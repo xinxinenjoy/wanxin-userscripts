@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.4.2
+// @version      1.4.3
 // @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡数量，并支持卡池新标签页自动查询。注意：卡类查询需要账号用友对应的权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -25,6 +25,12 @@
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.4.3  -  2026-9-6
+ * - 优化页面级缓存机制：缓存绑定当前订单页面，不使用持久化缓存。
+ * - 同一订单页面关闭/重新打开模块时复用当前页面数据，避免重复请求。
+ * - 切换不同订单时自动失效缓存并重新读取，避免数据串单。
+ * - 点击“刷新数据”时清除当前页面缓存并强制重新查询。
  *
  * v1.4.2  -  2026-9-5
  * - 优化体检数据窗体文字可读性：提高关键标签字号、字重和对比度，数值显示更清晰。
@@ -157,9 +163,11 @@
   let cardGroupPendingRunning = false;
   let combinedDataQueryRunning = false;
 
+  // 当前页面缓存。仅存在于当前标签页 JS 生命周期内。
+  // 不写入 localStorage，避免不同订单之间数据串联。
   let combinedDataCache = {
     orderCode: "",
-    timestamp: 0
+    data: null
   };
 
   let cardPoolQueryCache = {
@@ -3519,7 +3527,7 @@
 
       combinedDataCache = {
         orderCode: "",
-        timestamp: 0
+        data: null
       };
 
       closeDataPanel();
@@ -3808,12 +3816,8 @@
   ) {
     return Boolean(
       orderCode &&
-      combinedDataCache.orderCode ===
-        orderCode &&
-      combinedDataCache.timestamp > 0 &&
-      Date.now() -
-        combinedDataCache.timestamp <=
-        AUTO_DATA_CACHE_MS
+      combinedDataCache.orderCode === orderCode &&
+      combinedDataCache.data
     );
   }
 
@@ -3869,13 +3873,41 @@
         orderCode
       )
     ) {
+      const cache =
+        combinedDataCache.data;
+
+      resetDataPanelContent();
+
+      if (cache.landingOptions) {
+        cachedLandingTimeOptions =
+          cache.landingOptions;
+
+        renderLandingExtractOptions(
+          cache.landingOptions
+        );
+      }
+
+      if (cache.physical) {
+        renderPhysicalExamSummary(
+          cache.physical
+        );
+      }
+
+      if (cache.cardPool && cache.cardCorpCode) {
+        renderCardPoolSummary(
+          cache.cardPool,
+          cache.cardCorpCode
+        );
+      }
+
       title.textContent =
         "体检数据 · 已加载";
 
       updatePanelStatus(
-        "✓ 已复用刚刚读取的数据，避免短时间重复请求。",
+        "✓ 已复用当前订单页面缓存。",
         "success"
       );
+
       return;
     }
 
@@ -4025,8 +4057,14 @@
       ) {
         combinedDataCache = {
           orderCode,
-          timestamp:
-            Date.now()
+          data: {
+            landingOptions:
+              [...cachedLandingTimeOptions],
+            physical,
+            cardPool,
+            cardCorpCode:
+              getCurrentCardCorpCode()
+          }
         };
       }
 
@@ -4419,7 +4457,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.4.2
+          体检数据 v1.4.3
         </strong>
 
         <div style="
@@ -4673,7 +4711,7 @@
 
       combinedDataCache = {
         orderCode: "",
-        timestamp: 0
+        data: null
       };
 
       cardPoolQueryCache = {
@@ -5063,7 +5101,7 @@
 
     combinedDataCache = {
       orderCode: "",
-      timestamp: 0
+      data: null
     };
 
     cardPoolQueryCache = {
