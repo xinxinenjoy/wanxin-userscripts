@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.5.2
-// @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡数量，并支持卡池新标签页自动查询。注意：卡类查询需要账号用友对应的权限
+// @version      1.6.1
+// @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡/电商卡数量，并支持原有卡池新标签页自动查询。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        none
@@ -20,11 +20,24 @@
  * 功能：
  * - 已落单订单按需读取落单时间记录并支持复制为表格行。
  * - 读取体检总人数、已检/未检人数、到检/挂账/自费金额。
- * - 同时查询套餐卡、储值卡数量，15秒内复用同订单查询结果。
+ * - 同时查询套餐卡、储值卡、电商卡数量，15秒内复用同订单查询结果。
  * - 卡数量大于0时可新建标签页打开对应卡池，自动填写单位代码并查询。
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.6.1  -  2026-9-7
+ * - 三类卡固定显示：套餐卡、储值卡、电商卡始终三列并排，0张也保留卡位，避免UI跳动。
+ * - 修正卡状态识别：兼容status、status_business、card_status、cardStatus、use_status、state等字段；未知主状态不会遮蔽有效备用状态。
+ * - 扩展常见状态别名；真正未知状态仍归入“其他”，并在控制台记录原始值，便于后续补充映射。
+ * - 电商卡总数量支持点击后打开卡池页，自动定位电商卡页签、填写单位代码并查询。
+ * - 三类卡统一使用page_size=100及完整分页逻辑；其他体检、落单、缓存、刷新功能不变。
+ *
+ * v1.6.0  -  2026-9-7
+ * - 新增“电商卡”分类，实时查询 /soa-card/api/v1/platform/card/pool/display。
+ * - 电商卡沿用卡池完整分页逻辑，page_size固定100，并按status统计生效中、已核销、已冻结、作废及其他状态。
+ * - 电商卡总数为0时默认隐藏；有数据时与套餐卡、储值卡三列并排显示；查询失败时保留错误提示，避免误判为无数据。
+ * - 电商卡当前仅展示统计，不新增卡池跳转；套餐卡、储值卡原有点击跳转逻辑保持不变。
  *
  * v1.5.2  -  2026-9-7
  * - 仅优化卡分类UI：取消状态行灰色/彩色底块，改为简洁的左右对齐明细。
@@ -98,12 +111,32 @@
 
   const CARD_STATUS_MAP = {
     ENABLE: "生效中",
+    ENABLED: "生效中",
+    ACTIVE: "生效中",
+    NORMAL: "生效中",
+    AVAILABLE: "生效中",
+    VALID: "生效中",
+    UNUSED: "生效中",
+
     USED: "已核销",
+    CONSUMED: "已核销",
+    VERIFIED: "已核销",
+    WRITE_OFF: "已核销",
+    WRITEOFF: "已核销",
+
     FREEZE: "冻结",
     FROZEN: "冻结",
+    LOCK: "冻结",
+    LOCKED: "冻结",
+
     INVALID: "作废",
     CANCEL: "作废",
-    CANCELLED: "作废"
+    CANCELED: "作废",
+    CANCELLED: "作废",
+    VOID: "作废",
+    DISABLE: "作废",
+    DISABLED: "作废",
+    EXPIRED: "作废"
   };
 
   const CONFIG = {
@@ -118,6 +151,9 @@
 
     STORED_VALUE_CARD_POOL_API:
       "/soa-card/api/v1/bqcard/page/pool",
+
+    ECOMMERCE_CARD_POOL_API:
+      "/soa-card/api/v1/platform/card/pool/display",
 
     EXTRACT_ORDER_NAME_SELECTOR:
       "#register > div",
@@ -2491,9 +2527,13 @@
     }
   }
 
-  async function fetchBothCardPoolTotals(
+  async function fetchAllCardPoolTotals(
     cardCorpCode
   ) {
+    updatePanelStatus(
+      "正在查询套餐卡..."
+    );
+
     const packageCard =
       await safeFetchCardPoolTotal(
         CONFIG.PACKAGE_CARD_POOL_API,
@@ -2504,15 +2544,34 @@
       150
     );
 
+    updatePanelStatus(
+      "正在查询储值卡..."
+    );
+
     const storedValueCard =
       await safeFetchCardPoolTotal(
         CONFIG.STORED_VALUE_CARD_POOL_API,
         cardCorpCode
       );
 
+    await sleep(
+      150
+    );
+
+    updatePanelStatus(
+      "正在查询电商卡..."
+    );
+
+    const ecommerceCard =
+      await safeFetchCardPoolTotal(
+        CONFIG.ECOMMERCE_CARD_POOL_API,
+        cardCorpCode
+      );
+
     return {
       packageCard,
-      storedValueCard
+      storedValueCard,
+      ecommerceCard
     };
   }
 
@@ -2522,9 +2581,12 @@
   ) {
     const type =
       cardType ===
-      "storage"
+        "storage"
         ? "storage"
-        : "general";
+        : cardType ===
+            "ecommerce"
+          ? "ecommerce"
+          : "general";
 
     const code =
       cleanText(
@@ -2571,7 +2633,8 @@
         !data.cardCorpCode ||
         ![
           "general",
-          "storage"
+          "storage",
+          "ecommerce"
         ].includes(
           data.cardType
         )
@@ -2762,64 +2825,175 @@
     );
   }
 
+  function getCardGroupSuffixCandidates(
+    cardType
+  ) {
+    if (
+      cardType ===
+      "storage"
+    ) {
+      return [
+        "storageCard"
+      ];
+    }
+
+    if (
+      cardType ===
+      "ecommerce"
+    ) {
+      return [
+        "platformCard",
+        "ecommerceCard",
+        "eCommerceCard"
+      ];
+    }
+
+    return [
+      "generalCard"
+    ];
+  }
+
   function getCardGroupTab(
     cardType
   ) {
-    const suffix =
-      cardType ===
-      "storage"
-        ? "storageCard"
-        : "generalCard";
+    const suffixes =
+      getCardGroupSuffixCandidates(
+        cardType
+      );
 
-    return (
-      document.getElementById(
-        `rc-tabs-0-tab-${suffix}`
-      ) ||
-      document.querySelector(
-        `[id$="-tab-${suffix}"]`
-      )
-    );
+    for (
+      const suffix
+      of suffixes
+    ) {
+      const tab =
+        document.getElementById(
+          `rc-tabs-0-tab-${suffix}`
+        ) ||
+        document.querySelector(
+          `[id$="-tab-${suffix}"]`
+        );
+
+      if (tab) {
+        return tab;
+      }
+    }
+
+    if (
+      cardType ===
+      "ecommerce"
+    ) {
+      return (
+        Array.from(
+          document.querySelectorAll(
+            '[role="tab"], .ant-tabs-tab, [id*="-tab-"]'
+          )
+        ).find(
+          tab =>
+            isElementVisible(
+              tab
+            ) &&
+            compactText(
+              tab.textContent
+            ).includes(
+              "电商卡"
+            )
+        ) ||
+        null
+      );
+    }
+
+    return null;
   }
 
   function getCardGroupPanel(
     cardType
   ) {
-    const suffix =
-      cardType ===
-      "storage"
-        ? "storageCard"
-        : "generalCard";
+    const tab =
+      getCardGroupTab(
+        cardType
+      );
 
-    return (
-      document.getElementById(
-        `rc-tabs-0-panel-${suffix}`
-      ) ||
-      document.querySelector(
-        `[id$="-panel-${suffix}"]`
-      )
-    );
+    const controlledId =
+      tab?.getAttribute(
+        "aria-controls"
+      );
+
+    if (controlledId) {
+      const controlled =
+        document.getElementById(
+          controlledId
+        );
+
+      if (controlled) {
+        return controlled;
+      }
+    }
+
+    const suffixes =
+      getCardGroupSuffixCandidates(
+        cardType
+      );
+
+    for (
+      const suffix
+      of suffixes
+    ) {
+      const panel =
+        document.getElementById(
+          `rc-tabs-0-panel-${suffix}`
+        ) ||
+        document.querySelector(
+          `[id$="-panel-${suffix}"]`
+        );
+
+      if (panel) {
+        return panel;
+      }
+    }
+
+    if (
+      cardType ===
+      "ecommerce"
+    ) {
+      return (
+        Array.from(
+          document.querySelectorAll(
+            '[role="tabpanel"], .ant-tabs-tabpane'
+          )
+        ).find(
+          isElementVisible
+        ) ||
+        null
+      );
+    }
+
+    return null;
   }
 
   function findCardGroupQueryButton(
     cardType
   ) {
-    const suffix =
-      cardType ===
-      "storage"
-        ? "storageCard"
-        : "generalCard";
+    if (
+      cardType !==
+      "ecommerce"
+    ) {
+      const suffix =
+        cardType ===
+          "storage"
+          ? "storageCard"
+          : "generalCard";
 
-    /*
-     * 第一优先级：用户提供的精确 DOM 路径。
-     * storageCard 按同样结构自动替换 panel id。
-     */
-    const exact =
-      document.querySelector(
-        `#rc-tabs-0-panel-${suffix} > div > div > div > form > div > div:nth-of-type(9) > div > div:nth-of-type(2) > div > div > div > div > div > div > button`
-      );
+      /*
+       * 套餐卡、储值卡继续优先使用已验证过的精确DOM路径。
+       */
+      const exact =
+        document.querySelector(
+          `#rc-tabs-0-panel-${suffix} > div > div > div > form > div > div:nth-of-type(9) > div > div:nth-of-type(2) > div > div > div > div > div > div > button`
+        );
 
-    if (exact) {
-      return exact;
+      if (exact) {
+        return exact;
+      }
     }
 
     const panel =
@@ -2885,7 +3059,10 @@
               pending.cardType ===
                 "storage"
                 ? "储值卡页签"
-                : "套餐卡页签"
+                : pending.cardType ===
+                    "ecommerce"
+                  ? "电商卡页签"
+                  : "套餐卡页签"
           }
         );
 
@@ -3131,18 +3308,111 @@
     }
   }
 
+  function normalizeCardStatusValue(
+    value
+  ) {
+    return cleanText(
+      value
+    )
+      .toUpperCase()
+      .replace(/[\s-]+/g, "_");
+  }
+
+  function resolveCardStatus(
+    item
+  ) {
+    const candidates = [
+      item?.status,
+      item?.status_business,
+      item?.statusBusiness,
+      item?.card_status,
+      item?.cardStatus,
+      item?.use_status,
+      item?.useStatus,
+      item?.state
+    ];
+
+    for (
+      const value
+      of candidates
+    ) {
+      const normalized =
+        normalizeCardStatusValue(
+          value
+        );
+
+      if (
+        normalized &&
+        CARD_STATUS_MAP[
+          normalized
+        ]
+      ) {
+        return {
+          label:
+            CARD_STATUS_MAP[
+              normalized
+            ],
+          raw:
+            normalized
+        };
+      }
+    }
+
+    return {
+      label:
+        "其他",
+      raw:
+        candidates
+          .map(
+            normalizeCardStatusValue
+          )
+          .filter(Boolean)
+          .join(" / ")
+    };
+  }
+
   function buildCardStatusSummary(items) {
     const summary = {};
+    const unknownValues =
+      new Set();
 
     (items || []).forEach(item => {
-      const status =
-        CARD_STATUS_MAP[
-          String(item.status || "").toUpperCase()
-        ] || "其他";
+      const resolved =
+        resolveCardStatus(
+          item
+        );
 
-      summary[status] =
-        (summary[status] || 0) + 1;
+      summary[
+        resolved.label
+      ] =
+        (
+          summary[
+            resolved.label
+          ] ||
+          0
+        ) + 1;
+
+      if (
+        resolved.label ===
+          "其他" &&
+        resolved.raw
+      ) {
+        unknownValues.add(
+          resolved.raw
+        );
+      }
     });
+
+    if (
+      unknownValues.size
+    ) {
+      console.warn(
+        "[SOA订单数据] 发现未映射卡状态：",
+        Array.from(
+          unknownValues
+        )
+      );
+    }
 
     return summary;
   }
@@ -3168,6 +3438,10 @@
       [
         "储值卡",
         data.storedValueCard
+      ],
+      [
+        "电商卡",
+        data.ecommerceCard
       ]
     ];
 
@@ -3240,10 +3514,16 @@
               label ===
               "储值卡"
                 ? "storage"
-                : "general";
+                : label ===
+                    "电商卡"
+                  ? "ecommerce"
+                  : "general";
+
+            const canOpenCardPool =
+              clickable;
 
             const clickAttrs =
-              clickable
+              canOpenCardPool
                 ? `data-soa-card-type="${cardType}" data-soa-card-code="${cardCorpCode}"`
                 : "";
 
@@ -3293,19 +3573,19 @@
                     font-weight:800;
                     line-height:1.35;
                     cursor:${
-                      clickable
+                      canOpenCardPool
                         ? "pointer"
                         : "default"
                     };
                     text-decoration:${
-                      clickable
+                      canOpenCardPool
                         ? "underline"
                         : "none"
                     };
                     text-underline-offset:2px;
                   "
                   title="${
-                    clickable
+                    canOpenCardPool
                       ? `点击新建标签页打开${label}卡池并查询单位代码 ${cardCorpCode}`
                       : safeValue
                   }"
@@ -3357,10 +3637,10 @@
                             display:flex;
                             align-items:center;
                             justify-content:space-between;
-                            gap:10px;
+                            gap:4px;
                             min-height:23px;
-                            padding:1px 3px;
-                            font-size:12px;
+                            padding:1px 2px;
+                            font-size:11px;
                             line-height:1.55;
                           ">
                             <span style="
@@ -3371,9 +3651,9 @@
                             ">${label}</span>
                             <span style="
                               flex:0 0 auto;
-                              min-width:28px;
+                              min-width:22px;
                               color:${numberColor};
-                              font-size:13px;
+                              font-size:12px;
                               font-weight:800;
                               text-align:right;
                               font-variant-numeric:tabular-nums;
@@ -3392,6 +3672,9 @@
 
     grid.style.display =
       "grid";
+
+    grid.style.gridTemplateColumns =
+      "repeat(3, minmax(0, 1fr))";
 
     grid.style.marginTop =
       "9px";
@@ -3822,7 +4105,7 @@
                 font-weight:500;
                 text-align:center;
               ">
-                正在查询套餐卡、储值卡...
+                正在查询套餐卡、储值卡、电商卡...
               </div>
             `;
 
@@ -3841,7 +4124,7 @@
           }
 
           cardPool =
-            await fetchBothCardPoolTotals(
+            await fetchAllCardPoolTotals(
               cardCorpCode
             );
 
@@ -3872,7 +4155,8 @@
         cardPool
           ? [
               cardPool.packageCard,
-              cardPool.storedValueCard
+              cardPool.storedValueCard,
+              cardPool.ecommerceCard
             ].filter(
               item =>
                 item?.ok
@@ -3881,12 +4165,12 @@
 
       if (
         physical &&
-        cardSuccessCount === 2
+        cardSuccessCount === 3
       ) {
         updatePanelStatus(
           physicalResult.navigated
-            ? "✓ 已切换体检名单并读取体检汇总及卡池数量。"
-            : "✓ 已直接读取当前页体检汇总及卡池数量。",
+            ? "✓ 已切换体检名单并读取体检汇总及三类卡数量。"
+            : "✓ 已直接读取当前页体检汇总及三类卡数量。",
           "success"
         );
       } else if (
@@ -4105,7 +4389,7 @@
                 font-weight:500;
                 text-align:center;
               ">
-                正在查询套餐卡、储值卡...
+                正在查询套餐卡、储值卡、电商卡...
               </div>
             `;
 
@@ -4124,7 +4408,7 @@
           }
 
           cardPool =
-            await fetchBothCardPoolTotals(
+            await fetchAllCardPoolTotals(
               cardCorpCode
             );
 
@@ -4148,7 +4432,8 @@
         cardPool
           ? [
               cardPool.packageCard,
-              cardPool.storedValueCard
+              cardPool.storedValueCard,
+              cardPool.ecommerceCard
             ].filter(
               item =>
                 item?.ok
@@ -4175,12 +4460,12 @@
 
       if (
         physical &&
-        cardSuccessCount === 2
+        cardSuccessCount === 3
       ) {
         updatePanelStatus(
           physicalResult?.navigated
-            ? "✓ 已自动读取落单数据，并切换体检名单获取体检汇总及卡类数量。"
-            : "✓ 已自动读取落单数据、体检汇总及卡类数量。",
+            ? "✓ 已自动读取落单数据，并切换体检名单获取体检汇总及三类卡数量。"
+            : "✓ 已自动读取落单数据、体检汇总及三类卡数量。",
           "success"
         );
       } else if (
@@ -4562,7 +4847,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.5.2
+          体检数据 v1.6.1
         </strong>
 
         <div style="
@@ -4698,7 +4983,7 @@
         font-weight:500;
         line-height:1.55;
       ">
-        首次打开自动读取当前订单数据；需要更新时点击“刷新数据”，不进行非必要的后台自动刷新。
+        首次打开自动读取当前订单数据；需要更新时点击“刷新数据”，不进行非必要的后台自动刷新。三类卡固定显示并支持点击数量进入对应卡池查询。
       </div>
     `;
 
