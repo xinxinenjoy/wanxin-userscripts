@@ -45,7 +45,7 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
           from urllib.parse import quote
-          from datetime import datetime, timedelta
+          from datetime import datetime
           from zoneinfo import ZoneInfo
           from html import escape
           import json
@@ -574,11 +574,11 @@ jobs:
               "Game": 900,
           }
 
-          # 源脚本最近多少天内发生修改时，在卡片标题旁显示“更新”提示。
-          # 后续如果觉得提示保留时间过长 / 过短，只改这个数字即可。
-          RECENT_UPDATE_BADGE_DAYS = 7
-
-
+          # 仅当源脚本“今天（北京时间）”有更新时，
+          # 在卡片标题旁显示“今日更新”提示。
+          #
+          # 页面会结合当前脚本版本号和浏览器本地记录判断：
+          # 如果用户已经点击过该版本的“立即安装”，本浏览器不再显示提示。
           def folder_display_name(folder):
               folder = str(folder or "").strip()
 
@@ -608,15 +608,18 @@ jobs:
               )
 
 
-          def is_recently_updated(modified_dt):
+          def is_updated_today(modified_dt):
               if not modified_dt:
                   return False
 
-              age = datetime.now(TZ) - modified_dt
+              try:
+                  local_modified = modified_dt.astimezone(TZ)
+              except Exception:
+                  local_modified = modified_dt
 
               return (
-                  age.total_seconds() >= 0
-                  and age <= timedelta(days=RECENT_UPDATE_BADGE_DAYS)
+                  local_modified.date()
+                  == datetime.now(TZ).date()
               )
 
 
@@ -779,11 +782,13 @@ jobs:
 
                   update_badge = ""
 
-                  if is_recently_updated(item["modified_dt"]):
+                  if is_updated_today(item["modified_dt"]):
                       update_badge = (
                           '<span class="script-update-badge" '
-                          f'title="最近更新：{h(modified_date)}">'
-                          '<span aria-hidden="true">↻</span> 更新'
+                          f'data-script-id="{h(item["publish_id"])}" '
+                          f'data-version="{h(item["version"])}" '
+                          f'title="今日更新：{h(modified_date)}">'
+                          '<span aria-hidden="true">↻</span> 今日更新'
                           '</span>'
                       )
 
@@ -792,6 +797,7 @@ jobs:
                       <article class="script-card"
                                data-folder="{h(item["display_folder"])}"
                                data-script-id="{h(item["publish_id"])}"
+                               data-version="{h(item["version"])}"
                                data-search="{h(search_text)}">
                         <div class="script-card-head">
                           <div class="script-title-wrap">
@@ -822,7 +828,8 @@ jobs:
                           <div class="script-actions">
                             <a class="button button-primary script-install-link"
                                href="{h(item["install_url"])}"
-                               data-script-id="{h(item["publish_id"])}">
+                               data-script-id="{h(item["publish_id"])}"
+                               data-version="{h(item["version"])}">
                               立即安装
                             </a>
                             {image_button}
@@ -1822,10 +1829,10 @@ jobs:
                 align-items: center;
                 gap: 4px;
                 padding: 0 7px;
-                border: 1px solid #ffd6d1;
+                border: 1px solid #ffc9c2;
                 border-radius: 999px;
-                color: #d92d20;
-                background: #fff2f0;
+                color: #c9251a;
+                background: #fff0ed;
                 font-size: 10px;
                 font-weight: 850;
                 line-height: 1;
@@ -2907,6 +2914,7 @@ jobs:
                 const topOperatingSystemsList = document.getElementById("top-operating-systems");
                 const topBrowsersList = document.getElementById("top-browsers");
                 const installLinks = [...document.querySelectorAll(".script-install-link")];
+                const updateBadges = [...document.querySelectorAll(".script-update-badge")];
                 const imageButtons = [...document.querySelectorAll(".script-images-button")];
                 const descriptionToggles = [...document.querySelectorAll(".description-toggle")];
                 const imageModal = document.getElementById("image-modal");
@@ -3497,6 +3505,67 @@ jobs:
                   return anonymousDeviceId;
                 }}
 
+                const SCRIPT_INSTALLED_VERSION_PREFIX =
+                  "wanxin-userscripts:installed-version:";
+
+                function installedVersionKey(scriptId) {{
+                  return (
+                    SCRIPT_INSTALLED_VERSION_PREFIX +
+                    String(scriptId || "")
+                  );
+                }}
+
+                function getInstalledVersion(scriptId) {{
+                  if (!scriptId) return "";
+
+                  try {{
+                    return localStorage.getItem(
+                      installedVersionKey(scriptId)
+                    ) || "";
+                  }} catch (_) {{
+                    return "";
+                  }}
+                }}
+
+                function markInstalledVersion(scriptId, version) {{
+                  if (!scriptId || !version) return;
+
+                  try {{
+                    localStorage.setItem(
+                      installedVersionKey(scriptId),
+                      String(version)
+                    );
+                  }} catch (_) {{
+                  }}
+                }}
+
+                function hideInstalledUpdateBadge(scriptId, version) {{
+                  if (!scriptId || !version) return;
+
+                  updateBadges.forEach(badge => {{
+                    if (
+                      badge.dataset.scriptId === scriptId &&
+                      badge.dataset.version === version
+                    ) {{
+                      badge.hidden = true;
+                    }}
+                  }});
+                }}
+
+                function refreshUpdateBadges() {{
+                  updateBadges.forEach(badge => {{
+                    const scriptId = badge.dataset.scriptId || "";
+                    const version = badge.dataset.version || "";
+                    const installedVersion =
+                      getInstalledVersion(scriptId);
+
+                    badge.hidden =
+                      Boolean(version) &&
+                      installedVersion === version;
+                  }});
+                }}
+
+
                 let clientEnvironmentPromise = null;
 
                 function getClientEnvironment() {{
@@ -3935,9 +4004,28 @@ jobs:
 
                 installLinks.forEach(link => {{
                   link.addEventListener("click", () => {{
+                    const scriptId =
+                      link.dataset.scriptId || "";
+                    const version =
+                      link.dataset.version || "";
+
+                    // 页面无法获知 Tampermonkey 最终是否确认安装，
+                    // 因此这里按“用户已点击当前版本安装”记录。
+                    // 同一天如果脚本再次升级到新版本，版本号不同，
+                    // “今日更新”会重新出现。
+                    markInstalledVersion(
+                      scriptId,
+                      version
+                    );
+
+                    hideInstalledUpdateBadge(
+                      scriptId,
+                      version
+                    );
+
                     trackEvent(
                       "install_click",
-                      link.dataset.scriptId || ""
+                      scriptId
                     );
                   }});
                 }});
@@ -3951,7 +4039,11 @@ jobs:
                   }}, 120);
                 }});
 
-                requestAnimationFrame(refreshDescriptionToggles);
+                requestAnimationFrame(() => {{
+                  refreshDescriptionToggles();
+                  refreshUpdateBadges();
+                }});
+
                 trackEvent("page_view");
                 loadStats();
               }})();
