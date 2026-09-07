@@ -1,13 +1,14 @@
 // Cloudflare Pages Function
 // 保存路径：functions/api/stats.js
 //
-// V6 首页统计（页面访问已由 track.js 做“同设备 + 同 IP 8 小时”去重）：
-// - 页面访问总次数
-// - 脚本安装点击总次数
-// - 国内地区 TOP 5
-// - 中国大陆城市 TOP 5
-// - 热门脚本 TOP 5
-// - 最近 14 天页面访问 / 安装趋势
+// V7 首页统计（页面访问已由 track.js 做“同设备 + 同 IP 8 小时”去重）：
+// - 页面访问总次数 + 今日次数
+// - 脚本安装点击总次数 + 今日次数
+// - 国内地区 / 城市 / 热门脚本 + 今日次数
+// - 浏览器 / 操作系统 / 设备 + 今日次数
+// - recent14Days 继续保留，供首页直接取得“今日访问 / 今日安装”
+//
+// 不新增 D1 表、不新增 Binding、不新增 Secret。
 //
 // D1 Binding 名称必须为：STATS_DB
 
@@ -259,6 +260,10 @@ function countOf(row) {
     return Number(row?.count || 0);
 }
 
+function todayCountOf(row) {
+    return Number(row?.today_count || 0);
+}
+
 function normalizeLocationKey(value) {
     return String(value || "")
         .normalize("NFD")
@@ -389,7 +394,14 @@ export async function onRequestGet(context) {
                         country,
                         region,
                         region_code,
-                        COUNT(*) AS count
+                        COUNT(*) AS count,
+                        SUM(
+                            CASE
+                                WHEN date(created_at, '+8 hours') = date('now', '+8 hours')
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS today_count
                      FROM events
                      WHERE event_type = 'page_view'
                        AND is_domestic = 1
@@ -404,7 +416,14 @@ export async function onRequestGet(context) {
                     `SELECT
                         city,
                         region_code,
-                        COUNT(*) AS count
+                        COUNT(*) AS count,
+                        SUM(
+                            CASE
+                                WHEN date(created_at, '+8 hours') = date('now', '+8 hours')
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS today_count
                      FROM events
                      WHERE event_type = 'page_view'
                        AND country = 'CN'
@@ -417,7 +436,16 @@ export async function onRequestGet(context) {
 
             rows(
                 env.STATS_DB.prepare(
-                    `SELECT script_id, COUNT(*) AS count
+                    `SELECT
+                        script_id,
+                        COUNT(*) AS count,
+                        SUM(
+                            CASE
+                                WHEN date(created_at, '+8 hours') = date('now', '+8 hours')
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS today_count
                      FROM events
                      WHERE event_type = 'install_click'
                        AND script_id <> ''
@@ -428,7 +456,16 @@ export async function onRequestGet(context) {
 
             rows(
                 env.STATS_DB.prepare(
-                    `SELECT browser AS name, COUNT(*) AS count
+                    `SELECT
+                        browser AS name,
+                        COUNT(*) AS count,
+                        SUM(
+                            CASE
+                                WHEN date(created_at, '+8 hours') = date('now', '+8 hours')
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS today_count
                      FROM events
                      WHERE event_type = 'page_view'
                      GROUP BY browser
@@ -439,7 +476,16 @@ export async function onRequestGet(context) {
 
             rows(
                 env.STATS_DB.prepare(
-                    `SELECT os AS name, COUNT(*) AS count
+                    `SELECT
+                        os AS name,
+                        COUNT(*) AS count,
+                        SUM(
+                            CASE
+                                WHEN date(created_at, '+8 hours') = date('now', '+8 hours')
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS today_count
                      FROM events
                      WHERE event_type = 'page_view'
                      GROUP BY os
@@ -450,7 +496,16 @@ export async function onRequestGet(context) {
 
             rows(
                 env.STATS_DB.prepare(
-                    `SELECT device AS name, COUNT(*) AS count
+                    `SELECT
+                        device AS name,
+                        COUNT(*) AS count,
+                        SUM(
+                            CASE
+                                WHEN date(created_at, '+8 hours') = date('now', '+8 hours')
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS today_count
                      FROM events
                      WHERE event_type = 'page_view'
                      GROUP BY device
@@ -461,7 +516,16 @@ export async function onRequestGet(context) {
 
             rows(
                 env.STATS_DB.prepare(
-                    `SELECT country AS name, COUNT(*) AS count
+                    `SELECT
+                        country AS name,
+                        COUNT(*) AS count,
+                        SUM(
+                            CASE
+                                WHEN date(created_at, '+8 hours') = date('now', '+8 hours')
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS today_count
                      FROM events
                      WHERE event_type = 'page_view'
                      GROUP BY country
@@ -472,7 +536,16 @@ export async function onRequestGet(context) {
 
             rows(
                 env.STATS_DB.prepare(
-                    `SELECT referrer_host AS name, COUNT(*) AS count
+                    `SELECT
+                        referrer_host AS name,
+                        COUNT(*) AS count,
+                        SUM(
+                            CASE
+                                WHEN date(created_at, '+8 hours') = date('now', '+8 hours')
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS today_count
                      FROM events
                      WHERE event_type = 'page_view'
                      GROUP BY referrer_host
@@ -498,6 +571,7 @@ export async function onRequestGet(context) {
         const domesticRegions = domesticRows.map((row) => ({
             name: domesticRegionName(row),
             count: countOf(row),
+            todayCount: todayCountOf(row),
         }));
 
         const cityTotals = new Map();
@@ -505,19 +579,42 @@ export async function onRequestGet(context) {
         cityRows.forEach((row) => {
             const name = cityDisplayName(row.city, row.region_code);
             const count = countOf(row);
-            cityTotals.set(name, (cityTotals.get(name) || 0) + count);
+            const todayCount = todayCountOf(row);
+            const previous = cityTotals.get(name) || {
+                count: 0,
+                todayCount: 0,
+            };
+
+            cityTotals.set(name, {
+                count: previous.count + count,
+                todayCount: previous.todayCount + todayCount,
+            });
         });
 
         const domesticCities = [...cityTotals.entries()]
-            .map(([name, count]) => ({ name, count }))
+            .map(([name, value]) => ({
+                name,
+                count: value.count,
+                todayCount: value.todayCount,
+            }))
             .sort((a, b) => b.count - a.count);
 
         const scriptInstalls = {};
+        const scriptInstallsToday = {};
+
         const topScripts = scriptRows.map((row) => {
             const scriptId = String(row.script_id || "");
             const count = countOf(row);
+            const todayCount = todayCountOf(row);
+
             scriptInstalls[scriptId] = count;
-            return { scriptId, count };
+            scriptInstallsToday[scriptId] = todayCount;
+
+            return {
+                scriptId,
+                count,
+                todayCount,
+            };
         });
 
         const topRegion = domesticRegions[0] || null;
@@ -533,27 +630,32 @@ export async function onRequestGet(context) {
             topScripts: topScripts.slice(0, 5),
             recent14Days: normalizeRecent14Days(recentRows),
             scriptInstalls,
+            scriptInstallsToday,
 
-            // 测试阶段保留，页面暂不展示
             browsers: browserRows.map((row) => ({
                 name: String(row.name || "Other"),
                 count: countOf(row),
+                todayCount: todayCountOf(row),
             })),
             operatingSystems: osRows.map((row) => ({
                 name: String(row.name || "Other"),
                 count: countOf(row),
+                todayCount: todayCountOf(row),
             })),
             devices: deviceRows.map((row) => ({
                 name: String(row.name || "Other"),
                 count: countOf(row),
+                todayCount: todayCountOf(row),
             })),
             countries: countryRows.map((row) => ({
                 code: String(row.name || "XX"),
                 count: countOf(row),
+                todayCount: todayCountOf(row),
             })),
             referrers: referrerRows.map((row) => ({
                 name: String(row.name || "direct"),
                 count: countOf(row),
+                todayCount: todayCountOf(row),
             })),
         });
     } catch (error) {

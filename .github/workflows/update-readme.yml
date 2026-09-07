@@ -565,6 +565,16 @@ jobs:
           }
 
 
+          # 页面分组显示顺序。
+          # 数字越小越靠前；未配置的分组统一按 500 处理，
+          # 同优先级继续按页面显示名称排序。
+          #
+          # 后续只改这里即可，不需要再修改页面生成逻辑。
+          PAGE_GROUP_ORDER = {
+              "Game": 900,
+          }
+
+
           def folder_display_name(folder):
               folder = str(folder or "").strip()
 
@@ -582,6 +592,16 @@ jobs:
               name = re.sub(r"(?<=[\u4e00-\u9fff])SOA$", " SOA", name)
 
               return name or folder
+
+
+          def page_group_sort_key(folder):
+              label = folder_display_name(folder)
+
+              return (
+                  PAGE_GROUP_ORDER.get(label, 500),
+                  label.lower(),
+                  str(folder).lower(),
+              )
 
 
           SUPPORTED_SCRIPT_IMAGE_SUFFIXES = {
@@ -676,7 +696,7 @@ jobs:
 
           for folder in sorted(
               page_groups,
-              key=lambda value: folder_display_name(value).lower(),
+              key=page_group_sort_key,
           ):
               folder_count = len(page_groups[folder])
               folder_label = folder_display_name(folder)
@@ -691,7 +711,7 @@ jobs:
 
           for folder in sorted(
               page_groups,
-              key=lambda value: folder_display_name(value).lower(),
+              key=page_group_sort_key,
           ):
               folder_label = folder_display_name(folder)
               group_items = sorted(
@@ -766,6 +786,7 @@ jobs:
                             <span>更新 {h(modified_date)}</span>
                             <span class="install-count" hidden>
                               安装 <strong>0</strong> 次
+                              <small class="count-today install-today" hidden></small>
                             </span>
                           </div>
 
@@ -1534,12 +1555,17 @@ jobs:
                 white-space: nowrap;
               }}
 
-              .stat-today {{
+              .stat-today,
+              .count-today {{
                 color: var(--accent);
                 font-size: 11px;
                 font-weight: 800;
                 line-height: 1.4;
                 white-space: nowrap;
+              }}
+
+              .count-today {{
+                margin-left: 4px;
               }}
 
               .region-summary {{
@@ -1566,6 +1592,9 @@ jobs:
               }}
 
               .region-chip {{
+                display: inline-flex;
+                gap: 5px;
+                align-items: center;
                 padding: 6px 9px;
                 border-radius: 999px;
                 color: #6f5960;
@@ -1657,6 +1686,11 @@ jobs:
               }}
 
               .ranking-count {{
+                display: inline-flex;
+                flex-wrap: wrap;
+                gap: 5px;
+                align-items: baseline;
+                justify-content: flex-end;
                 color: var(--muted);
                 font-size: 11px;
                 font-weight: 750;
@@ -1924,6 +1958,53 @@ jobs:
                 font-size: 11px;
                 font-weight: 800;
                 text-align: center;
+              }}
+
+              .image-fullscreen-button {{
+                display: inline-flex;
+                height: 30px;
+                align-items: center;
+                justify-content: center;
+                padding: 0 10px;
+                border: 0;
+                border-radius: 8px;
+                color: var(--text);
+                background: transparent;
+                cursor: pointer;
+                font-size: 11px;
+                font-weight: 800;
+                white-space: nowrap;
+              }}
+
+              .image-fullscreen-button:hover {{
+                background: #fff;
+              }}
+
+              .image-modal:fullscreen,
+              .image-modal.fullscreen-fallback {{
+                padding: 0;
+                background: #111318;
+              }}
+
+              .image-modal:fullscreen .image-modal-panel,
+              .image-modal.fullscreen-fallback .image-modal-panel {{
+                width: 100vw;
+                height: 100vh;
+                max-width: none;
+                max-height: none;
+                border: 0;
+                border-radius: 0;
+              }}
+
+              .image-modal:fullscreen .image-stage img,
+              .image-modal.fullscreen-fallback .image-stage img {{
+                max-height: calc(100vh - 150px);
+              }}
+
+              .image-modal.fullscreen-fallback {{
+                position: fixed;
+                z-index: 2000;
+                inset: 0;
               }}
 
               .image-modal-close {{
@@ -2564,11 +2645,17 @@ jobs:
                   </div>
                   <div class="stat-item">
                     <span class="stat-label">热门地区</span>
-                    <strong class="stat-value" id="stats-region">-</strong>
+                    <div class="stat-value-row">
+                      <strong class="stat-value" id="stats-region">-</strong>
+                      <span class="stat-today" id="stats-region-today" hidden></span>
+                    </div>
                   </div>
                   <div class="stat-item">
                     <span class="stat-label">常用浏览器</span>
-                    <strong class="stat-value" id="stats-browser">-</strong>
+                    <div class="stat-value-row">
+                      <strong class="stat-value" id="stats-browser">-</strong>
+                      <span class="stat-today" id="stats-browser-today" hidden></span>
+                    </div>
                   </div>
 
                   <div class="region-summary" id="region-summary" hidden>
@@ -2692,6 +2779,11 @@ jobs:
                               type="button">
                         重置
                       </button>
+                      <button class="image-fullscreen-button"
+                              id="image-fullscreen"
+                              type="button">
+                        全屏
+                      </button>
                     </div>
 
                     <button class="image-modal-close"
@@ -2751,7 +2843,9 @@ jobs:
                 const statsInstalls = document.getElementById("stats-installs");
                 const statsInstallsToday = document.getElementById("stats-installs-today");
                 const statsRegion = document.getElementById("stats-region");
+                const statsRegionToday = document.getElementById("stats-region-today");
                 const statsBrowser = document.getElementById("stats-browser");
+                const statsBrowserToday = document.getElementById("stats-browser-today");
                 const regionSummary = document.getElementById("region-summary");
                 const regionChips = document.getElementById("region-chips");
                 const statsDetails = document.getElementById("stats-details");
@@ -2775,6 +2869,7 @@ jobs:
                 const imageZoomIn = document.getElementById("image-zoom-in");
                 const imageZoomReset = document.getElementById("image-zoom-reset");
                 const imageZoomLabel = document.getElementById("image-zoom-label");
+                const imageFullscreen = document.getElementById("image-fullscreen");
                 const scriptNameMap = new Map(
                   cards.map(card => [
                     card.dataset.scriptId,
@@ -3028,9 +3123,17 @@ jobs:
 
 
                 function closeGallery() {{
-                  imageModal.classList.remove("open");
+                  if (document.fullscreenElement === imageModal) {{
+                    document.exitFullscreen().catch(() => {{}});
+                  }}
+
+                  imageModal.classList.remove(
+                    "open",
+                    "fullscreen-fallback"
+                  );
                   imageModal.setAttribute("aria-hidden", "true");
                   document.body.classList.remove("image-modal-open");
+                  updateFullscreenButton();
 
                   resetImageZoom(false);
                   imageCurrent.removeAttribute("src");
@@ -3050,6 +3153,67 @@ jobs:
                   resetImageZoom(false);
                   renderGallery();
                 }}
+
+
+                function isImageFullscreen() {{
+                  return (
+                    document.fullscreenElement === imageModal ||
+                    imageModal.classList.contains("fullscreen-fallback")
+                  );
+                }}
+
+
+                function updateFullscreenButton() {{
+                  imageFullscreen.textContent =
+                    isImageFullscreen()
+                      ? "退出全屏"
+                      : "全屏";
+                }}
+
+
+                async function toggleImageFullscreen() {{
+                  if (document.fullscreenElement === imageModal) {{
+                    try {{
+                      await document.exitFullscreen();
+                    }} catch (_) {{
+                    }}
+                    return;
+                  }}
+
+                  if (imageModal.classList.contains("fullscreen-fallback")) {{
+                    imageModal.classList.remove("fullscreen-fallback");
+                    updateFullscreenButton();
+                    return;
+                  }}
+
+                  if (imageModal.requestFullscreen) {{
+                    try {{
+                      await imageModal.requestFullscreen();
+                      return;
+                    }} catch (_) {{
+                    }}
+                  }}
+
+                  // 某些移动浏览器不支持标准 Fullscreen API，
+                  // 使用页面级全屏样式作为兜底。
+                  imageModal.classList.add("fullscreen-fallback");
+                  updateFullscreenButton();
+                }}
+
+
+                document.addEventListener("fullscreenchange", () => {{
+                  if (document.fullscreenElement !== imageModal) {{
+                    imageModal.classList.remove("fullscreen-fallback");
+                  }}
+
+                  updateFullscreenButton();
+                }});
+
+
+                imageFullscreen.addEventListener(
+                  "click",
+                  toggleImageFullscreen
+                );
 
 
                 imageButtons.forEach(button => {{
@@ -3226,6 +3390,8 @@ jobs:
                     changeImageScale(-IMAGE_SCALE_STEP);
                   }} else if (event.key === "0") {{
                     resetImageZoom(true);
+                  }} else if (event.key.toLowerCase() === "f") {{
+                    toggleImageFullscreen();
                   }}
                 }});
 
@@ -3332,8 +3498,17 @@ jobs:
 
                     const count = document.createElement("span");
                     count.className = "ranking-count";
-                    count.textContent = formatNumber(item.count) + " 次";
 
+                    const countMain = document.createElement("span");
+                    countMain.textContent =
+                      formatNumber(item.count) + " 次";
+
+                    const today = document.createElement("small");
+                    today.className = "count-today";
+                    today.textContent =
+                      "今日 +" + formatNumber(item.todayCount || 0);
+
+                    count.append(countMain, today);
                     li.append(rank, name, count);
                     container.appendChild(li);
                   }});
@@ -3382,10 +3557,12 @@ jobs:
                     const hasInstalls = Number.isFinite(Number(data.totalInstalls));
 
                     let regionText = "";
+                    let regionToday = 0;
 
                     if (data.topRegion && typeof data.topRegion === "object") {{
                       const regionName = data.topRegion.name || "";
                       const regionCount = Number(data.topRegion.count);
+                      regionToday = Number(data.topRegion.todayCount || 0);
 
                       if (regionName) {{
                         regionText = Number.isFinite(regionCount)
@@ -3433,6 +3610,9 @@ jobs:
 
                     if (regionText) {{
                       statsRegion.textContent = regionText;
+                      statsRegionToday.textContent =
+                        "今日 +" + formatNumber(regionToday);
+                      statsRegionToday.hidden = false;
                     }}
 
                     const browsers = Array.isArray(data.browsers)
@@ -3446,6 +3626,11 @@ jobs:
                         " · " +
                         formatNumber(topBrowser.count) +
                         " 次";
+
+                      statsBrowserToday.textContent =
+                        "今日 +" +
+                        formatNumber(topBrowser.todayCount || 0);
+                      statsBrowserToday.hidden = false;
                     }}
 
                     const domesticRegions = Array.isArray(data.domesticRegions)
@@ -3457,9 +3642,13 @@ jobs:
                         .map(item => {{
                           const name = String(item.name || "");
                           const count = formatNumber(item.count);
+                          const today = formatNumber(item.todayCount || 0);
+
                           return '<span class="region-chip">' +
-                            name + " " + count +
-                            "</span>";
+                            name + " " + count + " 次" +
+                            '<small class="count-today">今日 +' +
+                            today +
+                            "</small></span>";
                         }})
                         .join("");
 
@@ -3469,6 +3658,12 @@ jobs:
                     const scriptInstalls =
                       data.scriptInstalls && typeof data.scriptInstalls === "object"
                         ? data.scriptInstalls
+                        : {{}};
+
+                    const scriptInstallsToday =
+                      data.scriptInstallsToday &&
+                      typeof data.scriptInstallsToday === "object"
+                        ? data.scriptInstallsToday
                         : {{}};
 
                     cards.forEach(card => {{
@@ -3481,10 +3676,20 @@ jobs:
 
                       const target = card.querySelector(".install-count");
                       const strong = target?.querySelector("strong");
+                      const today = target?.querySelector(".install-today");
+                      const todayCount = Number(
+                        scriptInstallsToday[scriptId] || 0
+                      );
 
                       if (target && strong) {{
                         strong.textContent = formatNumber(count);
                         target.hidden = false;
+
+                        if (today) {{
+                          today.textContent =
+                            "今日 +" + formatNumber(todayCount);
+                          today.hidden = false;
+                        }}
                       }}
                     }});
 
