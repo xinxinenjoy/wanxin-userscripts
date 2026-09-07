@@ -580,7 +580,6 @@ jobs:
           # 在卡片标题旁显示“今日更新”提示。
           #
           # 页面会结合当前脚本版本号和浏览器本地记录判断：
-          # 如果用户已经点击过该脚本当前版本的“立即安装”，本浏览器不再显示提示；更换设备不会影响其他设备显示。
           def folder_display_name(folder):
               folder = str(folder or "").strip()
 
@@ -3481,7 +3480,7 @@ jobs:
                     /^[A-Za-z0-9._:-]{{8,120}}$/.test(String(value || ""));
 
                   try {{
-                    const saved = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+                    const saved = 浏览器本地状态.getItem(DEVICE_ID_STORAGE_KEY);
                     if (isValid(saved)) {{
                       anonymousDeviceId = saved;
                       return anonymousDeviceId;
@@ -3499,7 +3498,7 @@ jobs:
                   }}
 
                   try {{
-                    localStorage.setItem(
+                    浏览器本地状态.setItem(
                       DEVICE_ID_STORAGE_KEY,
                       anonymousDeviceId
                     );
@@ -3509,65 +3508,6 @@ jobs:
                   return anonymousDeviceId;
                 }}
 
-                const SCRIPT_INSTALLED_VERSION_PREFIX =
-                  "wanxin-userscripts:installed-version:";
-
-                function installedVersionKey(scriptId) {{
-                  return (
-                    SCRIPT_INSTALLED_VERSION_PREFIX +
-                    String(scriptId || "")
-                  );
-                }}
-
-                function getInstalledVersion(scriptId) {{
-                  if (!scriptId) return "";
-
-                  try {{
-                    return localStorage.getItem(
-                      installedVersionKey(scriptId)
-                    ) || "";
-                  }} catch (_) {{
-                    return "";
-                  }}
-                }}
-
-                function markInstalledVersion(scriptId, version) {{
-                  if (!scriptId || !version) return;
-
-                  try {{
-                    localStorage.setItem(
-                      installedVersionKey(scriptId),
-                      String(version)
-                    );
-                  }} catch (_) {{
-                  }}
-                }}
-
-                function hideInstalledUpdateBadge(scriptId, version) {{
-                  if (!scriptId || !version) return;
-
-                  updateBadges.forEach(badge => {{
-                    if (
-                      badge.dataset.scriptId === scriptId &&
-                      badge.dataset.version === version
-                    ) {{
-                      badge.hidden = true;
-                    }}
-                  }});
-                }}
-
-                function refreshUpdateBadges() {{
-                  updateBadges.forEach(badge => {{
-                    const scriptId = badge.dataset.scriptId || "";
-                    const version = badge.dataset.version || "";
-                    const installedVersion =
-                      getInstalledVersion(scriptId);
-
-                    badge.hidden =
-                      Boolean(version) &&
-                      installedVersion === version;
-                  }});
-                }}
 
 
                 let clientEnvironmentPromise = null;
@@ -4017,19 +3957,7 @@ jobs:
                     // 因此这里按“用户已点击当前版本安装”记录。
                     // 同一天如果脚本再次升级到新版本，版本号不同，
                     // “今日更新”会重新出现。
-                    markInstalledVersion(
-                      scriptId,
-                      version
-                    );
-
-                    hideInstalledUpdateBadge(
-                      scriptId,
-                      version
-                    );
-
-                    refreshUpdateBadges();
-
-                    trackEvent(
+trackEvent(
                       "install_click",
                       scriptId
                     );
@@ -4047,8 +3975,7 @@ jobs:
 
                 requestAnimationFrame(() => {{
                   refreshDescriptionToggles();
-                  refreshUpdateBadges();
-                }});
+}});
 
                 trackEvent("page_view");
                 loadStats();
