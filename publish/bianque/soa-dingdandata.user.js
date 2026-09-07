@@ -134,6 +134,8 @@
     VALID: "生效中",
     UNUSED: "生效中",
 
+    APPOINTED: "已预约",
+
     USED: "已核销",
     CONSUMED: "已核销",
     VERIFIED: "已核销",
@@ -158,6 +160,7 @@
   const CARD_STATUS_DISPLAY_ORDER = [
     "生效中",
     "已核销",
+    "已预约",
     "冻结",
     "作废",
     "其他"
