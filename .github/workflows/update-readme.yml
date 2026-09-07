@@ -736,7 +736,7 @@ jobs:
                       )
 
                   modified_date = (
-                      item["modified_at"].split(" ", 1)[0]
+                      item["modified_at"]
                       if item["modified_at"] and item["modified_at"] != "-"
                       else "-"
                   )
@@ -1492,7 +1492,7 @@ jobs:
 
               .stats-panel {{
                 display: grid;
-                grid-template-columns: repeat(3, minmax(0, 1fr));
+                grid-template-columns: repeat(4, minmax(0, 1fr));
                 gap: 12px;
                 padding: 16px;
                 border: 1px solid var(--line);
@@ -1516,6 +1516,14 @@ jobs:
                 font-size: 12px;
               }}
 
+              .stat-value-row {{
+                display: flex;
+                min-width: 0;
+                flex-wrap: wrap;
+                gap: 7px;
+                align-items: baseline;
+              }}
+
               .stat-value {{
                 display: block;
                 overflow: hidden;
@@ -1523,6 +1531,14 @@ jobs:
                 font-weight: 850;
                 line-height: 1.35;
                 text-overflow: ellipsis;
+                white-space: nowrap;
+              }}
+
+              .stat-today {{
+                color: var(--accent);
+                font-size: 11px;
+                font-weight: 800;
+                line-height: 1.4;
                 white-space: nowrap;
               }}
 
@@ -1560,7 +1576,7 @@ jobs:
 
               .stats-detail-grid {{
                 display: grid;
-                grid-template-columns: minmax(0, 1.7fr) minmax(220px, .65fr) minmax(220px, .65fr);
+                grid-template-columns: repeat(4, minmax(0, 1fr));
                 gap: 12px;
                 margin-top: 12px;
               }}
@@ -1593,48 +1609,6 @@ jobs:
                 color: var(--muted);
                 font-size: 11px;
                 line-height: 1.45;
-              }}
-
-              .trend-legend {{
-                display: flex;
-                flex: 0 0 auto;
-                gap: 10px;
-                align-items: center;
-                color: var(--muted);
-                font-size: 11px;
-                font-weight: 700;
-              }}
-
-              .trend-legend-item {{
-                display: inline-flex;
-                gap: 5px;
-                align-items: center;
-              }}
-
-              .trend-dot {{
-                width: 8px;
-                height: 8px;
-                border-radius: 999px;
-              }}
-
-              .trend-dot.visits {{
-                background: #e5484d;
-              }}
-
-              .trend-dot.installs {{
-                background: #4d78df;
-              }}
-
-              .trend-canvas-wrap {{
-                position: relative;
-                width: 100%;
-                min-height: 238px;
-              }}
-
-              #trend-chart {{
-                display: block;
-                width: 100%;
-                height: 238px;
               }}
 
               .ranking-list {{
@@ -2166,6 +2140,15 @@ jobs:
                   border-top: 1px solid var(--line);
                   border-left: 0;
                 }}
+
+                .stats-panel,
+                .stats-detail-grid {{
+                  grid-template-columns: repeat(2, minmax(0, 1fr));
+                }}
+
+                .stat-item:nth-child(3) {{
+                  border-left: 0;
+                }}
               }}
 
               @media (max-width: 760px) {{
@@ -2194,12 +2177,7 @@ jobs:
                 }}
 
                 .trend-canvas-wrap,
-                #trend-chart {{
-                  min-height: 210px;
-                  height: 210px;
-                }}
-
-                .page-updated {{
+                  .page-updated {{
                   position: relative;
                   top: auto;
                   right: auto;
@@ -2572,15 +2550,25 @@ jobs:
                 <div class="stats-panel">
                   <div class="stat-item">
                     <span class="stat-label">页面访问</span>
-                    <strong class="stat-value" id="stats-visits">-</strong>
+                    <div class="stat-value-row">
+                      <strong class="stat-value" id="stats-visits">-</strong>
+                      <span class="stat-today" id="stats-visits-today" hidden></span>
+                    </div>
                   </div>
                   <div class="stat-item">
                     <span class="stat-label">脚本安装</span>
-                    <strong class="stat-value" id="stats-installs">-</strong>
+                    <div class="stat-value-row">
+                      <strong class="stat-value" id="stats-installs">-</strong>
+                      <span class="stat-today" id="stats-installs-today" hidden></span>
+                    </div>
                   </div>
                   <div class="stat-item">
                     <span class="stat-label">热门地区</span>
                     <strong class="stat-value" id="stats-region">-</strong>
+                  </div>
+                  <div class="stat-item">
+                    <span class="stat-label">常用浏览器</span>
+                    <strong class="stat-value" id="stats-browser">-</strong>
                   </div>
 
                   <div class="region-summary" id="region-summary" hidden>
@@ -2590,30 +2578,6 @@ jobs:
                 </div>
 
                 <div class="stats-detail-grid" id="stats-details" hidden>
-                  <section class="stats-card">
-                    <div class="stats-card-head">
-                      <div>
-                        <h3 class="stats-card-title">最近 14 天趋势</h3>
-                        <p class="stats-card-note">页面访问与脚本安装点击</p>
-                      </div>
-
-                      <div class="trend-legend" aria-label="趋势图图例">
-                        <span class="trend-legend-item">
-                          <span class="trend-dot visits"></span>
-                          页面访问
-                        </span>
-                        <span class="trend-legend-item">
-                          <span class="trend-dot installs"></span>
-                          脚本安装
-                        </span>
-                      </div>
-                    </div>
-
-                    <div class="trend-canvas-wrap">
-                      <canvas id="trend-chart"></canvas>
-                    </div>
-                  </section>
-
                   <section class="stats-card">
                     <div class="stats-card-head">
                       <div>
@@ -2632,6 +2596,26 @@ jobs:
                       </div>
                     </div>
                     <ol class="ranking-list" id="top-cities"></ol>
+                  </section>
+
+                  <section class="stats-card">
+                    <div class="stats-card-head">
+                      <div>
+                        <h3 class="stats-card-title">操作系统</h3>
+                        <p class="stats-card-note">按页面访问次数排序</p>
+                      </div>
+                    </div>
+                    <ol class="ranking-list" id="top-operating-systems"></ol>
+                  </section>
+
+                  <section class="stats-card">
+                    <div class="stats-card-head">
+                      <div>
+                        <h3 class="stats-card-title">访问设备</h3>
+                        <p class="stats-card-note">桌面端、手机及其他设备</p>
+                      </div>
+                    </div>
+                    <ol class="ranking-list" id="top-devices"></ol>
                   </section>
                 </div>
               </div>
@@ -2763,14 +2747,18 @@ jobs:
                 const ua = navigator.userAgent;
                 const statsSection = document.getElementById("usage-stats");
                 const statsVisits = document.getElementById("stats-visits");
+                const statsVisitsToday = document.getElementById("stats-visits-today");
                 const statsInstalls = document.getElementById("stats-installs");
+                const statsInstallsToday = document.getElementById("stats-installs-today");
                 const statsRegion = document.getElementById("stats-region");
+                const statsBrowser = document.getElementById("stats-browser");
                 const regionSummary = document.getElementById("region-summary");
                 const regionChips = document.getElementById("region-chips");
                 const statsDetails = document.getElementById("stats-details");
-                const trendCanvas = document.getElementById("trend-chart");
                 const topScriptsList = document.getElementById("top-scripts");
                 const topCitiesList = document.getElementById("top-cities");
+                const topOperatingSystemsList = document.getElementById("top-operating-systems");
+                const topDevicesList = document.getElementById("top-devices");
                 const installLinks = [...document.querySelectorAll(".script-install-link")];
                 const imageButtons = [...document.querySelectorAll(".script-images-button")];
                 const descriptionToggles = [...document.querySelectorAll(".description-toggle")];
@@ -2795,7 +2783,6 @@ jobs:
                 );
 
                 let activeGroup = "all";
-                let trendData = [];
                 let browser = "";
 
                 if (ua.includes("Edg/")) {{
@@ -3316,156 +3303,6 @@ jobs:
                   }}).catch(() => {{}});
                 }}
 
-                function niceMax(value) {{
-                  const n = Math.max(1, Number(value) || 1);
-                  const power = Math.pow(10, Math.floor(Math.log10(n)));
-                  const normalized = n / power;
-
-                  let nice = 1;
-                  if (normalized <= 1) nice = 1;
-                  else if (normalized <= 2) nice = 2;
-                  else if (normalized <= 5) nice = 5;
-                  else nice = 10;
-
-                  return nice * power;
-                }}
-
-                function shortDate(value) {{
-                  const parts = String(value || "").split("-");
-                  if (parts.length !== 3) return value || "";
-                  return Number(parts[1]) + "/" + Number(parts[2]);
-                }}
-
-                function drawTrendChart() {{
-                  if (!trendCanvas || !trendData.length) {{
-                    return;
-                  }}
-
-                  const rect = trendCanvas.getBoundingClientRect();
-                  const width = Math.max(320, rect.width || 640);
-                  const height = Math.max(200, rect.height || 238);
-                  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
-
-                  trendCanvas.width = Math.round(width * dpr);
-                  trendCanvas.height = Math.round(height * dpr);
-
-                  const ctx = trendCanvas.getContext("2d");
-                  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-                  ctx.clearRect(0, 0, width, height);
-
-                  const padding = {{
-                    top: 16,
-                    right: 12,
-                    bottom: 30,
-                    left: 42
-                  }};
-
-                  const chartWidth = width - padding.left - padding.right;
-                  const chartHeight = height - padding.top - padding.bottom;
-
-                  const maxValue = niceMax(
-                    Math.max(
-                      1,
-                      ...trendData.map(item => Number(item.visits) || 0),
-                      ...trendData.map(item => Number(item.installs) || 0)
-                    )
-                  );
-
-                  const gridCount = 4;
-
-                  ctx.lineWidth = 1;
-                  ctx.font = "11px system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
-                  ctx.textBaseline = "middle";
-
-                  for (let i = 0; i <= gridCount; i++) {{
-                    const ratio = i / gridCount;
-                    const y = padding.top + chartHeight * ratio;
-                    const value = Math.round(maxValue * (1 - ratio));
-
-                    ctx.beginPath();
-                    ctx.strokeStyle = "#eceef2";
-                    ctx.moveTo(padding.left, y);
-                    ctx.lineTo(width - padding.right, y);
-                    ctx.stroke();
-
-                    ctx.fillStyle = "#969ca9";
-                    ctx.textAlign = "right";
-                    ctx.fillText(
-                      new Intl.NumberFormat("zh-CN", {{
-                        notation: value >= 10000 ? "compact" : "standard",
-                        maximumFractionDigits: 1
-                      }}).format(value),
-                      padding.left - 8,
-                      y
-                    );
-                  }}
-
-                  const pointX = index => {{
-                    if (trendData.length <= 1) return padding.left;
-                    return padding.left +
-                      (chartWidth * index) / (trendData.length - 1);
-                  }};
-
-                  const pointY = value => {{
-                    const ratio = Math.max(0, Math.min(1, Number(value || 0) / maxValue));
-                    return padding.top + chartHeight * (1 - ratio);
-                  }};
-
-                  const labelIndexes = new Set([
-                    0,
-                    Math.floor((trendData.length - 1) / 3),
-                    Math.floor(((trendData.length - 1) * 2) / 3),
-                    trendData.length - 1
-                  ]);
-
-                  ctx.fillStyle = "#969ca9";
-                  ctx.textAlign = "center";
-                  ctx.textBaseline = "top";
-
-                  trendData.forEach((item, index) => {{
-                    if (!labelIndexes.has(index)) return;
-                    ctx.fillText(
-                      shortDate(item.date),
-                      pointX(index),
-                      height - padding.bottom + 9
-                    );
-                  }});
-
-                  function drawLine(key, color) {{
-                    ctx.beginPath();
-                    ctx.lineWidth = 2.25;
-                    ctx.lineJoin = "round";
-                    ctx.lineCap = "round";
-                    ctx.strokeStyle = color;
-
-                    trendData.forEach((item, index) => {{
-                      const x = pointX(index);
-                      const y = pointY(item[key]);
-
-                      if (index === 0) ctx.moveTo(x, y);
-                      else ctx.lineTo(x, y);
-                    }});
-
-                    ctx.stroke();
-
-                    trendData.forEach((item, index) => {{
-                      const x = pointX(index);
-                      const y = pointY(item[key]);
-
-                      ctx.beginPath();
-                      ctx.fillStyle = "#fff";
-                      ctx.strokeStyle = color;
-                      ctx.lineWidth = 1.7;
-                      ctx.arc(x, y, 2.7, 0, Math.PI * 2);
-                      ctx.fill();
-                      ctx.stroke();
-                    }});
-                  }}
-
-                  drawLine("visits", "#e5484d");
-                  drawLine("installs", "#4d78df");
-                }}
-
                 function renderRanking(container, items, nameResolver) {{
                   if (!container) return;
 
@@ -3501,6 +3338,34 @@ jobs:
                     container.appendChild(li);
                   }});
                 }}
+
+                function deviceDisplayName(value) {{
+                  const raw = String(value || "Other");
+                  const key = raw.toLowerCase();
+
+                  const names = {{
+                    desktop: "桌面端",
+                    mobile: "手机",
+                    tablet: "平板",
+                    other: "其他"
+                  }};
+
+                  return names[key] || raw;
+                }}
+
+
+                function operatingSystemDisplayName(value) {{
+                  const raw = String(value || "Other");
+
+                  const names = {{
+                    "Mac OS": "macOS",
+                    "MacOS": "macOS",
+                    "Other": "其他"
+                  }};
+
+                  return names[raw] || raw;
+                }}
+
 
                 async function loadStats() {{
                   try {{
@@ -3539,8 +3404,48 @@ jobs:
                       statsInstalls.textContent = formatNumber(data.totalInstalls);
                     }}
 
+                    // /api/stats 已经返回按北京时间生成的 recent14Days。
+                    // 最后一项就是今日汇总，无需增加 D1 查询或 Cloudflare 参数。
+                    const recentDays = Array.isArray(data.recent14Days)
+                      ? data.recent14Days
+                      : [];
+
+                    const todayStats = recentDays.length
+                      ? recentDays[recentDays.length - 1]
+                      : null;
+
+                    if (todayStats) {{
+                      const todayVisits = Number(todayStats.visits);
+                      const todayInstalls = Number(todayStats.installs);
+
+                      if (Number.isFinite(todayVisits)) {{
+                        statsVisitsToday.textContent =
+                          "今日 +" + formatNumber(todayVisits);
+                        statsVisitsToday.hidden = false;
+                      }}
+
+                      if (Number.isFinite(todayInstalls)) {{
+                        statsInstallsToday.textContent =
+                          "今日 +" + formatNumber(todayInstalls);
+                        statsInstallsToday.hidden = false;
+                      }}
+                    }}
+
                     if (regionText) {{
                       statsRegion.textContent = regionText;
+                    }}
+
+                    const browsers = Array.isArray(data.browsers)
+                      ? data.browsers.slice(0, 5)
+                      : [];
+
+                    if (browsers.length) {{
+                      const topBrowser = browsers[0];
+                      statsBrowser.textContent =
+                        String(topBrowser.name || "其他") +
+                        " · " +
+                        formatNumber(topBrowser.count) +
+                        " 次";
                     }}
 
                     const domesticRegions = Array.isArray(data.domesticRegions)
@@ -3591,6 +3496,14 @@ jobs:
                       ? data.domesticCities.slice(0, 5)
                       : [];
 
+                    const operatingSystems = Array.isArray(data.operatingSystems)
+                      ? data.operatingSystems.slice(0, 5)
+                      : [];
+
+                    const devices = Array.isArray(data.devices)
+                      ? data.devices.slice(0, 5)
+                      : [];
+
                     renderRanking(
                       topScriptsList,
                       topScripts,
@@ -3603,27 +3516,33 @@ jobs:
                       item => String(item.name || "未知城市")
                     );
 
-                    trendData = Array.isArray(data.recent14Days)
-                      ? data.recent14Days.slice(-14)
-                      : [];
+                    renderRanking(
+                      topOperatingSystemsList,
+                      operatingSystems,
+                      item => operatingSystemDisplayName(item.name)
+                    );
+
+                    renderRanking(
+                      topDevicesList,
+                      devices,
+                      item => deviceDisplayName(item.name)
+                    );
 
                     const hasDetailData =
                       topScripts.length ||
                       domesticCities.length ||
-                      trendData.some(item =>
-                        Number(item.visits) > 0 ||
-                        Number(item.installs) > 0
-                      );
+                      operatingSystems.length ||
+                      devices.length;
 
                     if (hasDetailData) {{
                       statsDetails.hidden = false;
-                      requestAnimationFrame(drawTrendChart);
                     }}
 
                     if (
                       hasVisits ||
                       hasInstalls ||
                       regionText ||
+                      browsers.length ||
                       domesticRegions.length ||
                       hasDetailData
                     ) {{
@@ -3691,7 +3610,6 @@ jobs:
                 window.addEventListener("resize", () => {{
                   clearTimeout(chartResizeTimer);
                   chartResizeTimer = setTimeout(() => {{
-                    drawTrendChart();
                     refreshDescriptionToggles();
                   }}, 120);
                 }});
