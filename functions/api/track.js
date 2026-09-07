@@ -1,5 +1,5 @@
 // Cloudflare Pages Function
-// V6 统计事件采集
+// V7 统计事件采集
 // 保存路径：functions/api/track.js
 //
 // 页面访问统计规则：
@@ -35,7 +35,101 @@ function clean(value, maxLength = 120) {
     return String(value || "").trim().slice(0, maxLength);
 }
 
-function parseUserAgent(ua) {
+function cleanVersion(value, maxParts = 3) {
+    return String(value || "")
+        .replace(/_/g, ".")
+        .split(".")
+        .filter((part) => /^\d+$/.test(part))
+        .slice(0, maxParts)
+        .join(".");
+}
+
+function windowsNameFromPlatformVersion(platformVersion) {
+    const version = cleanVersion(platformVersion, 3);
+    const major = Number(version.split(".")[0]);
+
+    if (!Number.isFinite(major) || major <= 0) {
+        return "";
+    }
+
+    // Chromium UA-CH:
+    // Windows 11 的 platformVersion 主版本通常为 13 或更高。
+    // Windows 10 常见为 1~10。
+    if (major >= 13) {
+        return "Windows 11";
+    }
+
+    return "Windows 10";
+}
+
+function osNameFromUa(value) {
+    const android = value.match(/Android\s+([0-9._]+)/i);
+    if (android) {
+        const version = cleanVersion(android[1], 2);
+        return version ? `Android ${version}` : "Android";
+    }
+
+    const ios = value.match(
+        /(?:iPhone|CPU(?: iPhone)? OS|iPad; CPU OS)\s*([0-9_]+)?/i
+    );
+    if (/iPhone|iPad|iPod/i.test(value)) {
+        const version = cleanVersion(ios?.[1], 2);
+        return version ? `iOS ${version}` : "iOS";
+    }
+
+    const mac = value.match(/Mac OS X\s+([0-9_]+)/i);
+    if (/Mac OS X|Macintosh/i.test(value)) {
+        const version = cleanVersion(mac?.[1], 2);
+        return version ? `macOS ${version}` : "macOS";
+    }
+
+    const windows = value.match(/Windows NT\s+([0-9.]+)/i);
+    if (windows) {
+        const nt = cleanVersion(windows[1], 2);
+
+        // 仅凭传统 UA 无法可靠区分 Windows 10 和 Windows 11，
+        // 因此 NT 10.0 统一写作 Windows 10/11。
+        if (nt == "10.0") return "Windows 10/11";
+        if (nt == "6.3") return "Windows 8.1";
+        if (nt == "6.2") return "Windows 8";
+        if (nt == "6.1") return "Windows 7";
+
+        return nt ? `Windows NT ${nt}` : "Windows";
+    }
+
+    if (/Linux/i.test(value)) return "Linux";
+
+    return "Other";
+}
+
+function enrichOsName(baseOs, ua, clientEnvironment = {}) {
+    const platform = clean(clientEnvironment?.platform, 80);
+    const platformVersion = clean(
+        clientEnvironment?.platformVersion,
+        40
+    );
+
+    if (/windows/i.test(platform) || baseOs === "Windows") {
+        const windows =
+            windowsNameFromPlatformVersion(platformVersion);
+
+        if (windows) return windows;
+    }
+
+    if (/android/i.test(platform) && platformVersion) {
+        const version = cleanVersion(platformVersion, 2);
+        if (version) return `Android ${version}`;
+    }
+
+    if (/mac/i.test(platform) && platformVersion) {
+        const version = cleanVersion(platformVersion, 2);
+        if (version) return `macOS ${version}`;
+    }
+
+    return osNameFromUa(String(ua || ""));
+}
+
+function parseUserAgent(ua, clientEnvironment = {}) {
     const value = String(ua || "");
 
     let browser = "Other";
@@ -44,12 +138,18 @@ function parseUserAgent(ua) {
     else if (/Chrome\//i.test(value) || /Chromium\//i.test(value)) browser = "Chrome";
     else if (/Safari\//i.test(value) && /Version\//i.test(value)) browser = "Safari";
 
-    let os = "Other";
-    if (/Windows NT/i.test(value)) os = "Windows";
-    else if (/Android/i.test(value)) os = "Android";
-    else if (/iPhone|iPad|iPod/i.test(value)) os = "iOS";
-    else if (/Mac OS X|Macintosh/i.test(value)) os = "macOS";
-    else if (/Linux/i.test(value)) os = "Linux";
+    let baseOs = "Other";
+    if (/Windows NT/i.test(value)) baseOs = "Windows";
+    else if (/Android/i.test(value)) baseOs = "Android";
+    else if (/iPhone|iPad|iPod/i.test(value)) baseOs = "iOS";
+    else if (/Mac OS X|Macintosh/i.test(value)) baseOs = "macOS";
+    else if (/Linux/i.test(value)) baseOs = "Linux";
+
+    const os = enrichOsName(
+        baseOs,
+        value,
+        clientEnvironment
+    );
 
     let device = "Desktop";
     if (/iPad|Tablet/i.test(value)) device = "Tablet";
@@ -178,7 +278,13 @@ async function shouldCountPageView(db, visitorKey) {
     return true;
 }
 
-async function insertEvent({ db, eventType, scriptId, request }) {
+async function insertEvent({
+    db,
+    eventType,
+    scriptId,
+    request,
+    clientEnvironment = {},
+}) {
     const requestUrl = new URL(request.url);
     const ua = request.headers.get("User-Agent") || "";
     const cf = request.cf || {};
@@ -189,7 +295,10 @@ async function insertEvent({ db, eventType, scriptId, request }) {
     const city = clean(cf.city || "", 80);
     const timezone = clean(cf.timezone || "", 80);
 
-    const { browser, os, device } = parseUserAgent(ua);
+    const { browser, os, device } = parseUserAgent(
+        ua,
+        clientEnvironment
+    );
     const referrer = clean(referrerHost(request), 160);
     const hostname = clean(requestUrl.hostname, 160);
     const isDomestic = DOMESTIC_COUNTRIES.has(country) ? 1 : 0;
@@ -258,6 +367,17 @@ export async function onRequestPost(context) {
         return json({ ok: false, error: "invalid json" }, 400);
     }
 
+    const clientEnvironment = {
+        platform: clean(
+            body?.clientEnvironment?.platform,
+            80
+        ),
+        platformVersion: clean(
+            body?.clientEnvironment?.platformVersion,
+            40
+        ),
+    };
+
     const eventType = clean(body.eventType, 32);
 
     if (!["page_view", "install_click"].includes(eventType)) {
@@ -313,6 +433,7 @@ export async function onRequestPost(context) {
             eventType,
             scriptId: "",
             request,
+            clientEnvironment,
         });
 
         return json({
@@ -331,6 +452,7 @@ export async function onRequestPost(context) {
         eventType,
         scriptId,
         request,
+        clientEnvironment,
     });
 
     return json({
@@ -348,5 +470,6 @@ export async function onRequestGet() {
         pageViewRule: `same browser device + same IP counted once per ${PAGE_VIEW_DEDUPE_HOURS} hours`,
         installRule: "every install click is counted",
         privacy: "raw IP and client device ID are not stored",
+        osDetail: "OS family/version is derived from User-Agent and UA Client Hints when available",
     });
 }

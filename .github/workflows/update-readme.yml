@@ -45,7 +45,7 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
           from urllib.parse import quote
-          from datetime import datetime
+          from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
           from html import escape
           import json
@@ -574,6 +574,10 @@ jobs:
               "Game": 900,
           }
 
+          # 源脚本最近多少天内发生修改时，在卡片标题旁显示“更新”提示。
+          # 后续如果觉得提示保留时间过长 / 过短，只改这个数字即可。
+          RECENT_UPDATE_BADGE_DAYS = 7
+
 
           def folder_display_name(folder):
               folder = str(folder or "").strip()
@@ -601,6 +605,18 @@ jobs:
                   PAGE_GROUP_ORDER.get(label, 500),
                   label.lower(),
                   str(folder).lower(),
+              )
+
+
+          def is_recently_updated(modified_dt):
+              if not modified_dt:
+                  return False
+
+              age = datetime.now(TZ) - modified_dt
+
+              return (
+                  age.total_seconds() >= 0
+                  and age <= timedelta(days=RECENT_UPDATE_BADGE_DAYS)
               )
 
 
@@ -761,6 +777,16 @@ jobs:
                       else "-"
                   )
 
+                  update_badge = ""
+
+                  if is_recently_updated(item["modified_dt"]):
+                      update_badge = (
+                          '<span class="script-update-badge" '
+                          f'title="最近更新：{h(modified_date)}">'
+                          '<span aria-hidden="true">↻</span> 更新'
+                          '</span>'
+                      )
+
                   cards.append(
                       f"""
                       <article class="script-card"
@@ -768,7 +794,10 @@ jobs:
                                data-script-id="{h(item["publish_id"])}"
                                data-search="{h(search_text)}">
                         <div class="script-card-head">
-                          <h3>{h(item["name"])}</h3>
+                          <div class="script-title-wrap">
+                            <h3>{h(item["name"])}</h3>
+                            {update_badge}
+                          </div>
                           <span class="script-version">v{h(item["version"])}</span>
                         </div>
 
@@ -1773,10 +1802,34 @@ jobs:
                 justify-content: space-between;
               }}
 
+              .script-title-wrap {{
+                display: flex;
+                min-width: 0;
+                flex-wrap: wrap;
+                gap: 7px;
+                align-items: center;
+              }}
+
               .script-card h3 {{
                 margin: 0;
                 font-size: 19px;
                 line-height: 1.45;
+              }}
+
+              .script-update-badge {{
+                display: inline-flex;
+                height: 22px;
+                align-items: center;
+                gap: 4px;
+                padding: 0 7px;
+                border: 1px solid #ffd6d1;
+                border-radius: 999px;
+                color: #d92d20;
+                background: #fff2f0;
+                font-size: 10px;
+                font-weight: 850;
+                line-height: 1;
+                white-space: nowrap;
               }}
 
               .script-version {{
@@ -2698,11 +2751,11 @@ jobs:
                   <section class="stats-card">
                     <div class="stats-card-head">
                       <div>
-                        <h3 class="stats-card-title">访问设备</h3>
-                        <p class="stats-card-note">桌面端、手机及其他设备</p>
+                        <h3 class="stats-card-title">常用浏览器</h3>
+                        <p class="stats-card-note">按页面访问次数排序</p>
                       </div>
                     </div>
-                    <ol class="ranking-list" id="top-devices"></ol>
+                    <ol class="ranking-list" id="top-browsers"></ol>
                   </section>
                 </div>
               </div>
@@ -2852,7 +2905,7 @@ jobs:
                 const topScriptsList = document.getElementById("top-scripts");
                 const topCitiesList = document.getElementById("top-cities");
                 const topOperatingSystemsList = document.getElementById("top-operating-systems");
-                const topDevicesList = document.getElementById("top-devices");
+                const topBrowsersList = document.getElementById("top-browsers");
                 const installLinks = [...document.querySelectorAll(".script-install-link")];
                 const imageButtons = [...document.querySelectorAll(".script-images-button")];
                 const descriptionToggles = [...document.querySelectorAll(".description-toggle")];
@@ -3444,11 +3497,59 @@ jobs:
                   return anonymousDeviceId;
                 }}
 
-                function trackEvent(eventType, scriptId = "") {{
+                let clientEnvironmentPromise = null;
+
+                function getClientEnvironment() {{
+                  if (clientEnvironmentPromise) {{
+                    return clientEnvironmentPromise;
+                  }}
+
+                  clientEnvironmentPromise = (async () => {{
+                    const result = {{
+                      platform: "",
+                      platformVersion: ""
+                    }};
+
+                    try {{
+                      if (
+                        navigator.userAgentData &&
+                        typeof navigator.userAgentData.getHighEntropyValues === "function"
+                      ) {{
+                        const values =
+                          await navigator.userAgentData.getHighEntropyValues([
+                            "platform",
+                            "platformVersion"
+                          ]);
+
+                        result.platform =
+                          String(values.platform || "");
+
+                        result.platformVersion =
+                          String(values.platformVersion || "");
+                      }} else {{
+                        result.platform =
+                          String(navigator.platform || "");
+                      }}
+                    }} catch (_) {{
+                      result.platform =
+                        String(navigator.platform || "");
+                    }}
+
+                    return result;
+                  }})();
+
+                  return clientEnvironmentPromise;
+                }}
+
+                async function trackEvent(eventType, scriptId = "") {{
+                  const clientEnvironment =
+                    await getClientEnvironment();
+
                   const payload = JSON.stringify({{
                     eventType,
                     scriptId,
-                    deviceId: getAnonymousDeviceId()
+                    deviceId: getAnonymousDeviceId(),
+                    clientEnvironment
                   }});
 
                   if (navigator.sendBeacon) {{
@@ -3503,31 +3604,22 @@ jobs:
                     countMain.textContent =
                       formatNumber(item.count) + " 次";
 
-                    const today = document.createElement("small");
-                    today.className = "count-today";
-                    today.textContent =
-                      "今日 +" + formatNumber(item.todayCount || 0);
+                    count.append(countMain);
 
-                    count.append(countMain, today);
+                    const todayCount = Number(item.todayCount || 0);
+
+                    if (Number.isFinite(todayCount) && todayCount > 0) {{
+                      const today = document.createElement("small");
+                      today.className = "count-today";
+                      today.textContent =
+                        "今日 +" + formatNumber(todayCount);
+                      count.append(today);
+                    }}
+
                     li.append(rank, name, count);
                     container.appendChild(li);
                   }});
                 }}
-
-                function deviceDisplayName(value) {{
-                  const raw = String(value || "Other");
-                  const key = raw.toLowerCase();
-
-                  const names = {{
-                    desktop: "桌面端",
-                    mobile: "手机",
-                    tablet: "平板",
-                    other: "其他"
-                  }};
-
-                  return names[key] || raw;
-                }}
-
 
                 function operatingSystemDisplayName(value) {{
                   const raw = String(value || "Other");
@@ -3595,24 +3687,42 @@ jobs:
                       const todayVisits = Number(todayStats.visits);
                       const todayInstalls = Number(todayStats.installs);
 
-                      if (Number.isFinite(todayVisits)) {{
+                      if (
+                        Number.isFinite(todayVisits) &&
+                        todayVisits > 0
+                      ) {{
                         statsVisitsToday.textContent =
                           "今日 +" + formatNumber(todayVisits);
                         statsVisitsToday.hidden = false;
+                      }} else {{
+                        statsVisitsToday.hidden = true;
                       }}
 
-                      if (Number.isFinite(todayInstalls)) {{
+                      if (
+                        Number.isFinite(todayInstalls) &&
+                        todayInstalls > 0
+                      ) {{
                         statsInstallsToday.textContent =
                           "今日 +" + formatNumber(todayInstalls);
                         statsInstallsToday.hidden = false;
+                      }} else {{
+                        statsInstallsToday.hidden = true;
                       }}
                     }}
 
                     if (regionText) {{
                       statsRegion.textContent = regionText;
-                      statsRegionToday.textContent =
-                        "今日 +" + formatNumber(regionToday);
-                      statsRegionToday.hidden = false;
+
+                      if (
+                        Number.isFinite(regionToday) &&
+                        regionToday > 0
+                      ) {{
+                        statsRegionToday.textContent =
+                          "今日 +" + formatNumber(regionToday);
+                        statsRegionToday.hidden = false;
+                      }} else {{
+                        statsRegionToday.hidden = true;
+                      }}
                     }}
 
                     const browsers = Array.isArray(data.browsers)
@@ -3627,10 +3737,20 @@ jobs:
                         formatNumber(topBrowser.count) +
                         " 次";
 
-                      statsBrowserToday.textContent =
-                        "今日 +" +
-                        formatNumber(topBrowser.todayCount || 0);
-                      statsBrowserToday.hidden = false;
+                      const browserToday = Number(
+                        topBrowser.todayCount || 0
+                      );
+
+                      if (
+                        Number.isFinite(browserToday) &&
+                        browserToday > 0
+                      ) {{
+                        statsBrowserToday.textContent =
+                          "今日 +" + formatNumber(browserToday);
+                        statsBrowserToday.hidden = false;
+                      }} else {{
+                        statsBrowserToday.hidden = true;
+                      }}
                     }}
 
                     const domesticRegions = Array.isArray(data.domesticRegions)
@@ -3642,13 +3762,22 @@ jobs:
                         .map(item => {{
                           const name = String(item.name || "");
                           const count = formatNumber(item.count);
-                          const today = formatNumber(item.todayCount || 0);
+                          const todayCount = Number(
+                            item.todayCount || 0
+                          );
+
+                          const todayText =
+                            Number.isFinite(todayCount) &&
+                            todayCount > 0
+                              ? '<small class="count-today">今日 +' +
+                                formatNumber(todayCount) +
+                                "</small>"
+                              : "";
 
                           return '<span class="region-chip">' +
                             name + " " + count + " 次" +
-                            '<small class="count-today">今日 +' +
-                            today +
-                            "</small></span>";
+                            todayText +
+                            "</span>";
                         }})
                         .join("");
 
@@ -3686,9 +3815,16 @@ jobs:
                         target.hidden = false;
 
                         if (today) {{
-                          today.textContent =
-                            "今日 +" + formatNumber(todayCount);
-                          today.hidden = false;
+                          if (
+                            Number.isFinite(todayCount) &&
+                            todayCount > 0
+                          ) {{
+                            today.textContent =
+                              "今日 +" + formatNumber(todayCount);
+                            today.hidden = false;
+                          }} else {{
+                            today.hidden = true;
+                          }}
                         }}
                       }}
                     }});
@@ -3703,10 +3839,6 @@ jobs:
 
                     const operatingSystems = Array.isArray(data.operatingSystems)
                       ? data.operatingSystems.slice(0, 5)
-                      : [];
-
-                    const devices = Array.isArray(data.devices)
-                      ? data.devices.slice(0, 5)
                       : [];
 
                     renderRanking(
@@ -3728,16 +3860,16 @@ jobs:
                     );
 
                     renderRanking(
-                      topDevicesList,
-                      devices,
-                      item => deviceDisplayName(item.name)
+                      topBrowsersList,
+                      browsers,
+                      item => String(item.name || "其他")
                     );
 
                     const hasDetailData =
                       topScripts.length ||
                       domesticCities.length ||
                       operatingSystems.length ||
-                      devices.length;
+                      browsers.length;
 
                     if (hasDetailData) {{
                       statsDetails.hidden = false;
