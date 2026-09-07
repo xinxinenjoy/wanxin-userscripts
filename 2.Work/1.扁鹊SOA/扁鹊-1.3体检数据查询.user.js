@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.5.0
+// @version      1.5.1
 // @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡数量，并支持卡池新标签页自动查询。注意：卡类查询需要账号用友对应的权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -25,6 +25,9 @@
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.5.1  -  2026-9-7
+ * - 优化卡状态展示：按状态颜色标签显示，提高卡信息可读性。
  *
  * v1.5.0  -  2026-9-7
  * - 卡池查询优化：单次请求改为100条，并自动分页获取完整数据。
@@ -3304,13 +3307,33 @@
                 >${safeValue}</div>
                 ${
                   success && Object.keys(statusSummary).length
-                    ? `<div style="margin-top:5px;color:#667085;font-size:10px;line-height:1.5;">
+                    ? `<div style="margin-top:7px;text-align:left;font-size:11px;line-height:1.8;font-weight:600;">
                       ${Object.entries(statusSummary)
-                        .map(([k,v]) => `${k}${v}张`)
-                        .join(" / ")}
+                        .map(([k, v]) => {
+                          let color = "#1677ff";
+                          let bg = "#e6f4ff";
+
+                          if (k === "生效中") {
+                            color = "#389e0d";
+                            bg = "#f6ffed";
+                          } else if (k === "已核销") {
+                            color = "#8c8c8c";
+                            bg = "#f5f5f5";
+                          } else if (k === "冻结") {
+                            color = "#d46b08";
+                            bg = "#fff7e6";
+                          } else if (k === "作废") {
+                            color = "#cf1322";
+                            bg = "#fff1f0";
+                          }
+
+                          return `<div style="display:block;margin-top:3px;padding:2px 6px;border-radius:4px;background:${bg};color:${color};">
+                            ${k}：${v}张
+                          </div>`;
+                        })
+                        .join("")}
                     </div>`
-                    : ""
-                }
+                    : ""}
               </div>
             `;
           }
