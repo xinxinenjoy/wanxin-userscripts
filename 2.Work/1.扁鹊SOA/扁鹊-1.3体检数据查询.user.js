@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.4.3
+// @version      1.5.0
 // @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡数量，并支持卡池新标签页自动查询。注意：卡类查询需要账号用友对应的权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -25,6 +25,12 @@
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.5.0  -  2026-9-7
+ * - 卡池查询优化：单次请求改为100条，并自动分页获取完整数据。
+ * - 增加卡状态统计：生效中、已核销、冻结、作废及其他。
+ * - 卡状态数量按实际存在情况显示，空状态自动隐藏。
+ * - 增加大卡池查询过程提示。
  *
  * v1.4.3  -  2026-9-6
  * - 优化页面级缓存机制：缓存绑定当前订单页面，不使用持久化缓存。
@@ -81,6 +87,16 @@
 
   const AUTO_DATA_CACHE_MS =
     15000;
+
+  const CARD_STATUS_MAP = {
+    ENABLE: "生效中",
+    USED: "已核销",
+    FREEZE: "冻结",
+    FROZEN: "冻结",
+    INVALID: "作废",
+    CANCEL: "作废",
+    CANCELLED: "作废"
+  };
 
   const CONFIG = {
     REACTIVE_POLL_INTERVAL: 400,
@@ -2380,77 +2396,67 @@
     api,
     cardCorpCode
   ) {
-    const response =
-      await fetch(
-        api,
-        {
-          method:
-            "POST",
-          headers: {
-            "accept":
-              "application/json, text/plain, */*",
-            "content-type":
-              "application/json;charset=UTF-8",
-            "mnclientid":
-              "MN_SOA3"
-          },
-          body:
-            JSON.stringify({
-              region_code:
-                "XX",
-              page_index:
-                1,
-              page_size:
-                20,
-              cardCorpCode
-            }),
-          credentials:
-            "include"
-        }
-      );
+    const fetchPage = async(pageIndex) => {
+      const response = await fetch(api, {
+        method: "POST",
+        headers: {
+          "accept": "application/json, text/plain, */*",
+          "content-type": "application/json;charset=UTF-8",
+          "mnclientid": "MN_SOA3"
+        },
+        body: JSON.stringify({
+          region_code: "XX",
+          page_index: pageIndex,
+          page_size: 100,
+          cardCorpCode
+        }),
+        credentials: "include"
+      });
 
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status}`
-      );
-    }
+      const payload = await response.json();
 
-    const payload =
-      await response.json();
+      const backendError =
+        getCardPoolBackendError(payload);
 
-    const backendError =
-      getCardPoolBackendError(
-        payload
-      );
+      if (backendError) {
+        throw new Error(backendError);
+      }
 
-    if (backendError) {
-      throw new Error(
-        backendError
-      );
-    }
+      return payload;
+    };
+
+    const first = await fetchPage(1);
 
     const totalNum =
-      extractCardPoolTotalNum(
-        payload
+      extractCardPoolTotalNum(first);
+
+    if (totalNum === null) {
+      throw new Error("接口成功，但未返回 total_num");
+    }
+
+    let items =
+      [...(first?.data?.items || [])];
+
+    const pages =
+      Math.ceil(totalNum / 100);
+
+    for (let i = 2; i <= pages; i++) {
+      updatePanelStatus(
+        `正在查询卡池：已加载 ${items.length}/${totalNum}`
       );
 
-    if (
-      totalNum === null
-    ) {
-      console.warn(
-        "[SOA订单数据] 卡池接口未返回 data.total_num：",
-        {
-          api,
-          payload
-        }
-      );
+      const pageData =
+        await fetchPage(i);
 
-      throw new Error(
-        "接口成功，但未返回 total_num"
+      items.push(
+        ...(pageData?.data?.items || [])
       );
     }
 
-    return totalNum;
+    return {
+      totalNum,
+      items
+    };
   }
 
   async function safeFetchCardPoolTotal(
@@ -2458,22 +2464,21 @@
     cardCorpCode
   ) {
     try {
+      const result =
+        await fetchCardPoolTotalNum(
+          api,
+          cardCorpCode
+        );
+
       return {
-        ok:
-          true,
-        totalNum:
-          await fetchCardPoolTotalNum(
-            api,
-            cardCorpCode
-          )
+        ok: true,
+        totalNum: result.totalNum,
+        items: result.items
       };
     } catch (error) {
       return {
-        ok:
-          false,
-        error:
-          error?.message ||
-          String(error)
+        ok: false,
+        error: error?.message || String(error)
       };
     }
   }
@@ -3118,6 +3123,22 @@
     }
   }
 
+  function buildCardStatusSummary(items) {
+    const summary = {};
+
+    (items || []).forEach(item => {
+      const status =
+        CARD_STATUS_MAP[
+          String(item.status || "").toUpperCase()
+        ] || "其他";
+
+      summary[status] =
+        (summary[status] || 0) + 1;
+    });
+
+    return summary;
+  }
+
   function renderCardPoolSummary(
     data,
     cardCorpCode
@@ -3163,10 +3184,13 @@
 
             const numericValue =
               success
-                ? Number(
-                    result.totalNum
-                  )
+                ? Number(result.totalNum)
                 : null;
+
+            const statusSummary =
+              success
+                ? buildCardStatusSummary(result.items)
+                : {};
 
             const clickable =
               success &&
@@ -3278,6 +3302,15 @@
                       : safeValue
                   }"
                 >${safeValue}</div>
+                ${
+                  success && Object.keys(statusSummary).length
+                    ? `<div style="margin-top:5px;color:#667085;font-size:10px;line-height:1.5;">
+                      ${Object.entries(statusSummary)
+                        .map(([k,v]) => `${k}${v}张`)
+                        .join(" / ")}
+                    </div>`
+                    : ""
+                }
               </div>
             `;
           }
@@ -4457,7 +4490,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.4.3
+          体检数据 v1.5.0
         </strong>
 
         <div style="
