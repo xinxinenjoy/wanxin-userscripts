@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.6.3
+// @version      1.6.4
 // @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡/电商卡数量，并支持原有卡池新标签页自动查询。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -25,6 +25,12 @@
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.6.4  -  2026-9-7
+ * - 优化大卡池分页请求节奏：10页以内每次请求后随机等待50-100ms，10页以上随机等待100-200ms。
+ * - 每连续完成7-10次分页请求后，额外随机停顿800-1200ms；每轮停顿阈值重新随机生成。
+ * - 第一页计入连续请求次数；最后一页完成后不再执行无意义等待。
+ * - 仅调整卡池分页请求节奏，查询接口、page_size=100、完整分页、缓存、状态识别、UI和三类卡跳转逻辑均保持不变。
  *
  * v1.6.3  -  2026-9-7
  * - 仅优化卡分类UI：三类卡继续固定显示，但0值卡自动收缩，不再被有状态明细的卡片强制撑高。
@@ -281,6 +287,29 @@
           resolve,
           ms
         )
+    );
+  }
+
+  function randomInt(
+    min,
+    max
+  ) {
+    const low =
+      Math.ceil(
+        Number(min)
+      );
+
+    const high =
+      Math.floor(
+        Number(max)
+      );
+
+    return (
+      Math.floor(
+        Math.random() *
+        (high - low + 1)
+      ) +
+      low
     );
   }
 
@@ -2497,22 +2526,101 @@
     }
 
     let items =
-      [...(first?.data?.items || [])];
+      [
+        ...(first?.data?.items || [])
+      ];
 
     const pages =
-      Math.ceil(totalNum / 100);
-
-    for (let i = 2; i <= pages; i++) {
-      updatePanelStatus(
-        `正在查询卡池：已加载 ${items.length}/${totalNum}`
+      Math.ceil(
+        totalNum / 100
       );
+
+    /*
+     * 卡池分页请求节奏：
+     * - <=10页：每次分页之间随机等待50-100ms
+     * - >10页：每次分页之间随机等待100-200ms
+     * - 每连续完成7-10次请求后，额外停顿800-1200ms
+     * - 第一页计入连续请求次数
+     * - 最后一页完成后不再额外等待
+     */
+    let requestsSinceBreak =
+      pages > 0
+        ? 1
+        : 0;
+
+    let nextBreakAt =
+      randomInt(
+        7,
+        10
+      );
+
+    const shortDelayRange =
+      pages <= 10
+        ? [50, 100]
+        : [100, 200];
+
+    for (
+      let pageIndex = 2;
+      pageIndex <= pages;
+      pageIndex++
+    ) {
+      /*
+       * 上一页请求已经完成。
+       * 在发起下一页前先加入短随机延迟。
+       */
+      await sleep(
+        randomInt(
+          shortDelayRange[0],
+          shortDelayRange[1]
+        )
+      );
+
+      /*
+       * 连续完成7-10次请求后主动长停顿。
+       * 每次长停顿后重新随机生成下一轮阈值。
+       */
+      if (
+        requestsSinceBreak >=
+        nextBreakAt
+      ) {
+        updatePanelStatus(
+          `正在查询卡池：已加载 ${items.length}/${totalNum}，短暂停顿...`
+        );
+
+        await sleep(
+          randomInt(
+            800,
+            1200
+          )
+        );
+
+        requestsSinceBreak =
+          0;
+
+        nextBreakAt =
+          randomInt(
+            7,
+            10
+          );
+      } else {
+        updatePanelStatus(
+          `正在查询卡池：已加载 ${items.length}/${totalNum}`
+        );
+      }
 
       const pageData =
-        await fetchPage(i);
+        await fetchPage(
+          pageIndex
+        );
 
       items.push(
-        ...(pageData?.data?.items || [])
+        ...(
+          pageData?.data?.items ||
+          []
+        )
       );
+
+      requestsSinceBreak++;
     }
 
     return {
@@ -4892,7 +5000,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.6.3
+          体检数据 v1.6.4
         </strong>
 
         <div style="
