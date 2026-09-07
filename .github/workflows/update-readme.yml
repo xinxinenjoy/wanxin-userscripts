@@ -3673,12 +3673,6 @@ jobs:
                     const count = document.createElement("span");
                     count.className = "ranking-count";
 
-                    const countMain = document.createElement("span");
-                    countMain.textContent =
-                      formatNumber(item.count) + " 次";
-
-                    count.append(countMain);
-
                     const todayCount = Number(item.todayCount || 0);
 
                     if (Number.isFinite(todayCount) && todayCount > 0) {{
@@ -3688,6 +3682,12 @@ jobs:
                         "今日 +" + formatNumber(todayCount);
                       count.append(today);
                     }}
+
+                    const countMain = document.createElement("span");
+                    countMain.textContent =
+                      formatNumber(item.count) + " 次";
+
+                    count.append(countMain);
 
                     li.append(rank, name, count);
                     container.appendChild(li);
@@ -4026,6 +4026,8 @@ jobs:
                       scriptId,
                       version
                     );
+
+                    refreshUpdateBadges();
 
                     trackEvent(
                       "install_click",
