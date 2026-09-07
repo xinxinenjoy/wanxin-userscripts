@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.5.1
+// @version      1.5.2
 // @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡数量，并支持卡池新标签页自动查询。注意：卡类查询需要账号用友对应的权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -25,6 +25,11 @@
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.5.2  -  2026-9-7
+ * - 仅优化卡分类UI：取消状态行灰色/彩色底块，改为简洁的左右对齐明细。
+ * - 状态名称左对齐、数量右对齐并加粗；去掉“张”字，适当放大字号。
+ * - 生效中用绿色、已核销用灰色、已冻结用橙色、作废用红色、其他用蓝色。
  *
  * v1.5.1  -  2026-9-7
  * - 优化卡状态展示：按状态颜色标签显示，提高卡信息可读性。
@@ -3307,28 +3312,72 @@
                 >${safeValue}</div>
                 ${
                   success && Object.keys(statusSummary).length
-                    ? `<div style="margin-top:7px;text-align:left;font-size:11px;line-height:1.8;font-weight:600;">
+                    ? `<div style="
+                        margin-top:8px;
+                        padding-top:7px;
+                        border-top:1px solid rgba(56,142,60,.12);
+                        text-align:left;
+                      ">
                       ${Object.entries(statusSummary)
                         .map(([k, v]) => {
-                          let color = "#1677ff";
-                          let bg = "#e6f4ff";
+                          let label =
+                            k;
+
+                          let color =
+                            "#1677ff";
+
+                          let numberColor =
+                            "#344054";
 
                           if (k === "生效中") {
-                            color = "#389e0d";
-                            bg = "#f6ffed";
+                            color =
+                              "#389e0d";
+                            numberColor =
+                              "#237804";
                           } else if (k === "已核销") {
-                            color = "#8c8c8c";
-                            bg = "#f5f5f5";
+                            color =
+                              "#7a8599";
+                            numberColor =
+                              "#475467";
                           } else if (k === "冻结") {
-                            color = "#d46b08";
-                            bg = "#fff7e6";
+                            label =
+                              "已冻结";
+                            color =
+                              "#d46b08";
+                            numberColor =
+                              "#ad4e00";
                           } else if (k === "作废") {
-                            color = "#cf1322";
-                            bg = "#fff1f0";
+                            color =
+                              "#cf1322";
+                            numberColor =
+                              "#a8071a";
                           }
 
-                          return `<div style="display:block;margin-top:3px;padding:2px 6px;border-radius:4px;background:${bg};color:${color};">
-                            ${k}：${v}张
+                          return `<div style="
+                            display:flex;
+                            align-items:center;
+                            justify-content:space-between;
+                            gap:10px;
+                            min-height:23px;
+                            padding:1px 3px;
+                            font-size:12px;
+                            line-height:1.55;
+                          ">
+                            <span style="
+                              min-width:0;
+                              color:${color};
+                              font-weight:600;
+                              white-space:nowrap;
+                            ">${label}</span>
+                            <span style="
+                              flex:0 0 auto;
+                              min-width:28px;
+                              color:${numberColor};
+                              font-size:13px;
+                              font-weight:800;
+                              text-align:right;
+                              font-variant-numeric:tabular-nums;
+                            ">${v}</span>
                           </div>`;
                         })
                         .join("")}
@@ -4513,7 +4562,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.5.0
+          体检数据 v1.5.2
         </strong>
 
         <div style="
