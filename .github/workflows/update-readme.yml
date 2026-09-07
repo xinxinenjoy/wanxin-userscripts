@@ -67,6 +67,8 @@ jobs:
           SITE_ASSETS_ROOT = ROOT / SITE_ASSETS_DIR
 
           # 首页只读取 Build 已经生成好的网页优化图。
+# 图片目录预留：publish/assets/scripts/<publishID>/
+# 支持同一脚本多张 WebP 图片展示。
           SCRIPT_IMAGE_ROOT = (
               PUBLISH_ROOT
               / "assets"
@@ -578,7 +580,7 @@ jobs:
           # 在卡片标题旁显示“今日更新”提示。
           #
           # 页面会结合当前脚本版本号和浏览器本地记录判断：
-          # 如果用户已经点击过该版本的“立即安装”，本浏览器不再显示提示。
+          # 如果用户已经点击过该脚本当前版本的“立即安装”，本浏览器不再显示提示；更换设备不会影响其他设备显示。
           def folder_display_name(folder):
               folder = str(folder or "").strip()
 
@@ -828,6 +830,8 @@ jobs:
                           <div class="script-actions">
                             <a class="button button-primary script-install-link"
                                href="{h(item["install_url"])}"
+                               target="_blank"
+                               rel="noopener noreferrer"
                                data-script-id="{h(item["publish_id"])}"
                                data-version="{h(item["version"])}">
                               立即安装
