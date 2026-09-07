@@ -2711,7 +2711,7 @@ jobs:
                     </div>
                   </div>
                   <div class="stat-item">
-                    <span class="stat-label">常用浏览器</span>
+                    <span class="stat-label">浏览器版本</span>
                     <div class="stat-value-row">
                       <strong class="stat-value" id="stats-browser">-</strong>
                       <span class="stat-today" id="stats-browser-today" hidden></span>
@@ -2748,8 +2748,8 @@ jobs:
                   <section class="stats-card">
                     <div class="stats-card-head">
                       <div>
-                        <h3 class="stats-card-title">操作系统</h3>
-                        <p class="stats-card-note">按页面访问次数排序</p>
+                        <h3 class="stats-card-title">操作系统版本</h3>
+                        <p class="stats-card-note">按系统版本的页面访问次数排序</p>
                       </div>
                     </div>
                     <ol class="ranking-list" id="top-operating-systems"></ol>
@@ -2758,8 +2758,8 @@ jobs:
                   <section class="stats-card">
                     <div class="stats-card-head">
                       <div>
-                        <h3 class="stats-card-title">常用浏览器</h3>
-                        <p class="stats-card-note">按页面访问次数排序</p>
+                        <h3 class="stats-card-title">浏览器版本排行</h3>
+                        <p class="stats-card-note">按浏览器版本的页面访问次数排序</p>
                       </div>
                     </div>
                     <ol class="ranking-list" id="top-browsers"></ol>

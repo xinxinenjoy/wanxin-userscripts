@@ -1,5 +1,5 @@
 // Cloudflare Pages Function
-// V7 统计事件采集
+// V8 统计事件采集
 // 保存路径：functions/api/track.js
 //
 // 页面访问统计规则：
@@ -129,14 +129,71 @@ function enrichOsName(baseOs, ua, clientEnvironment = {}) {
     return osNameFromUa(String(ua || ""));
 }
 
+function browserNameWithVersion(value) {
+    const ua = String(value || "");
+
+    const rules = [
+        {
+            regex: /SamsungBrowser\/([0-9.]+)/i,
+            name: "Samsung Internet",
+        },
+        {
+            regex: /OPR\/([0-9.]+)/i,
+            name: "Opera",
+        },
+        {
+            regex: /EdgA?\/([0-9.]+)/i,
+            name: "Edge",
+        },
+        {
+            regex: /EdgiOS\/([0-9.]+)/i,
+            name: "Edge",
+        },
+        {
+            regex: /CriOS\/([0-9.]+)/i,
+            name: "Chrome",
+        },
+        {
+            regex: /Chrome\/([0-9.]+)/i,
+            name: "Chrome",
+        },
+        {
+            regex: /FxiOS\/([0-9.]+)/i,
+            name: "Firefox",
+        },
+        {
+            regex: /Firefox\/([0-9.]+)/i,
+            name: "Firefox",
+        },
+        {
+            regex: /Version\/([0-9.]+).*Safari\//i,
+            name: "Safari",
+        },
+    ];
+
+    for (const rule of rules) {
+        const match = ua.match(rule.regex);
+
+        if (!match) {
+            continue;
+        }
+
+        // 版本排行默认保留主版本号。
+        // 这样既能区分 Chrome 140 / 141，也不会因为补丁版本造成过度碎片化。
+        const major = cleanVersion(match[1], 1);
+
+        return major
+            ? `${rule.name} ${major}`
+            : rule.name;
+    }
+
+    return "Other";
+}
+
 function parseUserAgent(ua, clientEnvironment = {}) {
     const value = String(ua || "");
 
-    let browser = "Other";
-    if (/Edg\//i.test(value)) browser = "Edge";
-    else if (/Firefox\//i.test(value)) browser = "Firefox";
-    else if (/Chrome\//i.test(value) || /Chromium\//i.test(value)) browser = "Chrome";
-    else if (/Safari\//i.test(value) && /Version\//i.test(value)) browser = "Safari";
+    const browser = browserNameWithVersion(value);
 
     let baseOs = "Other";
     if (/Windows NT/i.test(value)) baseOs = "Windows";
@@ -471,5 +528,6 @@ export async function onRequestGet() {
         installRule: "every install click is counted",
         privacy: "raw IP and client device ID are not stored",
         osDetail: "OS family/version is derived from User-Agent and UA Client Hints when available",
+        browserDetail: "browser field stores browser family + major version when available",
     });
 }
