@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.6.1
+// @version      1.6.3
 // @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡/电商卡数量，并支持原有卡池新标签页自动查询。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -25,6 +25,16 @@
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.6.3  -  2026-9-7
+ * - 仅优化卡分类UI：三类卡继续固定显示，但0值卡自动收缩，不再被有状态明细的卡片强制撑高。
+ * - 有数据卡适度强化边框和总数；0值卡降低视觉权重，仍明确显示“0”。
+ * - 状态名称字号提升至12px、数量提升至14px并加粗；缩小行间距，保持左侧状态、右侧数量严格对齐。
+ * - 状态区分隔线与上下留白同步收紧，提高信息密度和可读性；查询、分页、缓存、状态识别和跳转逻辑不变。
+ *
+ * v1.6.2  -  2026-9-7
+ * - 仅调整卡状态展示顺序，固定为：生效中 → 已核销 → 已冻结 → 作废 → 其他。
+ * - 数量为0的状态仍不显示；查询、分页、缓存、状态识别及三类卡跳转逻辑均保持不变。
  *
  * v1.6.1  -  2026-9-7
  * - 三类卡固定显示：套餐卡、储值卡、电商卡始终三列并排，0张也保留卡位，避免UI跳动。
@@ -138,6 +148,14 @@
     DISABLED: "作废",
     EXPIRED: "作废"
   };
+
+  const CARD_STATUS_DISPLAY_ORDER = [
+    "生效中",
+    "已核销",
+    "冻结",
+    "作废",
+    "其他"
+  ];
 
   const CONFIG = {
     REACTIVE_POLL_INTERVAL: 400,
@@ -3530,25 +3548,39 @@
             return `
               <div style="
                 min-width:0;
-                padding:8px 6px;
+                align-self:start;
+                padding:${
+                  success && !clickable
+                    ? "7px 6px"
+                    : "8px 6px"
+                };
                 border:1px solid ${
-                  success
-                    ? "#d9f7be"
-                    : "#ffccc7"
+                  !success
+                    ? "#ffccc7"
+                    : clickable
+                      ? "#b7eb8f"
+                      : "#dfe9d5"
                 };
                 border-radius:6px;
                 background:${
-                  success
-                    ? "#f6ffed"
-                    : "#fff2f0"
+                  !success
+                    ? "#fff2f0"
+                    : clickable
+                      ? "#f6ffed"
+                      : "#fbfdf8"
+                };
+                box-shadow:${
+                  success && clickable
+                    ? "0 1px 3px rgba(82,196,26,.06)"
+                    : "none"
                 };
                 text-align:center;
               ">
                 <div style="
                   margin-bottom:3px;
-                  color:#667085;
-                  font-size:11px;
-                  font-weight:600;
+                  color:#596579;
+                  font-size:12px;
+                  font-weight:650;
                   line-height:1.25;
                 ">${label}</div>
 
@@ -3562,16 +3594,18 @@
                       !success
                         ? "#cf1322"
                         : clickable
-                          ? "#389e0d"
-                          : "#1f2937"
+                          ? "#237804"
+                          : "#8a94a3"
                     };
                     font-size:${
                       success
-                        ? "16px"
+                        ? clickable
+                          ? "18px"
+                          : "16px"
                         : "11px"
                     };
                     font-weight:800;
-                    line-height:1.35;
+                    line-height:1.25;
                     cursor:${
                       canOpenCardPool
                         ? "pointer"
@@ -3593,12 +3627,19 @@
                 ${
                   success && Object.keys(statusSummary).length
                     ? `<div style="
-                        margin-top:8px;
-                        padding-top:7px;
-                        border-top:1px solid rgba(56,142,60,.12);
+                        margin-top:6px;
+                        padding-top:5px;
+                        border-top:1px solid rgba(56,142,60,.14);
                         text-align:left;
                       ">
-                      ${Object.entries(statusSummary)
+                      ${CARD_STATUS_DISPLAY_ORDER
+                        .map(k => [
+                          k,
+                          Number(
+                            statusSummary[k] || 0
+                          )
+                        ])
+                        .filter(([, v]) => v > 0)
                         .map(([k, v]) => {
                           let label =
                             k;
@@ -3637,24 +3678,25 @@
                             display:flex;
                             align-items:center;
                             justify-content:space-between;
-                            gap:4px;
-                            min-height:23px;
-                            padding:1px 2px;
-                            font-size:11px;
-                            line-height:1.55;
+                            gap:5px;
+                            min-height:19px;
+                            padding:0 2px;
+                            font-size:12px;
+                            line-height:1.32;
                           ">
                             <span style="
                               min-width:0;
                               color:${color};
-                              font-weight:600;
+                              font-weight:650;
                               white-space:nowrap;
                             ">${label}</span>
                             <span style="
                               flex:0 0 auto;
-                              min-width:22px;
+                              min-width:30px;
                               color:${numberColor};
-                              font-size:12px;
+                              font-size:14px;
                               font-weight:800;
+                              line-height:1.2;
                               text-align:right;
                               font-variant-numeric:tabular-nums;
                             ">${v}</span>
@@ -3675,6 +3717,9 @@
 
     grid.style.gridTemplateColumns =
       "repeat(3, minmax(0, 1fr))";
+
+    grid.style.alignItems =
+      "start";
 
     grid.style.marginTop =
       "9px";
@@ -4847,7 +4892,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.6.1
+          体检数据 v1.6.3
         </strong>
 
         <div style="
