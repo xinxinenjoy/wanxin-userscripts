@@ -3480,7 +3480,7 @@ jobs:
                     /^[A-Za-z0-9._:-]{{8,120}}$/.test(String(value || ""));
 
                   try {{
-                    const saved = 浏览器本地状态.getItem(DEVICE_ID_STORAGE_KEY);
+                    const saved = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
                     if (isValid(saved)) {{
                       anonymousDeviceId = saved;
                       return anonymousDeviceId;
@@ -3498,7 +3498,7 @@ jobs:
                   }}
 
                   try {{
-                    浏览器本地状态.setItem(
+                    localStorage.setItem(
                       DEVICE_ID_STORAGE_KEY,
                       anonymousDeviceId
                     );
@@ -3948,18 +3948,9 @@ jobs:
 
                 installLinks.forEach(link => {{
                   link.addEventListener("click", () => {{
-                    const scriptId =
-                      link.dataset.scriptId || "";
-                    const version =
-                      link.dataset.version || "";
-
-                    // 页面无法获知 Tampermonkey 最终是否确认安装，
-                    // 因此这里按“用户已点击当前版本安装”记录。
-                    // 同一天如果脚本再次升级到新版本，版本号不同，
-                    // “今日更新”会重新出现。
-trackEvent(
+                    trackEvent(
                       "install_click",
-                      scriptId
+                      link.dataset.scriptId || ""
                     );
                   }});
                 }});
@@ -3975,7 +3966,7 @@ trackEvent(
 
                 requestAnimationFrame(() => {{
                   refreshDescriptionToggles();
-}});
+                }});
 
                 trackEvent("page_view");
                 loadStats();
