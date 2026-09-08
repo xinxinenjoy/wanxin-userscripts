@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.5业绩报表辅助
 // @namespace    https://tampermonkey.net/
-// @version      0.2.3
-// @description  SOA报表辅助查询导出工具，一次性导出多个表格，免去重复操作。
+// @version      1.0.1
+// @description  SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。
 
 // @match        https://home.health-100.cn/*
 // @match        https://checkup-soa3.health-100.cn/*
@@ -23,77 +23,25 @@
 // ==/UserScript==
 
 /*
- * 红领巾-Fly报表下载工具
+ * 扁鹊-1.5业绩报表辅助
  *
- * 当前功能：
- * - 统一“报表工具”入口，一次点击同时查询：收入确认表、体检对账报表、客户加选项目报表。
- * - 三张报表共用日期条件：今天 / 本月 / 本季度 / 本年 / 自定义区间。
- * - 三张报表按顺序错开请求，避免同一时刻集中访问多个Fly报表接口。
- * - 查询结果统一列在一个结果区，可直接查看每张报表的数据量与当前状态，并分别下载。
- * - 收入确认表：查询确认有数据后显示“导出”。
- * - 体检对账报表：单位代码保持为空，按工具指定日期查询；超过1080天自动分段，一键依次导出有效分段。
- * - 客户加选项目报表：查询有数据后自动提交异步导出任务，显示“生成中”；最多自动等待15秒。
- * - 客户加选项目报表：15秒内生成完成后按钮变为“导出”；超时后变为“重新获取”，重新获取只读取下载中心，不重复提交任务。
- * - 客户加选项目报表：下载中心检测到 exportStatus=1 且 exportUrl 有值后，直接使用 exportUrl 下载。
- * - 完整保留Fly Token捕获、缓存、失效刷新、网络重试和与对账报表v1.9共存机制。
- * - 面板支持拖动及位置记忆；门户与SOA顶部提供统一入口。
+ * 功能说明：
+ * - 一次查询收入确认表、体检对账报表、客户加选项目报表，并分别查看、导出。
+ * - 支持今天、本月、本季度、本年和自定义日期区间。
+ * - 三张报表按顺序错开请求，降低集中访问风险。
+ * - 体检对账报表支持超1080天自动分段。
+ * - 客户加选项目报表支持异步生成、15秒检测、重新获取和查看下载中心状态。
+ * - 支持Fly授权自动获取、失效刷新、网络重试，并可与对账报表v1.9同时使用。
  *
- * 更新记录
+ * 更新记录：
  *
- * v0.3.1  -  2026-09-08
- * - 取消三张报表的“模块切换”操作，改为一次点击“查询全部报表”，统一查询并列出三张报表结果。
- * - 三张报表按“收入确认表 → 体检对账报表 → 客户加选项目报表”的顺序执行，相邻报表请求默认错开1.2秒。
- * - 结果区固定展示三张报表：待查询、查询中、数据量、无数据、生成中、可导出、重新获取或错误状态一目了然。
- * - 收入确认表和体检对账报表查询完成后可分别导出；体检对账报表如存在多个1080天分段，一次点击依次导出全部有效分段。
- * - 客户加选项目报表继续沿用“查询后自动生成”逻辑；最多等待15秒，完成后显示“导出”，超时显示“重新获取”。
- * - 查询期间保留结果逐项更新，不必等待三张表全部结束后才能查看前面已完成的结果。
- * - 优化顶部“报表工具”入口：改为更沉稳的深蓝半透明底色、去除图标底块、提高文字对比度。
- * - SOA页面自动寻找顶部“地区”文字作为对齐锚点，使报表入口与页面原有右侧导航文字保持同一视觉基线；找不到锚点时使用稳定回退位置。
+ * v1.0.1  -  2026-09-09
+ * - 调整为正式版本号，统一脚本说明与发布信息。
+ * - 精简更新日志，保留当前稳定功能说明。
+ * - 当前稳定支持三类报表统一查询、分别导出及客户加选异步任务处理。
  *
- * v0.3.0  -  2026-09-08
- * - 报表工具升级为多模块架构，新增“体检对账报表”和“客户加选项目报表”。
- * - 体检对账报表复用v1.9已验证接口；单位代码 corpCode 固定为空数组，日期使用工具公共区间。
- * - 体检对账报表保留1080天单段限制，超出后自动拆分连续区间，查询成功后分段独立导出。
- * - 客户加选项目报表使用 queryAddItems 查询，并在查询有数据后自动提交 asynchronousExportAddItems。
- * - 客户加选项目异步导出最多自动等待15秒；生成完成后按钮变为“导出”，超时后显示“重新获取”。
- * - “重新获取”只重新查询 downloadCenter/queryDownloadList，不会再次提交异步导出，避免重复生成报表任务。
- * - 下载中心以 exportName、createdBy、基准任务ID共同锁定本次新任务，检测到 exportStatus=1 且 exportUrl 有值后允许下载。
- * - 三个模块共享常用区间与自定义日期，切换模块不改变当前日期。
- *
- * v0.2.4  -  2026-09-08
- * - 全面优化报表面板视觉：统一蓝色主色、图标、字号、层级、间距和状态提示，提高可读性。
- * - 面板标题改为“报表工具”，新增“报表模块”区域；当前仅显示“收入确认表”，为后续继续增加Fly报表预留模块切换位置。
- * - “常用区间”移动到日期输入上方，新增：今天、本月、本季度、本年。
- * - 自动记录最近一次选择的常用区间；下次加载时作为默认区间并突出显示。
- * - 手工修改开始/结束日期即视为自定义区间，自动取消常用区间的突出状态，但不覆盖已记录的默认常用区间。
- * - 查询、导出、重新查询、Token授权及与对账报表v1.9共存逻辑保持不变。
- *
- * v0.2.3  -  2026-09-08
- * - 修复与“对账报表 v1.9”同时启用时的Fly Token捕获冲突。
- * - 收入确认表改用独立的fetch/XHR包装标记；即使v1.9已包装网络请求，本脚本仍会继续叠加自己的捕获层。
- * - Token缓存Key改为收入确认表独立命名，避免后续模块合并或维护时发生混淆。
- * - 脚本运行范围收窄为门户、SOA和Fly三个站点，不再全网页加载。
- * - 在 home.health-100.cn 与 checkup-soa3.health-100.cn 顶部蓝色导航右侧新增“报表工具”全局入口。
- * - 报表面板默认关闭，点击顶部入口打开；关闭后不影响页面使用。
- * - 保留面板拖动及位置记忆，入口在SOA首页、订单页及门户首页均可使用。
- *
- * v0.2.1  -  2026-09-08
- * - 修复Fly授权页打开后无法继续的问题：移除@noframes，允许在Fly内部框架中运行授权捕获逻辑。
- * - 恢复对账报表v1.9的执行方式：Fly站点只安装Token捕获后立即return，不继续加载业务UI。
- * - 非Fly页面仅在顶层窗口创建工具面板，避免iframe重复显示。
- *
- * v0.2.0  -  2026-09-08
- * - 重新基于对账报表v1.9的完整Fly授权模块构建，不再使用简化Token读取方案。
- * - 修复独立用户脚本之间GM存储互不共享，导致仅复用TOKEN_KEY仍无法读取Token的问题。
- * - 收入确认表改为“查询 → 有结果显示导出 → 手工导出”的完整流程。
- * - UI对齐对账报表风格：日期同行、查询按钮、导出卡片、重新查询、状态提示、拖动位置记忆。
- * - 增加真实HTTP/接口错误显示，便于后续新增其他Fly报表时排查。
- *
- * v0.1.4  -  2026-09-08
- * - 尝试复用对账报表Token Key。
- *
- * v0.1.0 ~ v0.1.3
- * - 初步完成收入确认表接口、日期快捷按钮与查询/导出测试。
+ * v0.x  -  2026-09-08
+ * - 完成三类报表接入、Fly授权共存、统一查询界面、日期快捷区间及下载状态处理。
  */
 
 (() => {
@@ -114,6 +62,9 @@
 
   const FLY_REPORT_URL =
     "https://app-fly.health-100.cn/autoapp-sheet-from/finance/srqrb?menuCode=1582200567533940737";
+
+  const ADD_ITEMS_DOWNLOAD_CENTER_URL =
+    "https://app-fly.health-100.cn/autoapp-sheet-from/downloadcenter/statement-download-list?exportName=%E5%AE%A2%E6%88%B7%E5%8A%A0%E9%80%89%E9%A1%B9%E7%9B%AE%E6%8A%A5%E8%A1%A8";
 
   const API = {
     INCOME_QUERY:
@@ -2868,7 +2819,7 @@
         zIndex:
           "2147483646",
         width:
-          "520px",
+          "470px",
         maxWidth:
           "calc(100vw - 24px)",
         padding:
@@ -2941,7 +2892,7 @@
                 font-size:10px;
                 line-height:16px;
                 font-weight:700;
-              ">v0.3.1</span>
+              ">v1.0.1</span>
             </div>
 
             <div style="
@@ -2981,7 +2932,7 @@
 
           <span style="
             color:#9aa7b8;
-            font-size:9px;
+            font-size:10px;
           ">三张报表共用同一日期</span>
         </div>
 
@@ -3014,7 +2965,7 @@
               style="
                 display:none;
                 color:#7d8ca0;
-                font-size:9px;
+                font-size:10px;
               "
             >自定义区间</span>
           </div>
@@ -3105,7 +3056,7 @@
 
             <span style="
               color:#9aa7b8;
-              font-size:9px;
+              font-size:10px;
             ">按顺序错开请求 · 间隔约1.2秒</span>
           </div>
 
@@ -3200,11 +3151,11 @@
 
       #${PANEL_ID} .__fly_report_result_row_v031 {
         display:grid;
-        grid-template-columns:34px minmax(0,1fr) auto;
-        gap:10px;
+        grid-template-columns:32px minmax(0,1fr) auto;
+        gap:9px;
         align-items:center;
         min-height:58px;
-        padding:9px 10px;
+        padding:9px 9px;
         box-sizing:border-box;
         border:1px solid #e6edf5;
         border-radius:9px;
@@ -3212,8 +3163,8 @@
       }
 
       #${PANEL_ID} .__fly_report_result_icon_v031 {
-        width:32px;
-        height:32px;
+        width:30px;
+        height:30px;
         display:flex;
         align-items:center;
         justify-content:center;
@@ -3223,17 +3174,17 @@
       }
 
       #${PANEL_ID} .__fly_report_result_title_v031 {
-        color:#34455b;
-        font-size:12px;
-        line-height:1.3;
+        color:#2f4056;
+        font-size:13px;
+        line-height:1.35;
         font-weight:700;
       }
 
       #${PANEL_ID} .__fly_report_result_detail_v031 {
         margin-top:4px;
-        color:#8b99aa;
-        font-size:10px;
-        line-height:1.35;
+        color:#6f7f93;
+        font-size:11px;
+        line-height:1.4;
       }
 
       #${PANEL_ID} .__fly_report_result_badge_v031 {
@@ -3242,16 +3193,16 @@
         margin-left:6px;
         padding:1px 6px;
         border-radius:8px;
-        font-size:9px;
-        line-height:16px;
+        font-size:10px;
+        line-height:17px;
         font-weight:700;
         vertical-align:1px;
       }
 
       #${PANEL_ID} .__fly_report_action_v031 {
-        min-width:74px;
+        min-width:64px;
         height:30px;
-        padding:0 11px;
+        padding:0 9px;
         border:0;
         border-radius:7px;
         background:#1677ff;
@@ -3269,6 +3220,39 @@
         background:#fff8ed;
         color:#bb6d00;
         box-shadow:none;
+      }
+
+      #${PANEL_ID} .__fly_report_actions_v024 {
+        display:flex;
+        align-items:center;
+        justify-content:flex-end;
+        gap:6px;
+        white-space:nowrap;
+      }
+
+      #${PANEL_ID} .__fly_report_status_link_v024 {
+        height:28px;
+        padding:0 8px;
+        border:1px solid #bfd6f5;
+        border-radius:6px;
+        background:#f4f8fe;
+        color:#3e6f9f;
+        font-family:inherit;
+        font-size:10px;
+        font-weight:700;
+        cursor:pointer;
+        white-space:nowrap;
+        box-shadow:none;
+        transition:
+          background .12s ease,
+          border-color .12s ease,
+          color .12s ease;
+      }
+
+      #${PANEL_ID} .__fly_report_status_link_v024:hover {
+        border-color:#8fb9ee;
+        background:#eaf3ff;
+        color:#126de0;
       }
 
       #${PANEL_ID} .__fly_report_action_v031:disabled {
@@ -3897,12 +3881,27 @@
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    class="__fly_report_action_v031${action.secondary ? " is-secondary" : ""}"
-                    ${action.action ? `data-action="${action.action}"` : ""}
-                    ${action.disabled ? "disabled" : ""}
-                  >${action.text}</button>
+                  <div class="__fly_report_actions_v024">
+                    ${
+                      key === "addItems"
+                        ? `
+                          <button
+                            type="button"
+                            class="__fly_report_status_link_v024"
+                            data-action="addItems-status"
+                            title="打开Fly下载中心，查看客户加选项目报表任务状态"
+                          >查看状态</button>
+                        `
+                        : ""
+                    }
+
+                    <button
+                      type="button"
+                      class="__fly_report_action_v031${action.secondary ? " is-secondary" : ""}"
+                      ${action.action ? `data-action="${action.action}"` : ""}
+                      ${action.disabled ? "disabled" : ""}
+                    >${action.text}</button>
+                  </div>
                 </div>
               `;
             }
@@ -4908,7 +4907,35 @@
       }
     }
 
+    function openAddItemsDownloadCenter() {
+      const opened =
+        window.open(
+          ADD_ITEMS_DOWNLOAD_CENTER_URL,
+          "_blank"
+        );
+
+      try {
+        if (opened) {
+          opened.opener =
+            null;
+        }
+      } catch {}
+
+      setStatus(
+        "已打开Fly下载中心，可查看客户加选项目报表任务是否生成成功。"
+      );
+    }
+
     function bindResultActions() {
+      resultList
+        .querySelector(
+          '[data-action="addItems-status"]'
+        )
+        ?.addEventListener(
+          "click",
+          openAddItemsDownloadCenter
+        );
+
       resultList
         .querySelector(
           '[data-action="income-export"]'
@@ -5334,41 +5361,46 @@
         align-items:center;
         justify-content:center;
         gap:6px;
-        height:28px;
-        padding:0 11px;
+        height:27px;
+        padding:0 10px;
         box-sizing:border-box;
-        border:1px solid rgba(255,255,255,.25);
+        border:1px solid rgba(255,255,255,.32);
         border-radius:5px;
-        background:rgba(9,78,183,.42);
+        background:rgba(4,70,166,.72);
         color:#fff;
         font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif;
         font-size:13px;
         font-weight:700;
         line-height:1;
-        letter-spacing:.1px;
+        letter-spacing:.2px;
         white-space:nowrap;
         cursor:pointer;
         user-select:none;
-        text-shadow:0 1px 1px rgba(0,42,110,.2);
-        box-shadow:0 1px 4px rgba(0,48,120,.12);
+        text-shadow:0 1px 1px rgba(0,35,90,.35);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,.08),
+          0 1px 3px rgba(0,38,96,.18);
         backdrop-filter:blur(2px);
         transition:
           background .15s ease,
           border-color .15s ease,
-          box-shadow .15s ease,
-          transform .15s ease;
+          box-shadow .15s ease;
       }
 
       #${GLOBAL_SWITCH_ID}:hover {
-        background:rgba(5,67,168,.62);
-        border-color:rgba(255,255,255,.42);
-        box-shadow:0 2px 7px rgba(0,48,120,.2);
+        background:rgba(3,60,150,.90);
+        border-color:rgba(255,255,255,.48);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,.10),
+          0 2px 6px rgba(0,38,96,.25);
       }
 
       #${GLOBAL_SWITCH_ID}.is-active {
-        background:rgba(4,63,158,.72);
-        border-color:rgba(255,255,255,.48);
-        box-shadow:0 2px 8px rgba(0,48,120,.22);
+        background:rgba(2,53,137,.94);
+        border-color:rgba(255,255,255,.54);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,.10),
+          0 2px 7px rgba(0,38,96,.28);
       }
 
       #${GLOBAL_SWITCH_ID} svg {
@@ -5399,18 +5431,50 @@
     return style;
   }
 
-  function findSoaRegionAnchor() {
-    if (
-      location.hostname !==
-      HOST_SOA
-    ) {
-      return null;
+  function getDirectVisibleText(
+    element
+  ) {
+    const directText =
+      Array.from(
+        element.childNodes ||
+          []
+      )
+        .filter(
+          node =>
+            node.nodeType ===
+            Node.TEXT_NODE
+        )
+        .map(
+          node =>
+            cleanText(
+              node.textContent
+            )
+        )
+        .filter(Boolean)
+        .join(" ");
+
+    if (directText) {
+      return directText;
     }
 
+    if (
+      element.children &&
+      element.children.length ===
+        0
+    ) {
+      return cleanText(
+        element.textContent
+      );
+    }
+
+    return "";
+  }
+
+  function findTopRightTextAnchor() {
     const candidates =
       Array.from(
         document.querySelectorAll(
-          "span,div,a"
+          "span,div,a,strong"
         )
       );
 
@@ -5426,7 +5490,7 @@
     ) {
       if (
         element.id ===
-        GLOBAL_SWITCH_ID ||
+          GLOBAL_SWITCH_ID ||
         element.closest?.(
           `#${GLOBAL_SWITCH_ID}`
         )
@@ -5435,16 +5499,13 @@
       }
 
       const text =
-        cleanText(
-          element.textContent
+        getDirectVisibleText(
+          element
         );
 
       if (
         !text ||
-        text.length > 12 ||
-        !/地区$/.test(
-          text
-        )
+        text.length > 12
       ) {
         continue;
       }
@@ -5453,15 +5514,15 @@
         element.getBoundingClientRect();
 
       if (
-        rect.width < 20 ||
+        rect.width < 18 ||
         rect.width > 160 ||
-        rect.height < 10 ||
-        rect.height > 45 ||
+        rect.height < 12 ||
+        rect.height > 42 ||
         rect.top < 0 ||
-        rect.bottom > 95 ||
+        rect.bottom > 82 ||
         rect.left <
           window.innerWidth *
-            0.55
+            0.58
       ) {
         continue;
       }
@@ -5475,23 +5536,39 @@
         style.display ===
           "none" ||
         style.visibility ===
-          "hidden"
+          "hidden" ||
+        Number(
+          style.opacity
+        ) ===
+          0
       ) {
         continue;
       }
 
-      const score =
-        1000 -
-        Math.abs(
-          rect.height - 22
-        ) *
-          5 +
+      let score =
         rect.left /
           Math.max(
             window.innerWidth,
             1
           ) *
           100;
+
+      // SOA优先以“XX地区”作为锚点，确保入口位于地区文字左侧。
+      if (
+        /地区$/.test(
+          text
+        )
+      ) {
+        score +=
+          1000;
+      }
+
+      // 门户没有“地区”时，优先选择顶部更靠右的短文字，通常就是用户名。
+      score -=
+        Math.abs(
+          rect.height - 20
+        ) *
+        2;
 
       if (
         score >
@@ -5518,59 +5595,59 @@
       return;
     }
 
-    if (
-      location.hostname ===
-      HOST_SOA
-    ) {
-      const anchor =
-        findSoaRegionAnchor();
+    const anchor =
+      findTopRightTextAnchor();
 
-      if (anchor) {
-        const rect =
-          anchor.getBoundingClientRect();
+    if (anchor) {
+      const rect =
+        anchor.getBoundingClientRect();
 
-        const top =
-          Math.max(
-            4,
-            Math.round(
-              rect.top - 3
-            )
-          );
+      const buttonRect =
+        button.getBoundingClientRect();
 
-        const right =
-          Math.max(
-            90,
-            Math.round(
-              window.innerWidth -
-              rect.left +
-              28
-            )
-          );
+      // 与页面原有文字做垂直居中对齐，避免按钮明显高于/低于导航文字。
+      const top =
+        Math.max(
+          3,
+          Math.round(
+            rect.top +
+            (
+              rect.height -
+              buttonRect.height
+            ) /
+              2
+          )
+        );
 
-        button.style.top =
-          `${top}px`;
-
-        button.style.right =
-          `${right}px`;
-
-        return;
-      }
+      // 放在锚点左侧，保留适度间距。
+      const right =
+        Math.max(
+          86,
+          Math.round(
+            window.innerWidth -
+            rect.left +
+            20
+          )
+        );
 
       button.style.top =
-        "10px";
+        `${top}px`;
 
       button.style.right =
-        "205px";
+        `${right}px`;
 
       return;
     }
 
-    // 门户首页顶部较矮，使用稳定位置，与右侧用户区保持同一行。
+    // 页面结构变化时使用稳定回退位置。
     button.style.top =
       "10px";
 
     button.style.right =
-      "205px";
+      location.hostname ===
+        HOST_SOA
+        ? "205px"
+        : "155px";
   }
 
   function scheduleGlobalSwitchAlignment() {
