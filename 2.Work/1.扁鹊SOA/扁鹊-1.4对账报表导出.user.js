@@ -14,7 +14,6 @@
 // @grant        unsafeWindow
 
 // @connect      gateway-fly.health-100.cn
-
 // @run-at       document-start
 
 // @author       WanXin
