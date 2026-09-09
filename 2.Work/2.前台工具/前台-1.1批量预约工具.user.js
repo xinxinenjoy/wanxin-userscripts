@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         前台-1.1批量预约工具
 // @namespace    https://tampermonkey.net/
-// @version      1.15
+// @version      1.16
 // @description  前台批量预约工具：在前台批量登记页面增加工具窗口，自动识别粘贴的14位预约单号并自动进行登记填写。同时在“已到检”页签中自动勾选“仅当日”，并在请求层强制将首次列表查询改为仅当日。
 
 // @match        *://checkup-register.health-100.cn/*
@@ -17,6 +17,11 @@
 
 /*
  * 更新记录
+ *
+ * v1.16  -  2026-9-9
+ * - 修复：页面存在两个同名 #search_form_onlyToday 时，避免误操作“预约时间”下的仅当日。
+ * - 优化：改为根据字段标题“登记时间”定位对应复选框，仅控制登记时间区域的仅当日。
+ * - 保持原有“已到检”首次查询保护、请求层改写、批量预约等逻辑不变。
  *
  * v1.15  -  2026-8-29
  * - 修复：进入“已到检”后手动取消“仅当日”再点击查询时，不再被脚本重新强制勾选。
@@ -34,7 +39,7 @@
   "use strict";
 
   const INSTANCE_KEY =
-    "__SOA_BATCH_BOOKING_V115__";
+    "__SOA_BATCH_BOOKING_V116__";
 
   if (window[INSTANCE_KEY]) {
     return;
@@ -53,8 +58,10 @@
     // 点击“已到检”前先确保“仅当日”已勾选
     CHECKED_TAB_SELECTOR:
       '[role="tab"][id$="-tab-CHECKED"]',
+    // 页面存在两个同名 #search_form_onlyToday。
+    // 不再直接依赖 id，而通过“登记时间”字段区域定位。
     ONLY_TODAY_SELECTOR:
-      "#search_form_onlyToday",
+      null,
     ONLY_TODAY_WAIT_TIMEOUT: 1200,
     ONLY_TODAY_POLL_INTERVAL: 30,
 
@@ -713,9 +720,7 @@
 
   function syncOnlyTodayCheckboxUI() {
     const checkbox =
-      document.querySelector(
-        CONFIG.ONLY_TODAY_SELECTOR
-      );
+      getOnlyTodayCheckbox();
 
     if (
       !checkbox ||
@@ -747,9 +752,42 @@
   let checkedTabReplayRunning = false;
 
   function getOnlyTodayCheckbox() {
-    return document.querySelector(
-      CONFIG.ONLY_TODAY_SELECTOR
-    );
+    /*
+     * 页面存在两个同名 #search_form_onlyToday：
+     * 1. 登记时间 -> 需要控制
+     * 2. 预约时间 -> 不允许控制
+     *
+     * 因此不能使用 document.querySelector(id)，
+     * 改为根据 Ant Design 表单项标题定位。
+     */
+    const items =
+      Array.from(
+        document.querySelectorAll(
+          ".ant-form-item"
+        )
+      );
+
+    for (const item of items) {
+      const title =
+        item.querySelector(
+          ".ant-form-item-label label"
+        )?.getAttribute("title");
+
+      if (title !== "登记时间") {
+        continue;
+      }
+
+      const checkbox =
+        item.querySelector(
+          'input[type="checkbox"]'
+        );
+
+      if (checkbox) {
+        return checkbox;
+      }
+    }
+
+    return null;
   }
 
   function isOnlyTodayChecked() {
