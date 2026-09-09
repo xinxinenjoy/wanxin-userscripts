@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.6.4
-// @description  SOA体检数据：打开模块后自动读取落单数据、体检汇总及套餐卡/储值卡/电商卡数量，并支持原有卡池新标签页自动查询。注意：卡类查询需要账号对应权限
+// @version      1.7.1
+// @description  SOA体检数据：自动读取落单数据、体检汇总及三类卡数量，并支持按制卡批次查询卡备注。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        none
@@ -22,9 +22,26 @@
  * - 读取体检总人数、已检/未检人数、到检/挂账/自费金额。
  * - 同时查询套餐卡、储值卡、电商卡数量，15秒内复用同订单查询结果。
  * - 卡数量大于0时可新建标签页打开对应卡池，自动填写单位代码并查询。
+ * - 可在有数据的套餐卡/储值卡内手动查询备注：按卡号后5位识别制卡批次区间，再读取详情中的 remark。
+ * - 每次从未覆盖卡号中取1张查询制卡区间，区间内同类卡自动排除；仍有区间外卡号时继续查询下一批次。
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.7.1  -  2026-9-9
+ * - 卡备注查询改为按卡类型独立处理，仅数量大于0的套餐卡/储值卡显示“查询备注”按钮，不再单独占用备注面板。
+ * - 同类型卡批次判断只比较卡号最后5位：先查询1张卡，读取 beginNo/endNo 后排除该区间内全部卡号，区间外仍有卡时再继续查询下一张。
+ * - 同一个制卡批次的 detail 只读取一次；不同批次重复 remark 自动去重。
+ * - 备注结果仅简洁显示“备注内容：1.AAA 2.BBB …”，不再展示抽样数量、批次数等辅助统计。
+ * - 保留制卡 page → detail 的查询方式及随机短延迟；刷新数据或切换订单时自动清空备注结果。
+ *
+ * v1.7.0  -  2026-9-9
+ * - 新增“卡备注抽查”：复用当前已查询到的套餐卡/储值卡列表，不额外重新拉取完整卡池。
+ * - 每轮最多分散随机抽查5张代表卡号，先请求制卡记录 page 接口获取批次 id，再请求 detail 接口提取 remark。
+ * - 已识别的 beginNo~endNo 制卡区间自动跳过，避免在同一批次内重复请求；同一批次详情只读取一次。
+ * - 查询结果按制卡批次和备注去重展示；发现多种 remark 时突出提示，便于识别同订单多次办卡。
+ * - 再次点击“继续抽查”会优先抽取尚未检查、且不属于已识别批次区间的卡号，提高抽样覆盖。
+ * - 制卡查询请求全部串行执行，并加入随机短等待，避免瞬间集中请求。
  *
  * v1.6.4  -  2026-9-7
  * - 优化大卡池分页请求节奏：10页以内每次请求后随机等待50-100ms，10页以上随机等待100-200ms。
@@ -125,6 +142,17 @@
   const AUTO_DATA_CACHE_MS =
     15000;
 
+  // 制卡记录和详情请求均串行执行，并加入随机等待。
+  const CARD_REMARK_PAGE_DELAY = [
+    180,
+    320
+  ];
+
+  const CARD_REMARK_DETAIL_DELAY = [
+    220,
+    420
+  ];
+
   const CARD_STATUS_MAP = {
     ENABLE: "生效中",
     ENABLED: "生效中",
@@ -181,6 +209,12 @@
 
     ECOMMERCE_CARD_POOL_API:
       "/soa-card/api/v1/platform/card/pool/display",
+
+    CARD_PROCESS_PAGE_API:
+      "/soa-card/api/v1/bqcard/process/page",
+
+    CARD_PROCESS_DETAIL_API:
+      "/soa-card/api/v1/bqcard/process/detail",
 
     EXTRACT_ORDER_NAME_SELECTOR:
       "#register > div",
@@ -249,6 +283,15 @@
   let physicalDataQueryRunning = false;
   let cardGroupPendingRunning = false;
   let combinedDataQueryRunning = false;
+  // 空字符串表示当前没有卡备注查询；general / storage 表示正在查询的卡类型。
+  let cardRemarkQueryRunning = "";
+
+  // 卡备注结果只保存在当前标签页内，并按卡类型独立维护。
+  let cardRemarkDiscovery = {
+    orderCode: "",
+    cardCorpCode: "",
+    types: {}
+  };
 
   // 当前页面缓存。仅存在于当前标签页 JS 生命周期内。
   // 不写入 localStorage，避免不同订单之间数据串联。
@@ -2704,6 +2747,1155 @@
     };
   }
 
+
+  function createEmptyCardRemarkTypeState() {
+    return {
+      checkedCards:
+        new Set(),
+      batches:
+        new Map(),
+      complete:
+        false
+    };
+  }
+
+  function resetCardRemarkDiscovery() {
+    cardRemarkDiscovery = {
+      orderCode: "",
+      cardCorpCode: "",
+      types: {}
+    };
+  }
+
+  function ensureCardRemarkDiscoveryContext(
+    orderCode,
+    cardCorpCode
+  ) {
+    if (
+      cardRemarkDiscovery.orderCode !==
+        orderCode ||
+      cardRemarkDiscovery.cardCorpCode !==
+        cardCorpCode
+    ) {
+      resetCardRemarkDiscovery();
+
+      cardRemarkDiscovery.orderCode =
+        orderCode;
+
+      cardRemarkDiscovery.cardCorpCode =
+        cardCorpCode;
+    }
+
+    return cardRemarkDiscovery;
+  }
+
+  function getCardRemarkTypeState(
+    cardType,
+    orderCode,
+    cardCorpCode
+  ) {
+    const discovery =
+      ensureCardRemarkDiscoveryContext(
+        orderCode,
+        cardCorpCode
+      );
+
+    if (
+      !discovery.types[
+        cardType
+      ]
+    ) {
+      discovery.types[
+        cardType
+      ] =
+        createEmptyCardRemarkTypeState();
+    }
+
+    return discovery.types[
+      cardType
+    ];
+  }
+
+  function normalizeCardNoCandidate(
+    value
+  ) {
+    const text =
+      cleanText(
+        value
+      )
+        .replace(
+          /\s+/g,
+          ""
+        );
+
+    if (
+      !text ||
+      text.length < 12 ||
+      text.length > 40 ||
+      /[*\u4e00-\u9fff]/.test(
+        text
+      ) ||
+      !/[0-9]/.test(
+        text
+      ) ||
+      !/^[A-Za-z0-9-]+$/.test(
+        text
+      )
+    ) {
+      return "";
+    }
+
+    return text;
+  }
+
+  function extractCardNoFromPoolItem(
+    item
+  ) {
+    if (
+      !item ||
+      typeof item !==
+        "object"
+    ) {
+      return "";
+    }
+
+    const preferredKeys = [
+      "cardNo",
+      "card_no",
+      "cardNumber",
+      "card_number",
+      "cardCode",
+      "card_code",
+      "cardIdNo",
+      "card_id_no",
+      "no"
+    ];
+
+    for (
+      const key of
+      preferredKeys
+    ) {
+      const value =
+        normalizeCardNoCandidate(
+          item[key]
+        );
+
+      if (value) {
+        return value;
+      }
+    }
+
+    for (
+      const [
+        key,
+        rawValue
+      ] of
+      Object.entries(
+        item
+      )
+    ) {
+      if (
+        !/card.*(no|number|code)|^(no)$/i.test(
+          key
+        )
+      ) {
+        continue;
+      }
+
+      const value =
+        normalizeCardNoCandidate(
+          rawValue
+        );
+
+      if (value) {
+        return value;
+      }
+    }
+
+    return "";
+  }
+
+  function extractOrderCodeFromPoolItem(
+    item
+  ) {
+    if (
+      !item ||
+      typeof item !==
+        "object"
+    ) {
+      return "";
+    }
+
+    const keys = [
+      "orderCode",
+      "order_code",
+      "mainOrderCode",
+      "main_order_code",
+      "soaOrderNo",
+      "soa_order_no"
+    ];
+
+    for (
+      const key of
+      keys
+    ) {
+      const value =
+        cleanText(
+          item[key]
+        );
+
+      if (
+        /^SOA[A-Za-z0-9-]+$/i.test(
+          value
+        )
+      ) {
+        return value;
+      }
+    }
+
+    return "";
+  }
+
+  function getCardNoLastFive(
+    value
+  ) {
+    const text =
+      cleanText(
+        value
+      )
+        .replace(
+          /\s+/g,
+          ""
+        );
+
+    const match =
+      text.match(
+        /(\d{5})$/
+      );
+
+    if (!match) {
+      return null;
+    }
+
+    const number =
+      Number(
+        match[1]
+      );
+
+    return Number.isFinite(
+      number
+    )
+      ? number
+      : null;
+  }
+
+  function collectCardRemarkCandidatesForType(
+    result,
+    orderCode
+  ) {
+    if (
+      !result?.ok ||
+      !Array.isArray(
+        result.items
+      )
+    ) {
+      return [];
+    }
+
+    const unique =
+      new Map();
+
+    for (
+      const item of
+      result.items
+    ) {
+      const cardNo =
+        extractCardNoFromPoolItem(
+          item
+        );
+
+      const suffix =
+        getCardNoLastFive(
+          cardNo
+        );
+
+      if (
+        !cardNo ||
+        suffix ===
+          null
+      ) {
+        continue;
+      }
+
+      const itemOrderCode =
+        extractOrderCodeFromPoolItem(
+          item
+        );
+
+      /*
+       * 卡池明细若带订单号，先在本地过滤。
+       * 没有订单号字段时保留，后续 detail 再做最终校验。
+       */
+      if (
+        itemOrderCode &&
+        orderCode &&
+        itemOrderCode !==
+          orderCode
+      ) {
+        continue;
+      }
+
+      if (
+        !unique.has(
+          cardNo
+        )
+      ) {
+        unique.set(
+          cardNo,
+          {
+            cardNo,
+            suffix,
+            itemOrderCode,
+            item
+          }
+        );
+      }
+    }
+
+    return Array.from(
+      unique.values()
+    ).sort(
+      (a, b) =>
+        a.suffix -
+          b.suffix ||
+        a.cardNo.localeCompare(
+          b.cardNo,
+          "en"
+        )
+    );
+  }
+
+  function normalizeBatchSuffixRange(
+    beginNo,
+    endNo,
+    fallbackSuffix
+  ) {
+    const begin =
+      getCardNoLastFive(
+        beginNo
+      );
+
+    const end =
+      getCardNoLastFive(
+        endNo
+      );
+
+    if (
+      begin !==
+        null &&
+      end !==
+        null &&
+      begin <=
+        end
+    ) {
+      return {
+        start:
+          begin,
+        end
+      };
+    }
+
+    return {
+      start:
+        fallbackSuffix,
+      end:
+        fallbackSuffix
+    };
+  }
+
+  function isSuffixInKnownBatch(
+    suffix,
+    state
+  ) {
+    if (
+      suffix ===
+      null ||
+      !state
+    ) {
+      return false;
+    }
+
+    for (
+      const batch of
+      state.batches.values()
+    ) {
+      if (
+        Number.isFinite(
+          batch.startSuffix
+        ) &&
+        Number.isFinite(
+          batch.endSuffix
+        ) &&
+        suffix >=
+          batch.startSuffix &&
+        suffix <=
+          batch.endSuffix
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function getUncoveredCardCandidates(
+    candidates,
+    state
+  ) {
+    return candidates.filter(
+      candidate =>
+        !state.checkedCards.has(
+          candidate.cardNo
+        ) &&
+        !isSuffixInKnownBatch(
+          candidate.suffix,
+          state
+        )
+    );
+  }
+
+  function getCardProcessBackendError(
+    payload
+  ) {
+    const resultCode =
+      cleanText(
+        payload?.result_code
+      ).toUpperCase();
+
+    if (
+      resultCode &&
+      resultCode !==
+        "SUCC"
+    ) {
+      return (
+        cleanText(
+          payload?.error_desc
+        ) ||
+        cleanText(
+          payload?.msg
+        ) ||
+        cleanText(
+          payload?.message
+        ) ||
+        `接口返回 ${resultCode}`
+      );
+    }
+
+    return "";
+  }
+
+  async function fetchCardProcessPageByCardNo(
+    cardNo
+  ) {
+    const response =
+      await fetch(
+        CONFIG.CARD_PROCESS_PAGE_API,
+        {
+          method:
+            "POST",
+          headers: {
+            "accept":
+              "application/json, text/plain, */*",
+            "content-type":
+              "application/json;charset=UTF-8",
+            "mnclientid":
+              "MN_SOA3"
+          },
+          body:
+            JSON.stringify({
+              regionCode:
+                "XX",
+              pageSize:
+                20,
+              cardNo,
+              pageIndex:
+                1
+            }),
+          credentials:
+            "include"
+        }
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        `制卡记录查询失败：HTTP ${response.status}`
+      );
+    }
+
+    const payload =
+      await response.json();
+
+    const backendError =
+      getCardProcessBackendError(
+        payload
+      );
+
+    if (backendError) {
+      throw new Error(
+        backendError
+      );
+    }
+
+    return Array.isArray(
+      payload?.data?.items
+    )
+      ? payload.data.items
+      : [];
+  }
+
+  async function fetchCardProcessDetail(
+    id
+  ) {
+    const response =
+      await fetch(
+        CONFIG.CARD_PROCESS_DETAIL_API,
+        {
+          method:
+            "POST",
+          headers: {
+            "accept":
+              "application/json, text/plain, */*",
+            "content-type":
+              "application/json;charset=UTF-8",
+            "mnclientid":
+              "MN_SOA3"
+          },
+          body:
+            JSON.stringify({
+              id
+            }),
+          credentials:
+            "include"
+        }
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        `制卡详情查询失败：HTTP ${response.status}`
+      );
+    }
+
+    const payload =
+      await response.json();
+
+    const backendError =
+      getCardProcessBackendError(
+        payload
+      );
+
+    if (backendError) {
+      throw new Error(
+        backendError
+      );
+    }
+
+    if (
+      !payload?.data ||
+      typeof payload.data !==
+        "object"
+    ) {
+      throw new Error(
+        "制卡详情接口未返回有效 data"
+      );
+    }
+
+    return payload.data;
+  }
+
+  function findProcessRecordForCard(
+    records,
+    cardNo,
+    orderCode
+  ) {
+    if (
+      !Array.isArray(
+        records
+      ) ||
+      !records.length
+    ) {
+      return null;
+    }
+
+    const cardSuffix =
+      getCardNoLastFive(
+        cardNo
+      );
+
+    const sameOrder =
+      records.filter(
+        item =>
+          !cleanText(
+            item?.orderCode
+          ) ||
+          !orderCode ||
+          cleanText(
+            item?.orderCode
+          ) ===
+            orderCode
+      );
+
+    const pool =
+      sameOrder.length
+        ? sameOrder
+        : records;
+
+    const matched =
+      pool.find(
+        item => {
+          const begin =
+            getCardNoLastFive(
+              item?.beginNo
+            );
+
+          const end =
+            getCardNoLastFive(
+              item?.endNo
+            );
+
+          return (
+            cardSuffix !==
+              null &&
+            begin !==
+              null &&
+            end !==
+              null &&
+            begin <=
+              end &&
+            cardSuffix >=
+              begin &&
+            cardSuffix <=
+              end
+          );
+        }
+      );
+
+    return (
+      matched ||
+      pool.find(
+        item =>
+          item?.id !==
+            undefined &&
+          item?.id !==
+            null
+      ) ||
+      null
+    );
+  }
+
+  function escapeHtml(
+    value
+  ) {
+    return String(
+      value ?? ""
+    )
+      .replace(
+        /&/g,
+        "&amp;"
+      )
+      .replace(
+        /</g,
+        "&lt;"
+      )
+      .replace(
+        />/g,
+        "&gt;"
+      )
+      .replace(
+        /"/g,
+        "&quot;"
+      )
+      .replace(
+        /'/g,
+        "&#39;"
+      );
+  }
+
+  function getUniqueRemarkList(
+    state
+  ) {
+    const seen =
+      new Set();
+
+    const output =
+      [];
+
+    for (
+      const batch of
+      state?.batches?.values?.() ||
+      []
+    ) {
+      const remark =
+        cleanText(
+          batch.remark
+        ) ||
+        "（无备注）";
+
+      if (
+        seen.has(
+          remark
+        )
+      ) {
+        continue;
+      }
+
+      seen.add(
+        remark
+      );
+
+      output.push(
+        remark
+      );
+    }
+
+    return output;
+  }
+
+  function buildInlineRemarkHtml(
+    cardType,
+    result,
+    cardCorpCode
+  ) {
+    const total =
+      Number(
+        result?.totalNum
+      );
+
+    if (
+      !result?.ok ||
+      !Number.isFinite(
+        total
+      ) ||
+      total <= 0 ||
+      ![
+        "general",
+        "storage"
+      ].includes(
+        cardType
+      )
+    ) {
+      return "";
+    }
+
+    const orderCode =
+      getCurrentOrderCode();
+
+    const state =
+      getCardRemarkTypeState(
+        cardType,
+        orderCode,
+        cardCorpCode
+      );
+
+    const running =
+      Boolean(
+        cardRemarkQueryRunning
+      );
+
+    const thisRunning =
+      cardRemarkQueryRunning ===
+        cardType;
+
+    const remarks =
+      getUniqueRemarkList(
+        state
+      );
+
+    const buttonText =
+      thisRunning
+        ? "查询中..."
+        : state.complete
+          ? "已查询"
+          : "查询备注";
+
+    const disabled =
+      running ||
+      state.complete;
+
+    const remarkHtml =
+      remarks.length
+        ? `
+          <div style="
+            margin-top:6px;
+            padding-top:5px;
+            border-top:1px solid rgba(22,119,255,.14);
+            color:#44546a;
+            font-size:10px;
+            line-height:1.45;
+            text-align:left;
+            user-select:text;
+          ">
+            <div style="
+              margin-bottom:2px;
+              color:#596579;
+              font-weight:700;
+            ">备注内容：</div>
+            ${remarks
+              .map(
+                (remark, index) => `
+                  <div style="
+                    color:#344054;
+                    font-weight:600;
+                    word-break:break-all;
+                  ">${index + 1}.${escapeHtml(remark)}</div>
+                `
+              )
+              .join("")}
+          </div>
+        `
+        : "";
+
+    return `
+      <div style="
+        margin-top:6px;
+        padding-top:5px;
+        border-top:1px solid rgba(56,142,60,.12);
+      ">
+        <button
+          type="button"
+          data-soa-card-remark-type="${cardType}"
+          ${disabled ? "disabled" : ""}
+          style="
+            width:100%;
+            height:24px;
+            padding:0 5px;
+            border:1px solid ${
+              disabled
+                ? "#d9d9d9"
+                : "#91caff"
+            };
+            border-radius:5px;
+            background:${
+              disabled
+                ? "#f5f5f5"
+                : "#e6f4ff"
+            };
+            color:${
+              disabled
+                ? "#999"
+                : "#1677ff"
+            };
+            font-size:10px;
+            font-weight:650;
+            line-height:22px;
+            cursor:${
+              disabled
+                ? "not-allowed"
+                : "pointer"
+            };
+            white-space:nowrap;
+          "
+        >${buttonText}</button>
+
+        ${remarkHtml}
+      </div>
+    `;
+  }
+
+  async function queryCardRemarksByType(
+    cardType,
+    result,
+    cardPool,
+    cardCorpCode
+  ) {
+    if (
+      cardRemarkQueryRunning
+    ) {
+      updatePanelStatus(
+        "卡备注正在查询中，请稍候..."
+      );
+
+      return;
+    }
+
+    const orderCode =
+      getCurrentOrderCode();
+
+    if (!orderCode) {
+      throw new Error(
+        "未识别到当前订单编号，无法查询卡备注"
+      );
+    }
+
+    if (!cardCorpCode) {
+      throw new Error(
+        "未识别到商机编号或单位代码，无法查询卡备注"
+      );
+    }
+
+    if (
+      ![
+        "general",
+        "storage"
+      ].includes(
+        cardType
+      )
+    ) {
+      return;
+    }
+
+    const candidates =
+      collectCardRemarkCandidatesForType(
+        result,
+        orderCode
+      );
+
+    if (!candidates.length) {
+      throw new Error(
+        "当前卡列表中未识别到可用于制卡查询的卡号"
+      );
+    }
+
+    const state =
+      getCardRemarkTypeState(
+        cardType,
+        orderCode,
+        cardCorpCode
+      );
+
+    cardRemarkQueryRunning =
+      cardType;
+
+    renderCardPoolSummary(
+      cardPool,
+      cardCorpCode
+    );
+
+    const label =
+      cardType ===
+        "storage"
+        ? "储值卡"
+        : "套餐卡";
+
+    try {
+      while (true) {
+        if (
+          getCurrentOrderCode() !==
+          orderCode
+        ) {
+          throw new FlowCancelledError(
+            "订单已切换，已停止卡备注查询"
+          );
+        }
+
+        const uncovered =
+          getUncoveredCardCandidates(
+            candidates,
+            state
+          );
+
+        if (!uncovered.length) {
+          state.complete =
+            true;
+
+          break;
+        }
+
+        /*
+         * 每次只从当前未覆盖区间里取1张。
+         * 卡号已经按后5位从小到大排序，因此优先查询最小的未覆盖卡号。
+         * page 返回 beginNo/endNo 后，区间内其他同类型卡会立即自动排除。
+         */
+        const candidate =
+          uncovered[0];
+
+        state.checkedCards.add(
+          candidate.cardNo
+        );
+
+        updatePanelStatus(
+          `正在查询${label}备注：${candidate.cardNo}`,
+          "normal",
+          {
+            persistent:
+              true
+          }
+        );
+
+        try {
+          const records =
+            await fetchCardProcessPageByCardNo(
+              candidate.cardNo
+            );
+
+          const record =
+            findProcessRecordForCard(
+              records,
+              candidate.cardNo,
+              orderCode
+            );
+
+          if (
+            !record ||
+            record.id ===
+              undefined ||
+            record.id ===
+              null
+          ) {
+            console.warn(
+              "[SOA订单数据] 未找到对应制卡记录：",
+              candidate.cardNo
+            );
+
+            continue;
+          }
+
+          const batchId =
+            String(
+              record.id
+            );
+
+          if (
+            state.batches.has(
+              batchId
+            )
+          ) {
+            continue;
+          }
+
+          await sleep(
+            randomInt(
+              CARD_REMARK_DETAIL_DELAY[0],
+              CARD_REMARK_DETAIL_DELAY[1]
+            )
+          );
+
+          const detail =
+            await fetchCardProcessDetail(
+              record.id
+            );
+
+          if (
+            getCurrentOrderCode() !==
+            orderCode
+          ) {
+            throw new FlowCancelledError(
+              "订单已切换，已停止卡备注查询"
+            );
+          }
+
+          const detailOrderCode =
+            cleanText(
+              detail?.orderCode
+            );
+
+          if (
+            detailOrderCode &&
+            detailOrderCode !==
+              orderCode
+          ) {
+            console.warn(
+              "[SOA订单数据] 制卡详情订单不匹配，已跳过：",
+              {
+                cardNo:
+                  candidate.cardNo,
+                detailOrderCode,
+                currentOrderCode:
+                  orderCode
+              }
+            );
+
+            continue;
+          }
+
+          const range =
+            normalizeBatchSuffixRange(
+              detail?.beginNo ||
+              record?.beginNo,
+              detail?.endNo ||
+              record?.endNo,
+              candidate.suffix
+            );
+
+          state.batches.set(
+            batchId,
+            {
+              id:
+                batchId,
+              remark:
+                cleanText(
+                  detail?.remark
+                ),
+              startSuffix:
+                range.start,
+              endSuffix:
+                range.end,
+              beginNo:
+                cleanText(
+                  detail?.beginNo ||
+                  record?.beginNo
+                ),
+              endNo:
+                cleanText(
+                  detail?.endNo ||
+                  record?.endNo
+                )
+            }
+          );
+
+          /*
+           * 不需要手工逐张删除。
+           * 下一轮 getUncoveredCardCandidates 会依据后5位批次区间，
+           * 自动排除该 beginNo~endNo 范围内的全部同类型卡号。
+           */
+        } catch (error) {
+          if (
+            error instanceof
+            FlowCancelledError
+          ) {
+            throw error;
+          }
+
+          console.warn(
+            "[SOA订单数据] 卡备注查询失败：",
+            {
+              cardType,
+              cardNo:
+                candidate.cardNo,
+              error
+            }
+          );
+        }
+
+        if (
+          getUncoveredCardCandidates(
+            candidates,
+            state
+          ).length
+        ) {
+          await sleep(
+            randomInt(
+              CARD_REMARK_PAGE_DELAY[0],
+              CARD_REMARK_PAGE_DELAY[1]
+            )
+          );
+        }
+      }
+
+      updatePanelStatus(
+        `✓ ${label}备注查询完成。`,
+        "success"
+      );
+    } finally {
+      cardRemarkQueryRunning =
+        "";
+
+      renderCardPoolSummary(
+        cardPool,
+        cardCorpCode
+      );
+    }
+  }
+
   function savePendingCardGroupQuery(
     cardType,
     cardCorpCode
@@ -3562,14 +4754,17 @@
     const items = [
       [
         "套餐卡",
+        "general",
         data.packageCard
       ],
       [
         "储值卡",
+        "storage",
         data.storedValueCard
       ],
       [
         "电商卡",
+        "ecommerce",
         data.ecommerceCard
       ]
     ];
@@ -3587,7 +4782,11 @@
       </div>
       ${items
         .map(
-          ([label, result]) => {
+          ([
+            label,
+            cardType,
+            result
+          ]) => {
             const success =
               Boolean(
                 result?.ok
@@ -3595,12 +4794,16 @@
 
             const numericValue =
               success
-                ? Number(result.totalNum)
+                ? Number(
+                    result.totalNum
+                  )
                 : null;
 
             const statusSummary =
               success
-                ? buildCardStatusSummary(result.items)
+                ? buildCardStatusSummary(
+                    result.items
+                  )
                 : {};
 
             const clickable =
@@ -3639,15 +4842,6 @@
                   "&quot;"
                 );
 
-            const cardType =
-              label ===
-              "储值卡"
-                ? "storage"
-                : label ===
-                    "电商卡"
-                  ? "ecommerce"
-                  : "general";
-
             const canOpenCardPool =
               clickable;
 
@@ -3655,6 +4849,13 @@
               canOpenCardPool
                 ? `data-soa-card-type="${cardType}" data-soa-card-code="${cardCorpCode}"`
                 : "";
+
+            const remarkHtml =
+              buildInlineRemarkHtml(
+                cardType,
+                result,
+                cardCorpCode
+              );
 
             return `
               <div style="
@@ -3735,8 +4936,12 @@
                       : safeValue
                   }"
                 >${safeValue}</div>
+
                 ${
-                  success && Object.keys(statusSummary).length
+                  success &&
+                  Object.keys(
+                    statusSummary
+                  ).length
                     ? `<div style="
                         margin-top:6px;
                         padding-top:5px;
@@ -3752,7 +4957,7 @@
                         ])
                         .filter(([, v]) => v > 0)
                         .map(([k, v]) => {
-                          let label =
+                          let statusLabel =
                             k;
 
                           let color =
@@ -3772,7 +4977,7 @@
                             numberColor =
                               "#475467";
                           } else if (k === "冻结") {
-                            label =
+                            statusLabel =
                               "已冻结";
                             color =
                               "#d46b08";
@@ -3800,7 +5005,7 @@
                               color:${color};
                               font-weight:650;
                               white-space:nowrap;
-                            ">${label}</span>
+                            ">${statusLabel}</span>
                             <span style="
                               flex:0 0 auto;
                               min-width:30px;
@@ -3815,7 +5020,10 @@
                         })
                         .join("")}
                     </div>`
-                    : ""}
+                    : ""
+                }
+
+                ${remarkHtml}
               </div>
             `;
           }
@@ -3885,7 +5093,50 @@
           );
         }
       );
+
+    grid
+      .querySelectorAll(
+        "[data-soa-card-remark-type]"
+      )
+      .forEach(
+        button => {
+          button.addEventListener(
+            "click",
+            event => {
+              event.preventDefault();
+              event.stopPropagation();
+
+              const cardType =
+                button.getAttribute(
+                  "data-soa-card-remark-type"
+                );
+
+              const result =
+                cardType ===
+                  "storage"
+                  ? data.storedValueCard
+                  : data.packageCard;
+
+              queryCardRemarksByType(
+                cardType,
+                result,
+                data,
+                cardCorpCode
+              ).catch(
+                error => {
+                  updatePanelStatus(
+                    error?.message ||
+                    String(error),
+                    "error"
+                  );
+                }
+              );
+            }
+          );
+        }
+      );
   }
+
 
   function setDataButtonActive(
     mode
@@ -4073,6 +5324,8 @@
         orderCode: "",
         data: null
       };
+
+      resetCardRemarkDiscovery();
 
       closeDataPanel();
     }
@@ -5003,7 +6256,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.6.4
+          体检数据 v1.7.1
         </strong>
 
         <div style="
@@ -5098,6 +6351,7 @@
           "
         ></div>
 
+
         <div
           id="${UI.EXTRACT_PREVIEW_ID}"
           style="
@@ -5139,7 +6393,7 @@
         font-weight:500;
         line-height:1.55;
       ">
-        首次打开自动读取当前订单数据；需要更新时点击“刷新数据”，不进行非必要的后台自动刷新。三类卡固定显示并支持点击数量进入对应卡池查询。
+        首次打开自动读取当前订单数据；需要更新时点击“刷新数据”。三类卡固定显示并支持点击数量进入对应卡池查询；有数据的套餐卡/储值卡可在卡片内点击“查询备注”。
       </div>
     `;
 
@@ -5216,7 +6470,11 @@
 
 
   async function refreshPhysicalDataPanel() {
-    if (combinedDataQueryRunning || physicalDataQueryRunning) {
+    if (
+      combinedDataQueryRunning ||
+      physicalDataQueryRunning ||
+      cardRemarkQueryRunning
+    ) {
       updatePanelStatus(
         "数据正在查询中，请稍候..."
       );
@@ -5266,6 +6524,8 @@
         timestamp: 0,
         data: null
       };
+
+      resetCardRemarkDiscovery();
 
       await loadCombinedDataOnOpen(true);
 
@@ -5644,6 +6904,9 @@
     cachedLandingTimeOptions = [];
     physicalDataQueryRunning = false;
     combinedDataQueryRunning = false;
+    cardRemarkQueryRunning = "";
+
+    resetCardRemarkDiscovery();
 
     combinedDataCache = {
       orderCode: "",
