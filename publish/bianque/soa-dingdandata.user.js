@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.7.1
+// @version      1.7.5
 // @description  SOA体检数据：自动读取落单数据、体检汇总及三类卡数量，并支持按制卡批次查询卡备注。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -27,6 +27,28 @@
  * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
  *
  * 更新记录
+ *
+ * v1.7.5  -  2026-9-9
+ * - 卡片内不再直接展开备注内容，避免备注较多时撑高主面板。
+ * - 卡数量大于0时显示“查询备注”；查询完成后同一按钮自动变为“查看备注”。
+ * - 点击“查看备注”直接打开现有放大详情窗口，集中查看卡号区间、办卡日期、数量和备注。
+ * - 卡数量为0时仍不显示备注按钮；原制卡批次识别与备注查询逻辑保持不变。
+ *
+ * v1.7.4  -  2026-9-9
+ * - 缩小卡备注放大详情窗口宽度，减少横向空白。
+ * - “数量”从右侧移到办卡日期右侧，日期与数量在同一行更紧凑展示。
+ * - 放大详情中的办卡日期、数量、备注字号整体调大，提高可读性。
+ *
+ * v1.7.3  -  2026-9-9
+ * - 优化卡备注放大详情布局：不再显示“批次1/批次2”，改为按实际制卡区间逐条编号展示。
+ * - 每条记录直接显示卡号区间、办卡日期、卡数量和备注内容，减少层级与留白。
+ * - 卡数量优先读取制卡详情 cardNum；缺失时根据卡号后5位 beginNo/endNo 自动计算。
+ *
+ * v1.7.2  -  2026-9-9
+ * - 卡片内继续保留紧凑备注显示，并新增“放大查看”入口；备注较长时不再强行撑宽卡片。
+ * - 放大详情按备注分组展示完整内容，并列出对应制卡批次的完整卡号区间及办卡日期。
+ * - 办卡日期优先读取 detail.beginDate，缺失时依次回退 bindTime、internalProcessTime、financeProcessTime 等制卡时间字段。
+ * - 同一备注对应多个制卡批次时，在放大详情中逐批次列出；查询和批次识别逻辑保持不变。
  *
  * v1.7.1  -  2026-9-9
  * - 卡备注查询改为按卡类型独立处理，仅数量大于0的套餐卡/储值卡显示“查询备注”按钮，不再单独占用备注面板。
@@ -271,6 +293,10 @@
       "__soa_data_physical_grid_v10",
     CARD_POOL_DATA_GRID_ID:
       "__soa_data_card_grid_v10",
+    CARD_REMARK_MODAL_ID:
+      "__soa_data_card_remark_modal_v172",
+    CARD_REMARK_MODAL_CLOSE_ID:
+      "__soa_data_card_remark_modal_close_v172",
     POSITION_KEY:
       "__soa_data_panel_position_v10"
   };
@@ -2760,6 +2786,8 @@
   }
 
   function resetCardRemarkDiscovery() {
+    closeCardRemarkDetailModal();
+
     cardRemarkDiscovery = {
       orderCode: "",
       cardCorpCode: "",
@@ -3420,44 +3448,467 @@
       );
   }
 
-  function getUniqueRemarkList(
-    state
+  function extractCardRemarkDate(
+    detail,
+    record
   ) {
-    const seen =
-      new Set();
-
-    const output =
-      [];
+    const candidates = [
+      detail?.beginDate,
+      detail?.bindTime,
+      detail?.internalProcessTime,
+      detail?.financeProcessTime,
+      record?.bindTime,
+      record?.internalProcessTime,
+      record?.financeProcessTime
+    ];
 
     for (
-      const batch of
-      state?.batches?.values?.() ||
-      []
+      const value of
+      candidates
     ) {
-      const remark =
+      const text =
         cleanText(
-          batch.remark
-        ) ||
-        "（无备注）";
+          value
+        );
 
-      if (
-        seen.has(
-          remark
-        )
-      ) {
+      if (!text) {
         continue;
       }
 
-      seen.add(
-        remark
-      );
+      const match =
+        text.match(
+          /\d{4}-\d{1,2}-\d{1,2}/
+        );
 
-      output.push(
-        remark
+      return (
+        match?.[0] ||
+        text
       );
     }
 
-    return output;
+    return "";
+  }
+
+  function getCardRemarkBatchList(
+    state
+  ) {
+    return Array.from(
+      state?.batches?.values?.() ||
+      []
+    ).sort(
+      (a, b) => {
+        const dateCompare =
+          cleanText(
+            a.cardDate
+          ).localeCompare(
+            cleanText(
+              b.cardDate
+            )
+          );
+
+        if (
+          dateCompare !==
+          0
+        ) {
+          return dateCompare;
+        }
+
+        return (
+          Number(
+            a.startSuffix || 0
+          ) -
+          Number(
+            b.startSuffix || 0
+          )
+        );
+      }
+    );
+  }
+
+  function getCardRemarkBatchCount(
+    batch
+  ) {
+    const direct =
+      Number(
+        batch?.cardNum
+      );
+
+    if (
+      Number.isFinite(
+        direct
+      ) &&
+      direct > 0
+    ) {
+      return direct;
+    }
+
+    const start =
+      Number(
+        batch?.startSuffix
+      );
+
+    const end =
+      Number(
+        batch?.endSuffix
+      );
+
+    if (
+      Number.isFinite(
+        start
+      ) &&
+      Number.isFinite(
+        end
+      ) &&
+      end >=
+        start
+    ) {
+      return (
+        end -
+        start +
+        1
+      );
+    }
+
+    return 0;
+  }
+
+  function closeCardRemarkDetailModal() {
+    document
+      .getElementById(
+        UI.CARD_REMARK_MODAL_ID
+      )
+      ?.remove();
+  }
+
+  function openCardRemarkDetailModal(
+    cardType,
+    cardCorpCode
+  ) {
+    const orderCode =
+      getCurrentOrderCode();
+
+    const state =
+      getCardRemarkTypeState(
+        cardType,
+        orderCode,
+        cardCorpCode
+      );
+
+    const batches =
+      getCardRemarkBatchList(
+        state
+      );
+
+    if (!batches.length) {
+      updatePanelStatus(
+        "当前还没有可放大查看的备注数据。"
+      );
+
+      return;
+    }
+
+    closeCardRemarkDetailModal();
+
+    const label =
+      cardType ===
+        "storage"
+        ? "储值卡"
+        : "套餐卡";
+
+    const overlay =
+      document.createElement(
+        "div"
+      );
+
+    overlay.id =
+      UI.CARD_REMARK_MODAL_ID;
+
+    overlay.style.cssText = [
+      "position:fixed",
+      "inset:0",
+      "z-index:100002",
+      "display:flex",
+      "align-items:center",
+      "justify-content:center",
+      "padding:24px 16px",
+      "box-sizing:border-box",
+      "background:rgba(15,23,42,.32)",
+      "backdrop-filter:blur(1px)"
+    ].join(";");
+
+    const bodyHtml =
+      batches
+        .map(
+          (
+            batch,
+            index
+          ) => {
+            const beginNo =
+              cleanText(
+                batch.beginNo
+              );
+
+            const endNo =
+              cleanText(
+                batch.endNo
+              );
+
+            const rangeText =
+              beginNo &&
+              endNo &&
+              beginNo !==
+                endNo
+                ? `${beginNo} - ${endNo}`
+                : (
+                    beginNo ||
+                    endNo ||
+                    "未返回"
+                  );
+
+            const cardDate =
+              cleanText(
+                batch.cardDate
+              ) ||
+              "未返回";
+
+            const cardCount =
+              getCardRemarkBatchCount(
+                batch
+              );
+
+            const remark =
+              cleanText(
+                batch.remark
+              ) ||
+              "（无备注）";
+
+            return `
+              <section style="
+                padding:10px 11px;
+                border:1px solid #e2e7ee;
+                border-radius:8px;
+                background:#fff;
+              ">
+                <div style="
+                  display:flex;
+                  align-items:flex-start;
+                  gap:6px;
+                  color:#253247;
+                  font-size:13px;
+                  font-weight:750;
+                  line-height:1.55;
+                ">
+                  <span style="
+                    flex:0 0 auto;
+                    color:#1677ff;
+                    font-weight:800;
+                  ">${index + 1}.</span>
+
+                  <div style="
+                    min-width:0;
+                    word-break:break-all;
+                    user-select:text;
+                  ">
+                    卡号 ${escapeHtml(rangeText)}
+                  </div>
+                </div>
+
+                <div style="
+                  display:flex;
+                  align-items:center;
+                  flex-wrap:wrap;
+                  gap:8px 26px;
+                  margin-top:7px;
+                  padding-left:20px;
+                  color:#596579;
+                  font-size:12px;
+                  line-height:1.55;
+                ">
+                  <div style="
+                    display:flex;
+                    align-items:center;
+                    gap:6px;
+                    white-space:nowrap;
+                  ">
+                    <span style="font-weight:700;">办卡日期</span>
+                    <span style="
+                      color:#344054;
+                      font-weight:700;
+                      user-select:text;
+                    ">${escapeHtml(cardDate)}</span>
+                  </div>
+
+                  <div style="
+                    display:flex;
+                    align-items:center;
+                    gap:5px;
+                    white-space:nowrap;
+                  ">
+                    <span style="font-weight:700;">数量：</span>
+                    <span style="
+                      color:#344054;
+                      font-size:12px;
+                      font-weight:800;
+                    ">${
+                      cardCount > 0
+                        ? `${cardCount}张`
+                        : "未返回"
+                    }</span>
+                  </div>
+                </div>
+
+                <div style="
+                  margin-top:8px;
+                  padding-left:20px;
+                  color:#596579;
+                  font-size:16px;
+                  line-height:1.6;
+                ">
+                  <span style="
+                    font-weight:700;
+                  ">备注：</span>
+                  <span style="
+                    color:#344054;
+                    font-weight:800;
+                    word-break:break-all;
+                    user-select:text;
+                  ">${escapeHtml(remark)}</span>
+                </div>
+              </section>
+            `;
+          }
+        )
+        .join("");
+
+    overlay.innerHTML = `
+      <div
+        role="dialog"
+        aria-modal="true"
+        style="
+          width:min(520px,calc(100vw - 32px));
+          max-height:calc(100vh - 48px);
+          display:flex;
+          flex-direction:column;
+          overflow:hidden;
+          border:1px solid #dfe5ec;
+          border-radius:11px;
+          background:#fff;
+          box-shadow:0 18px 50px rgba(15,23,42,.24);
+          font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;
+        "
+      >
+        <div style="
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:12px;
+          padding:12px 14px;
+          border-bottom:1px solid #edf0f4;
+          background:#f8fbff;
+        ">
+          <div>
+            <div style="
+              color:#263548;
+              font-size:15px;
+              font-weight:750;
+              line-height:1.35;
+            ">${label}备注详情</div>
+            <div style="
+              margin-top:2px;
+              color:#8390a2;
+              font-size:10px;
+              line-height:1.35;
+            ">按制卡区间展示 · 卡号 · 日期 · 数量 · 备注</div>
+          </div>
+
+          <button
+            id="${UI.CARD_REMARK_MODAL_CLOSE_ID}"
+            type="button"
+            title="关闭"
+            style="
+              width:28px;
+              height:28px;
+              border:0;
+              border-radius:7px;
+              background:#eef2f6;
+              color:#667085;
+              font-size:16px;
+              line-height:28px;
+              cursor:pointer;
+            "
+          >×</button>
+        </div>
+
+        <div style="
+          min-height:0;
+          overflow:auto;
+          padding:11px 13px 13px;
+          background:#f8fafc;
+        ">
+          <div style="
+            display:flex;
+            flex-direction:column;
+            gap:8px;
+          ">
+            ${bodyHtml}
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(
+      overlay
+    );
+
+    const close =
+      () => {
+        closeCardRemarkDetailModal();
+      };
+
+    overlay
+      .querySelector(
+        `#${UI.CARD_REMARK_MODAL_CLOSE_ID}`
+      )
+      ?.addEventListener(
+        "click",
+        close
+      );
+
+    overlay.addEventListener(
+      "mousedown",
+      event => {
+        if (
+          event.target ===
+          overlay
+        ) {
+          close();
+        }
+      }
+    );
+
+    const onKeyDown =
+      event => {
+        if (
+          event.key !==
+          "Escape"
+        ) {
+          return;
+        }
+
+        document.removeEventListener(
+          "keydown",
+          onKeyDown,
+          true
+        );
+
+        close();
+      };
+
+    document.addEventListener(
+      "keydown",
+      onKeyDown,
+      true
+    );
   }
 
   function buildInlineRemarkHtml(
@@ -3505,54 +3956,25 @@
       cardRemarkQueryRunning ===
         cardType;
 
-    const remarks =
-      getUniqueRemarkList(
-        state
-      );
+    const hasResult =
+      state.complete &&
+      state.batches.size >
+        0;
 
     const buttonText =
       thisRunning
         ? "查询中..."
-        : state.complete
-          ? "已查询"
+        : hasResult
+          ? "查看备注"
           : "查询备注";
 
-    const disabled =
-      running ||
-      state.complete;
+    const action =
+      hasResult
+        ? "view"
+        : "query";
 
-    const remarkHtml =
-      remarks.length
-        ? `
-          <div style="
-            margin-top:6px;
-            padding-top:5px;
-            border-top:1px solid rgba(22,119,255,.14);
-            color:#44546a;
-            font-size:10px;
-            line-height:1.45;
-            text-align:left;
-            user-select:text;
-          ">
-            <div style="
-              margin-bottom:2px;
-              color:#596579;
-              font-weight:700;
-            ">备注内容：</div>
-            ${remarks
-              .map(
-                (remark, index) => `
-                  <div style="
-                    color:#344054;
-                    font-weight:600;
-                    word-break:break-all;
-                  ">${index + 1}.${escapeHtml(remark)}</div>
-                `
-              )
-              .join("")}
-          </div>
-        `
-        : "";
+    const disabled =
+      running;
 
     return `
       <div style="
@@ -3563,6 +3985,7 @@
         <button
           type="button"
           data-soa-card-remark-type="${cardType}"
+          data-soa-card-remark-action="${action}"
           ${disabled ? "disabled" : ""}
           style="
             width:100%;
@@ -3571,13 +3994,17 @@
             border:1px solid ${
               disabled
                 ? "#d9d9d9"
-                : "#91caff"
+                : hasResult
+                  ? "#91caff"
+                  : "#91caff"
             };
             border-radius:5px;
             background:${
               disabled
                 ? "#f5f5f5"
-                : "#e6f4ff"
+                : hasResult
+                  ? "#e6f4ff"
+                  : "#e6f4ff"
             };
             color:${
               disabled
@@ -3595,8 +4022,6 @@
             white-space:nowrap;
           "
         >${buttonText}</button>
-
-        ${remarkHtml}
       </div>
     `;
   }
@@ -3838,6 +4263,17 @@
                 cleanText(
                   detail?.endNo ||
                   record?.endNo
+                ),
+              cardDate:
+                extractCardRemarkDate(
+                  detail,
+                  record
+                ),
+              cardNum:
+                Number(
+                  detail?.cardNum ||
+                  record?.cardNum ||
+                  0
                 )
             }
           );
@@ -5096,6 +5532,32 @@
 
     grid
       .querySelectorAll(
+        "[data-soa-card-remark-detail]"
+      )
+      .forEach(
+        button => {
+          button.addEventListener(
+            "click",
+            event => {
+              event.preventDefault();
+              event.stopPropagation();
+
+              const cardType =
+                button.getAttribute(
+                  "data-soa-card-remark-detail"
+                );
+
+              openCardRemarkDetailModal(
+                cardType,
+                cardCorpCode
+              );
+            }
+          );
+        }
+      );
+
+    grid
+      .querySelectorAll(
         "[data-soa-card-remark-type]"
       )
       .forEach(
@@ -5110,6 +5572,23 @@
                 button.getAttribute(
                   "data-soa-card-remark-type"
                 );
+
+              const action =
+                button.getAttribute(
+                  "data-soa-card-remark-action"
+                );
+
+              if (
+                action ===
+                "view"
+              ) {
+                openCardRemarkDetailModal(
+                  cardType,
+                  cardCorpCode
+                );
+
+                return;
+              }
 
               const result =
                 cardType ===
@@ -6256,7 +6735,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.7.1
+          体检数据 v1.7.5
         </strong>
 
         <div style="
@@ -6393,7 +6872,7 @@
         font-weight:500;
         line-height:1.55;
       ">
-        首次打开自动读取当前订单数据；需要更新时点击“刷新数据”。三类卡固定显示并支持点击数量进入对应卡池查询；有数据的套餐卡/储值卡可在卡片内点击“查询备注”。
+        首次打开自动读取当前订单数据；需要更新时点击“刷新数据”。三类卡固定显示并支持点击数量进入对应卡池查询；有数据的套餐卡/储值卡可点击“查询备注”，完成后点击“查看备注”打开详情。
       </div>
     `;
 
@@ -6567,6 +7046,10 @@
         panelVisible
           ? "block"
           : "none";
+    }
+
+    if (!panelVisible) {
+      closeCardRemarkDetailModal();
     }
 
     if (panelVisible) {
