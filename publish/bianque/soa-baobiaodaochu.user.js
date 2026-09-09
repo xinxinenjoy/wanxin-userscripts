@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.5业绩报表辅助
 // @namespace    https://tampermonkey.net/
-// @version      1.0.1
+// @version      1.1.1
 // @description  SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。
 
 // @match        https://home.health-100.cn/*
@@ -26,22 +26,25 @@
  * 扁鹊-1.5业绩报表辅助
  *
  * 功能说明：
- * - 一次查询收入确认表、体检对账报表、客户加选项目报表，并分别查看、导出。
+ * - 报表可勾选参与批量查询；未勾选报表仍可单独查询，勾选状态自动记忆。
+ * - 批量查询按顺序错开请求，查询结果分别展示并独立导出。
  * - 支持今天、本月、本季度、本年和自定义日期区间。
- * - 三张报表按顺序错开请求，降低集中访问风险。
+ * - 当前支持：收入确认表、体检对账报表、客户加选项目报表。
  * - 体检对账报表支持超1080天自动分段。
  * - 客户加选项目报表支持异步生成、15秒检测、重新获取和查看下载中心状态。
  * - 支持Fly授权自动获取、失效刷新、网络重试，并可与对账报表v1.9同时使用。
  *
  * 更新记录：
  *
- * v1.0.1  -  2026-09-09
- * - 调整为正式版本号，统一脚本说明与发布信息。
- * - 精简更新日志，保留当前稳定功能说明。
- * - 当前稳定支持三类报表统一查询、分别导出及客户加选异步任务处理。
+ * v1.1.1  -  2026-09-09
+ * - 移除“体检套餐一览表”相关查询与导出代码。
+ * - 保留“勾选批量 + 单独查询”、勾选状态记忆及现有三类报表全部功能。
  *
- * v0.x  -  2026-09-08
- * - 完成三类报表接入、Fly授权共存、统一查询界面、日期快捷区间及下载状态处理。
+ * v1.1.0  -  2026-09-09
+ * - 新增“勾选批量 + 单独查询”模式，支持记忆常用报表组合。
+ *
+ * v1.0.1  -  2026-09-09
+ * - 三类报表统一查询、分别导出，完成Fly授权共存及客户加选异步任务处理。
  */
 
 (() => {
@@ -118,9 +121,15 @@
   const REPORT_SEGMENT_GAP_MS =
     150;
 
-  // 三张不同报表之间的查询错峰间隔。
+  // 不同报表之间的批量查询错峰间隔。
   const REPORT_QUERY_GAP_MS =
     1200;
+
+  const REPORT_ORDER = [
+    "income",
+    "recon",
+    "addItems"
+  ];
 
   const ADD_ITEMS_WAIT_MS =
     15000;
@@ -166,6 +175,9 @@
 
   const PRESET_RANGE_KEY =
     "__fly_income_report_preset_range_v024";
+
+  const REPORT_SELECTION_KEY =
+    "__bianque_report_selected_v110";
 
   const GLOBAL_SWITCH_ID =
     "__hlj_fly_report_global_switch_v023";
@@ -2517,6 +2529,7 @@
     anchor.remove();
   }
 
+
   // ============================================================
   // 6. 面板位置与拖动
   // ============================================================
@@ -2892,7 +2905,7 @@
                 font-size:10px;
                 line-height:16px;
                 font-weight:700;
-              ">v1.0.1</span>
+              ">v1.1.1</span>
             </div>
 
             <div style="
@@ -2900,7 +2913,7 @@
               color:#8291a5;
               font-size:10px;
               line-height:1.2;
-            ">一次查询 · 三张报表 · 分别下载</div>
+            ">批量查询 · 单独查询 · 分别下载</div>
           </div>
         </div>
 
@@ -2933,7 +2946,7 @@
           <span style="
             color:#9aa7b8;
             font-size:10px;
-          ">三张报表共用同一日期</span>
+          ">所有报表共用同一日期</span>
         </div>
 
         <div style="
@@ -3034,7 +3047,7 @@
               stroke="currentColor" stroke-width="1.8"
               stroke-linecap="round"/>
           </svg>
-          <span>查询全部报表</span>
+          <span>查询已选报表（3）</span>
         </button>
 
         <div style="
@@ -3057,7 +3070,7 @@
             <span style="
               color:#9aa7b8;
               font-size:10px;
-            ">按顺序错开请求 · 间隔约1.2秒</span>
+            ">勾选参与批量 · 未勾选可单独查询</span>
           </div>
 
           <div
@@ -3083,7 +3096,7 @@
             line-height:1.5;
             word-break:break-all;
           "
-        >选择日期后点击“查询全部报表”。</div>
+        >勾选常用报表后可批量查询，也可单独查询任意一张。</div>
       </div>
     `;
 
@@ -3151,7 +3164,7 @@
 
       #${PANEL_ID} .__fly_report_result_row_v031 {
         display:grid;
-        grid-template-columns:32px minmax(0,1fr) auto;
+        grid-template-columns:18px 30px minmax(0,1fr) auto;
         gap:9px;
         align-items:center;
         min-height:58px;
@@ -3160,6 +3173,14 @@
         border:1px solid #e6edf5;
         border-radius:9px;
         background:#fbfcfe;
+      }
+
+      #${PANEL_ID} .__fly_report_select_v110 {
+        width:16px;
+        height:16px;
+        margin:0;
+        accent-color:#1677ff;
+        cursor:pointer;
       }
 
       #${PANEL_ID} .__fly_report_result_icon_v031 {
@@ -3329,6 +3350,9 @@
     let queryBusy =
       false;
 
+    let singleQueryBusy =
+      false;
+
     const reportStates = {
       income:
         null,
@@ -3337,6 +3361,26 @@
       addItems:
         null
     };
+
+    const savedSelection =
+      GM_getValue(
+        REPORT_SELECTION_KEY,
+        null
+      );
+
+    const selectedReports =
+      new Set(
+        Array.isArray(
+          savedSelection
+        )
+          ? savedSelection.filter(
+              key =>
+                REPORT_ORDER.includes(
+                  key
+                )
+            )
+          : REPORT_ORDER
+      );
 
     function setStatus(
       message,
@@ -3702,11 +3746,11 @@
       if (!state) {
         return {
           text:
-            "待查询",
+            "查询",
           disabled:
-            true,
+            false,
           action:
-            ""
+            `${key}-query`
         };
       }
 
@@ -3783,11 +3827,13 @@
       ) {
         return {
           text:
-            "无数据",
+            "重查",
           disabled:
-            true,
+            false,
           action:
-            ""
+            `${key}-query`,
+          secondary:
+            true
         };
       }
 
@@ -3797,30 +3843,29 @@
       ) {
         return {
           text:
-            "查询失败",
+            "重试",
           disabled:
-            true,
+            false,
           action:
-            ""
+            `${key}-query`,
+          secondary:
+            true
         };
       }
 
       return {
         text:
-          "待查询",
+          "查询",
         disabled:
-          true,
+          false,
         action:
-          ""
+          `${key}-query`
       };
     }
 
     function renderResults() {
-      const keys = [
-        "income",
-        "recon",
-        "addItems"
-      ];
+      const keys =
+        REPORT_ORDER;
 
       resultList.innerHTML =
         keys
@@ -3854,6 +3899,14 @@
                   class="__fly_report_result_row_v031"
                   data-result-report="${key}"
                 >
+                  <input
+                    type="checkbox"
+                    class="__fly_report_select_v110"
+                    data-report-select="${key}"
+                    title="勾选后参与批量查询"
+                    ${selectedReports.has(key) ? "checked" : ""}
+                  >
+
                   <div class="__fly_report_result_icon_v031">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
                       xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -3909,6 +3962,7 @@
           .join("");
 
       bindResultActions();
+      updateBatchButton();
     }
 
     function invalidateAllStates() {
@@ -3971,7 +4025,7 @@
       if (invalidate) {
         invalidateAllStates();
         setStatus(
-          "日期条件已变更，请重新查询全部报表。"
+          "日期条件已变更，请重新查询已选报表或单独查询。"
         );
       }
     }
@@ -3984,6 +4038,58 @@
       renderPresetState(
         ""
       );
+    }
+
+    function getSelectedReportKeys() {
+      return REPORT_ORDER.filter(
+        key =>
+          selectedReports.has(
+            key
+          )
+      );
+    }
+
+    function saveSelectedReports() {
+      GM_setValue(
+        REPORT_SELECTION_KEY,
+        getSelectedReportKeys()
+      );
+    }
+
+    function updateBatchButton() {
+      const count =
+        getSelectedReportKeys()
+          .length;
+
+      const label =
+        queryButton.querySelector(
+          "span"
+        );
+
+      if (
+        !queryBusy
+      ) {
+        if (label) {
+          label.textContent =
+            count > 0
+              ? `查询已选报表（${count}）`
+              : "请选择报表";
+        }
+
+        queryButton.disabled =
+          count === 0 ||
+          singleQueryBusy;
+
+        queryButton.style.opacity =
+          queryButton.disabled
+            ? ".58"
+            : "1";
+
+        queryButton.style.cursor =
+          queryButton.disabled
+            ? "not-allowed"
+            : "pointer";
+      }
     }
 
     function setQueryProgress(
@@ -4018,24 +4124,7 @@
       queryBusy =
         false;
 
-      queryButton.disabled =
-        false;
-
-      queryButton.style.opacity =
-        "1";
-
-      queryButton.style.cursor =
-        "pointer";
-
-      const label =
-        queryButton.querySelector(
-          "span"
-        );
-
-      if (label) {
-        label.textContent =
-          "查询全部报表";
-      }
+      updateBatchButton();
     }
 
     async function runIncomeQuery(
@@ -4340,7 +4429,7 @@
               renderResults();
 
               setStatus(
-                "✓ 三张报表查询完成，客户加选项目下载文件也已生成。",
+                "✓ 客户加选项目下载文件已生成，可以导出。",
                 "success"
               );
 
@@ -4367,7 +4456,7 @@
         renderResults();
 
         setStatus(
-          "三张报表查询已完成；客户加选项目文件15秒内尚未生成，可点击“重新获取”继续检查。"
+          "客户加选项目文件15秒内尚未生成，可点击“重新获取”继续检查。"
         );
       }
     }
@@ -4926,7 +5015,174 @@
       );
     }
 
+    async function runReportQueryByKey(
+      key,
+      dates
+    ) {
+      switch (key) {
+        case "income":
+          return runIncomeQuery(
+            dates
+          );
+
+        case "recon":
+          return runReconQuery(
+            dates
+          );
+
+        case "addItems":
+          if (
+            reportStates.addItems &&
+            (
+              reportStates.addItems.kind ===
+                "preparing" ||
+              reportStates.addItems.kind ===
+                "generating"
+            )
+          ) {
+            setStatus(
+              "客户加选项目报表仍在生成中，为避免重复提交任务，请等待完成或使用“重新获取”。"
+            );
+
+            return true;
+          }
+
+          return runAddItemsQuery(
+            dates
+          );
+
+        default:
+          throw new Error(
+            `未知报表模块：${key}`
+          );
+      }
+    }
+
+    async function querySingleReport(
+      key
+    ) {
+      if (
+        queryBusy ||
+        singleQueryBusy
+      ) {
+        setStatus(
+          "当前已有查询正在进行，请稍后再操作。"
+        );
+        return;
+      }
+
+      const dates =
+        normalizeDateInputs(
+          true
+        );
+
+      if (!dates) {
+        return;
+      }
+
+      singleQueryBusy =
+        true;
+
+      updateBatchButton();
+
+      try {
+        setStatus(
+          `正在单独查询：${REPORT_MODULES[key].name} ${dates.startDate} ～ ${dates.endDate}`
+        );
+
+        const ok =
+          await runReportQueryByKey(
+            key,
+            dates
+          );
+
+        const state =
+          reportStates[key];
+
+        if (!ok) {
+          setStatus(
+            `${REPORT_MODULES[key].name}查询失败，请查看该行状态。`,
+            "error"
+          );
+        } else if (
+          key === "addItems" &&
+          state &&
+          (
+            state.kind ===
+              "preparing" ||
+            state.kind ===
+              "generating"
+          )
+        ) {
+          setStatus(
+            "✓ 客户加选项目查询完成，下载文件正在后台生成。",
+            "success"
+          );
+        } else {
+          setStatus(
+            `✓ ${REPORT_MODULES[key].name}查询完成。`,
+            "success"
+          );
+        }
+      } finally {
+        singleQueryBusy =
+          false;
+
+        updateBatchButton();
+      }
+    }
+
     function bindResultActions() {
+      resultList
+        .querySelectorAll(
+          "[data-report-select]"
+        )
+        .forEach(
+          checkbox => {
+            checkbox.addEventListener(
+              "change",
+              () => {
+                const key =
+                  cleanText(
+                    checkbox.dataset
+                      .reportSelect
+                  );
+
+                if (
+                  checkbox.checked
+                ) {
+                  selectedReports.add(
+                    key
+                  );
+                } else {
+                  selectedReports.delete(
+                    key
+                  );
+                }
+
+                saveSelectedReports();
+                updateBatchButton();
+              }
+            );
+          }
+        );
+
+      REPORT_ORDER.forEach(
+        key => {
+          resultList
+            .querySelector(
+              `[data-action="${key}-query"]`
+            )
+            ?.addEventListener(
+              "click",
+              () =>
+                querySingleReport(
+                  key
+                )
+            );
+        }
+      );
+
       resultList
         .querySelector(
           '[data-action="addItems-status"]'
@@ -4982,24 +5238,24 @@
         );
     }
 
-    async function queryAllReports() {
-      if (queryBusy) {
+    async function querySelectedReports() {
+      if (
+        queryBusy ||
+        singleQueryBusy
+      ) {
         return;
       }
 
+      const selectedKeys =
+        getSelectedReportKeys();
+
       if (
-        reportStates.addItems &&
-        (
-          reportStates.addItems.kind ===
-            "preparing" ||
-          reportStates.addItems.kind ===
-            "generating"
-        )
+        selectedKeys.length ===
+        0
       ) {
         setStatus(
-          "客户加选项目报表仍在生成中。为避免重复提交导出任务，请等待生成完成或15秒后使用“重新获取”。"
+          "请先勾选至少一张需要批量查询的报表。"
         );
-
         return;
       }
 
@@ -5012,7 +5268,28 @@
         return;
       }
 
-      invalidateAllStates();
+      // 只清空本次参与批量查询的报表，未勾选报表保留现有结果。
+      selectedKeys.forEach(
+        key => {
+          if (
+            key === "addItems" &&
+            reportStates.addItems &&
+            (
+              reportStates.addItems.kind ===
+                "preparing" ||
+              reportStates.addItems.kind ===
+                "generating"
+            )
+          ) {
+            return;
+          }
+
+          reportStates[key] =
+            null;
+        }
+      );
+
+      renderResults();
 
       let okCount =
         0;
@@ -5021,72 +5298,47 @@
         0;
 
       try {
-        setQueryProgress(
-          1,
-          3,
-          "收入确认表"
-        );
-
-        setStatus(
-          `正在查询 1/3：收入确认表 ${dates.startDate} ～ ${dates.endDate}`
-        );
-
-        if (
-          await runIncomeQuery(
-            dates
-          )
+        for (
+          let index = 0;
+          index <
+            selectedKeys.length;
+          index += 1
         ) {
-          okCount += 1;
-        } else {
-          errorCount += 1;
-        }
+          const key =
+            selectedKeys[
+              index
+            ];
 
-        await sleep(
-          REPORT_QUERY_GAP_MS
-        );
+          setQueryProgress(
+            index + 1,
+            selectedKeys.length,
+            REPORT_MODULES[key].shortName
+          );
 
-        setQueryProgress(
-          2,
-          3,
-          "体检对账报表"
-        );
+          setStatus(
+            `正在查询 ${index + 1}/${selectedKeys.length}：${REPORT_MODULES[key].name}...`
+          );
 
-        setStatus(
-          "正在查询 2/3：体检对账报表..."
-        );
+          const ok =
+            await runReportQueryByKey(
+              key,
+              dates
+            );
 
-        if (
-          await runReconQuery(
-            dates
-          )
-        ) {
-          okCount += 1;
-        } else {
-          errorCount += 1;
-        }
+          if (ok) {
+            okCount += 1;
+          } else {
+            errorCount += 1;
+          }
 
-        await sleep(
-          REPORT_QUERY_GAP_MS
-        );
-
-        setQueryProgress(
-          3,
-          3,
-          "客户加选项目"
-        );
-
-        setStatus(
-          "正在查询 3/3：客户加选项目报表..."
-        );
-
-        if (
-          await runAddItemsQuery(
-            dates
-          )
-        ) {
-          okCount += 1;
-        } else {
-          errorCount += 1;
+          if (
+            index <
+            selectedKeys.length - 1
+          ) {
+            await sleep(
+              REPORT_QUERY_GAP_MS
+            );
+          }
         }
 
         const addState =
@@ -5096,6 +5348,9 @@
           errorCount === 0
         ) {
           if (
+            selectedKeys.includes(
+              "addItems"
+            ) &&
             addState &&
             (
               addState.kind ===
@@ -5105,18 +5360,18 @@
             )
           ) {
             setStatus(
-              "✓ 三张报表查询已完成；客户加选项目下载文件正在后台生成。",
+              `✓ 已完成 ${okCount} 张已选报表查询；客户加选项目下载文件正在后台生成。`,
               "success"
             );
           } else {
             setStatus(
-              "✓ 三张报表查询已完成。",
+              `✓ 已完成 ${okCount} 张已选报表查询。`,
               "success"
             );
           }
         } else {
           setStatus(
-            `查询流程已结束：${okCount} 张完成，${errorCount} 张失败。可查看各报表行的状态。`,
+            `批量查询结束：${okCount} 张完成，${errorCount} 张失败。可查看各报表行状态。`,
             "error"
           );
         }
@@ -5152,7 +5407,7 @@
             markCustomRange();
             invalidateAllStates();
             setStatus(
-              "日期条件已变更，请重新查询全部报表。"
+              "日期条件已变更，请重新查询已选报表或单独查询。"
             );
           }
         );
@@ -5198,7 +5453,7 @@
 
     queryButton.addEventListener(
       "click",
-      queryAllReports
+      querySelectedReports
     );
 
     closeButton.addEventListener(
@@ -5253,7 +5508,7 @@
     renderResults();
 
     setStatus(
-      "选择日期后点击“查询全部报表”。"
+      "勾选常用报表后可批量查询，也可单独查询任意一张。"
     );
 
     makePanelDraggable(
