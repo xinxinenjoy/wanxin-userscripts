@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GOW底下尖塔
 // @namespace    http://tampermonkey.net/
-// @version      4.2.29
+// @version      4.2.27
 // @description  GOW底下尖塔火把管理与节点同步工具
 
 // @match        https://solofandy.github.io/*
@@ -17,15 +17,10 @@
 /*
  * 更新记录
  *
- * v4.2.29 - 2026-9-10
- * - 回退：撤销连接线绕避方块评分算法，恢复上一版稳定标签避让逻辑
- * - 原因：连接线避块策略导致标签位置评分失衡，出现标签覆盖地图节点的问题
- *
- * v4.2.28 - 2026-9-10
- * - 优化：标签偏移后的节点关联线，改为独立高识别度指示线，增加浅色描边避免与地图线路混淆
- * - 优化：标签避让评分，优先避开房间、线路和已有标签，必要时允许远距离显示并保持节点关联
- * - 优化：终点/守卫标签显示逻辑，火把数量调整为“🔥8”形式，降低阅读成本
- * - 保留：不增加额外守卫图标，仅强化标签、路线和节点之间的视觉关系
+ * v4.2.27 - 2026-8-30
+ * - 优化：守卫清理模式与常规导航一致，为所有未完成守卫显示独立火把消耗与完整路线
+ * - 优化：清理模式会记录当前清理起点；同步完成守卫后自动从新完成守卫继续规划
+ * - 保留：各守卫路线独立计算，不因与其他路线重合而合并或抵扣火把
  *
  * v4.2.26 - 2026-8-30
  * - 优化：重点房间全部完成后，自动标记所有未完成的守卫房间
@@ -1015,16 +1010,14 @@
                 position: absolute;
                 left: 50%;
                 top: 50%;
-                height: 3px;
+                height: 2px;
                 transform-origin: 0 50%;
                 z-index: 32;
                 border-radius: 999px;
                 pointer-events: none;
-                opacity: 0.95;
+                opacity: 0.86;
                 background: currentColor;
-                box-shadow:
-                    0 0 0 2px rgba(255,255,255,0.92),
-                    0 0 6px rgba(0,0,0,0.28);
+                box-shadow: 0 0 4px rgba(0,0,0,0.20);
             }
 
             #underspire-map .gow-nav-connector::after {
@@ -1032,13 +1025,10 @@
                 position: absolute;
                 right: -1px;
                 top: 50%;
-                width: 7px;
-                height: 7px;
-                border-top: 3px solid currentColor;
-                border-right: 3px solid currentColor;
-                filter:
-                    drop-shadow(0 0 0.5px #fff)
-                    drop-shadow(0 0 2px rgba(0,0,0,0.25));
+                width: 6px;
+                height: 6px;
+                border-top: 2px solid currentColor;
+                border-right: 2px solid currentColor;
                 transform: translateY(-50%) rotate(45deg);
                 transform-origin: center;
             }
@@ -1748,13 +1738,13 @@
             const style = getComputedStyle(path);
             if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') <= 0.02) return;
             const rect = path.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) obstacles.push({ rect, weight: 12 });
+            if (rect.width > 0 && rect.height > 0) obstacles.push({ rect, weight: 5 });
         });
 
         // 房间色块本身也尽量不遮挡。
         map.querySelectorAll('.cell:not(.none) .cell-core').forEach(core => {
             const rect = core.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) obstacles.push({ rect, weight: 6 });
+            if (rect.width > 0 && rect.height > 0) obstacles.push({ rect, weight: 3 });
         });
 
         // 已放置的导航标签也互相避让。
@@ -1901,7 +1891,7 @@
         if (cost !== null && cost !== undefined) {
             const costBadge = document.createElement('div');
             costBadge.className = 'gow-nav-marker-cost';
-            costBadge.textContent = `🔥${cost}`;
+            costBadge.textContent = `${cost} 🔥`;
             marker.appendChild(costBadge);
         }
 
