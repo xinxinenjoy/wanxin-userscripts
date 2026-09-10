@@ -1,10 +1,9 @@
 // ==UserScript==
 // @name         扁鹊-1.5业绩报表辅助
 // @namespace    https://tampermonkey.net/
-// @version      1.1.1
+// @version      1.1.2
 // @description  SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。
 
-// @match        https://home.health-100.cn/*
 // @match        https://checkup-soa3.health-100.cn/*
 // @match        https://app-fly.health-100.cn/*
 // @grant        GM_xmlhttpRequest
@@ -36,6 +35,12 @@
  *
  * 更新记录：
  *
+ * v1.1.2  -  2026-09-10
+ * - 取消门户首页显示，业务入口仅在SOA页面展示；Fly页面仍仅用于授权捕获。
+ * - 重做“报表工具”入口定位：优先嵌入SOA顶部地区/用户导航区域的可用空位，空间不足时自动寻找顶部不遮挡原标签的安全位置。
+ * - 按SOA子页面路由记忆入口位置；刷新时先等待顶部布局稳定，再一次性显示，取消多次延迟重定位，避免加载过程中位置跳动。
+ * - SPA子页面切换或顶部导航重建后自动重新适配，不影响报表查询、导出及面板拖动记忆。
+ *
  * v1.1.1  -  2026-09-09
  * - 移除“体检套餐一览表”相关查询与导出代码。
  * - 保留“勾选批量 + 单独查询”、勾选状态记忆及现有三类报表全部功能。
@@ -54,8 +59,6 @@
   // 1. 基础配置
   // ============================================================
 
-  const HOST_HOME =
-    "home.health-100.cn";
 
   const HOST_SOA =
     "checkup-soa3.health-100.cn";
@@ -183,10 +186,34 @@
     "__hlj_fly_report_global_switch_v023";
 
   const GLOBAL_SWITCH_STYLE_ID =
-    "__hlj_fly_report_global_switch_style_v023";
+    "__hlj_fly_report_global_switch_style_v112";
+
+  const GLOBAL_SWITCH_PLACEMENT_KEY =
+    "__hlj_fly_report_switch_placement_v112";
+
+  const GLOBAL_SWITCH_STABLE_INTERVAL_MS =
+    120;
+
+  const GLOBAL_SWITCH_STABLE_REQUIRED =
+    3;
+
+  const GLOBAL_SWITCH_STABLE_MAX_CHECKS =
+    15;
 
   let panelVisible =
     false;
+
+  let globalSwitchPlacementTask =
+    null;
+
+  let globalSwitchPlacementGeneration =
+    0;
+
+  let globalSwitchObserver =
+    null;
+
+  let globalSwitchRouteKey =
+    "";
 
   // ============================================================
   // 2. 通用工具
@@ -2905,7 +2932,7 @@
                 font-size:10px;
                 line-height:16px;
                 font-weight:700;
-              ">v1.1.1</span>
+              ">v1.1.2</span>
             </div>
 
             <div style="
@@ -5608,9 +5635,6 @@
 
     style.textContent = `
       #${GLOBAL_SWITCH_ID} {
-        position:fixed;
-        top:10px;
-        right:205px;
         z-index:2147483645;
         display:inline-flex;
         align-items:center;
@@ -5619,9 +5643,9 @@
         height:27px;
         padding:0 10px;
         box-sizing:border-box;
-        border:1px solid rgba(255,255,255,.32);
+        border:1px solid rgba(255,255,255,.38);
         border-radius:5px;
-        background:rgba(4,70,166,.72);
+        background:rgba(4,70,166,.80);
         color:#fff;
         font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif;
         font-size:13px;
@@ -5631,48 +5655,41 @@
         white-space:nowrap;
         cursor:pointer;
         user-select:none;
-        text-shadow:0 1px 1px rgba(0,35,90,.35);
-        box-shadow:
-          inset 0 1px 0 rgba(255,255,255,.08),
-          0 1px 3px rgba(0,38,96,.18);
-        backdrop-filter:blur(2px);
-        transition:
-          background .15s ease,
-          border-color .15s ease,
-          box-shadow .15s ease;
+        text-shadow:0 1px 1px rgba(0,35,90,.30);
+        box-shadow:0 1px 4px rgba(0,38,96,.18);
+        transition:background .15s ease,border-color .15s ease,box-shadow .15s ease;
       }
 
       #${GLOBAL_SWITCH_ID}:hover {
-        background:rgba(3,60,150,.90);
-        border-color:rgba(255,255,255,.48);
-        box-shadow:
-          inset 0 1px 0 rgba(255,255,255,.10),
-          0 2px 6px rgba(0,38,96,.25);
+        background:rgba(3,60,150,.94);
+        border-color:rgba(255,255,255,.52);
+        box-shadow:0 2px 7px rgba(0,38,96,.24);
       }
 
       #${GLOBAL_SWITCH_ID}.is-active {
-        background:rgba(2,53,137,.94);
-        border-color:rgba(255,255,255,.54);
-        box-shadow:
-          inset 0 1px 0 rgba(255,255,255,.10),
-          0 2px 7px rgba(0,38,96,.28);
+        background:rgba(2,53,137,.98);
+        border-color:rgba(255,255,255,.58);
+        box-shadow:0 2px 8px rgba(0,38,96,.28);
+      }
+
+      #${GLOBAL_SWITCH_ID}.is-inline {
+        position:relative;
+        top:auto;
+        left:auto;
+        right:auto;
+        bottom:auto;
+        flex:0 0 auto;
+        margin:0 14px 0 0;
+        vertical-align:middle;
+      }
+
+      #${GLOBAL_SWITCH_ID}.is-fixed {
+        position:fixed;
+        margin:0;
       }
 
       #${GLOBAL_SWITCH_ID} svg {
         flex:0 0 auto;
-      }
-
-      @media (max-width:1180px) {
-        #${GLOBAL_SWITCH_ID} {
-          right:150px;
-          padding:0 9px;
-        }
-      }
-
-      @media (max-width:900px) {
-        #${GLOBAL_SWITCH_ID} {
-          right:95px;
-        }
       }
     `;
 
@@ -5689,6 +5706,10 @@
   function getDirectVisibleText(
     element
   ) {
+    if (!element) {
+      return "";
+    }
+
     const directText =
       Array.from(
         element.childNodes ||
@@ -5725,7 +5746,151 @@
     return "";
   }
 
-  function findTopRightTextAnchor() {
+  function getSoaRouteKey() {
+    const hashPath =
+      cleanText(
+        location.hash
+          .split("?")[0]
+      ) ||
+      "#/";
+
+    const normalizedHash =
+      hashPath
+        .split("/")
+        .map(
+          segment => {
+            if (
+              /^\d{6,}$/.test(
+                segment
+              ) ||
+              /^[A-Za-z0-9_-]{18,}$/.test(
+                segment
+              )
+            ) {
+              return ":id";
+            }
+
+            return segment;
+          }
+        )
+        .join("/");
+
+    return (
+      `${location.pathname}|${normalizedHash}`
+    );
+  }
+
+  function readGlobalSwitchPlacementMap() {
+    const value =
+      GM_getValue(
+        GLOBAL_SWITCH_PLACEMENT_KEY,
+        {}
+      );
+
+    return (
+      value &&
+      typeof value ===
+        "object" &&
+      !Array.isArray(
+        value
+      )
+    )
+      ? value
+      : {};
+  }
+
+  function saveGlobalSwitchPlacement(
+    placement
+  ) {
+    if (
+      !placement ||
+      typeof placement !==
+        "object"
+    ) {
+      return;
+    }
+
+    const map =
+      readGlobalSwitchPlacementMap();
+
+    map[
+      getSoaRouteKey()
+    ] = {
+      mode:
+        cleanText(
+          placement.mode
+        ),
+      left:
+        Number.isFinite(
+          Number(
+            placement.left
+          )
+        )
+          ? Number(
+              placement.left
+            )
+          : null,
+      top:
+        Number.isFinite(
+          Number(
+            placement.top
+          )
+        )
+          ? Number(
+              placement.top
+            )
+          : null
+    };
+
+    GM_setValue(
+      GLOBAL_SWITCH_PLACEMENT_KEY,
+      map
+    );
+  }
+
+  function getRememberedGlobalSwitchPlacement() {
+    return (
+      readGlobalSwitchPlacementMap()[
+        getSoaRouteKey()
+      ] ||
+      null
+    );
+  }
+
+  function isElementVisible(
+    element
+  ) {
+    if (!element) {
+      return false;
+    }
+
+    const rect =
+      element.getBoundingClientRect();
+
+    if (
+      rect.width <= 0 ||
+      rect.height <= 0
+    ) {
+      return false;
+    }
+
+    const style =
+      getComputedStyle(
+        element
+      );
+
+    return !(
+      style.display ===
+        "none" ||
+      style.visibility ===
+        "hidden" ||
+      Number(
+        style.opacity
+      ) === 0
+    );
+  }
+
+  function findSoaRegionAnchor() {
     const candidates =
       Array.from(
         document.querySelectorAll(
@@ -5744,6 +5909,9 @@
       candidates
     ) {
       if (
+        !isElementVisible(
+          element
+        ) ||
         element.id ===
           GLOBAL_SWITCH_ID ||
         element.closest?.(
@@ -5759,7 +5927,9 @@
         );
 
       if (
-        !text ||
+        !/地区$/.test(
+          text
+        ) ||
         text.length > 12
       ) {
         continue;
@@ -5769,61 +5939,27 @@
         element.getBoundingClientRect();
 
       if (
-        rect.width < 18 ||
-        rect.width > 160 ||
-        rect.height < 12 ||
-        rect.height > 42 ||
         rect.top < 0 ||
-        rect.bottom > 82 ||
+        rect.bottom > 92 ||
         rect.left <
           window.innerWidth *
-            0.58
+            0.52 ||
+        rect.width > 180 ||
+        rect.height > 48
       ) {
         continue;
       }
 
-      const style =
-        getComputedStyle(
-          element
-        );
-
-      if (
-        style.display ===
-          "none" ||
-        style.visibility ===
-          "hidden" ||
-        Number(
-          style.opacity
-        ) ===
-          0
-      ) {
-        continue;
-      }
-
-      let score =
-        rect.left /
-          Math.max(
-            window.innerWidth,
-            1
-          ) *
-          100;
-
-      // SOA优先以“XX地区”作为锚点，确保入口位于地区文字左侧。
-      if (
-        /地区$/.test(
-          text
-        )
-      ) {
-        score +=
-          1000;
-      }
-
-      // 门户没有“地区”时，优先选择顶部更靠右的短文字，通常就是用户名。
-      score -=
-        Math.abs(
-          rect.height - 20
-        ) *
-        2;
+      const score =
+        rect.left +
+        (
+          92 -
+          Math.abs(
+            rect.top +
+            rect.height / 2 -
+            28
+          )
+        ) * 5;
 
       if (
         score >
@@ -5840,108 +5976,707 @@
     return best;
   }
 
-  function alignGlobalSwitchToPage() {
-    const button =
-      document.getElementById(
-        GLOBAL_SWITCH_ID
-      );
-
-    if (!button) {
-      return;
-    }
-
-    const anchor =
-      findTopRightTextAnchor();
-
-    if (anchor) {
-      const rect =
-        anchor.getBoundingClientRect();
-
-      const buttonRect =
-        button.getBoundingClientRect();
-
-      // 与页面原有文字做垂直居中对齐，避免按钮明显高于/低于导航文字。
-      const top =
-        Math.max(
-          3,
-          Math.round(
-            rect.top +
-            (
-              rect.height -
-              buttonRect.height
-            ) /
-              2
-          )
-        );
-
-      // 放在锚点左侧，保留适度间距。
-      const right =
-        Math.max(
-          86,
-          Math.round(
-            window.innerWidth -
-            rect.left +
-            20
-          )
-        );
-
-      button.style.top =
-        `${top}px`;
-
-      button.style.right =
-        `${right}px`;
-
-      return;
-    }
-
-    // 页面结构变化时使用稳定回退位置。
-    button.style.top =
-      "10px";
-
-    button.style.right =
-      location.hostname ===
-        HOST_SOA
-        ? "205px"
-        : "155px";
-  }
-
-  function scheduleGlobalSwitchAlignment() {
-    const delays = [
-      0,
-      250,
-      800,
-      1600,
-      3000
-    ];
-
-    delays.forEach(
-      delay => {
-        setTimeout(
-          alignGlobalSwitchToPage,
-          delay
-        );
-      }
-    );
-  }
-
-  function ensureGlobalSwitch() {
-    if (
-      location.hostname !==
-        HOST_HOME &&
-      location.hostname !==
-        HOST_SOA
-    ) {
+  function findInlineContainerForAnchor(
+    anchor
+  ) {
+    if (!anchor) {
       return null;
     }
 
+    let current =
+      anchor.parentElement;
+
+    for (
+      let depth = 0;
+      current &&
+      depth < 6;
+      depth += 1,
+      current =
+        current.parentElement
+    ) {
+      const rect =
+        current.getBoundingClientRect();
+
+      const style =
+        getComputedStyle(
+          current
+        );
+
+      if (
+        (
+          style.display ===
+            "flex" ||
+          style.display ===
+            "inline-flex"
+        ) &&
+        rect.top >= 0 &&
+        rect.bottom <= 96 &&
+        rect.width >= 120 &&
+        rect.width <= 720 &&
+        rect.right >=
+          window.innerWidth *
+            0.78
+      ) {
+        let directChild =
+          anchor;
+
+        while (
+          directChild.parentElement &&
+          directChild.parentElement !==
+            current
+        ) {
+          directChild =
+            directChild.parentElement;
+        }
+
+        if (
+          directChild.parentElement ===
+          current
+        ) {
+          return {
+            container:
+              current,
+            anchorChild:
+              directChild
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function getOuterWidth(
+    element
+  ) {
+    if (!element) {
+      return 0;
+    }
+
+    const rect =
+      element.getBoundingClientRect();
+
+    const style =
+      getComputedStyle(
+        element
+      );
+
+    return (
+      rect.width +
+      (
+        parseFloat(
+          style.marginLeft
+        ) || 0
+      ) +
+      (
+        parseFloat(
+          style.marginRight
+        ) || 0
+      )
+    );
+  }
+
+  function inlineContainerHasRoom(
+    context,
+    button
+  ) {
+    if (
+      !context?.container ||
+      !button
+    ) {
+      return false;
+    }
+
+    const container =
+      context.container;
+
+    const rect =
+      container.getBoundingClientRect();
+
+    const style =
+      getComputedStyle(
+        container
+      );
+
+    const gap =
+      parseFloat(
+        style.columnGap ||
+        style.gap
+      ) || 0;
+
+    const children =
+      Array.from(
+        container.children
+      ).filter(
+        child =>
+          child !==
+            button &&
+          isElementVisible(
+            child
+          )
+      );
+
+    const occupied =
+      children.reduce(
+        (
+          total,
+          child
+        ) =>
+          total +
+          getOuterWidth(
+            child
+          ),
+        0
+      ) +
+      Math.max(
+        0,
+        children.length - 1
+      ) *
+      gap;
+
+    const estimatedButtonWidth =
+      Math.max(
+        108,
+        button.getBoundingClientRect()
+          .width || 108
+      );
+
+    return (
+      rect.width -
+      occupied >=
+      estimatedButtonWidth +
+      12
+    );
+  }
+
+  function applyInlineGlobalSwitch(
+    button,
+    context
+  ) {
+    if (
+      !button ||
+      !context?.container ||
+      !context?.anchorChild
+    ) {
+      return false;
+    }
+
+    button.classList.remove(
+      "is-fixed"
+    );
+
+    button.classList.add(
+      "is-inline"
+    );
+
+    button.style.left =
+      "auto";
+
+    button.style.top =
+      "auto";
+
+    button.style.right =
+      "auto";
+
+    context.container.insertBefore(
+      button,
+      context.anchorChild
+    );
+
+    return true;
+  }
+
+  function rectanglesOverlap(
+    a,
+    b,
+    margin = 0
+  ) {
+    return !(
+      a.right + margin <=
+        b.left ||
+      a.left - margin >=
+        b.right ||
+      a.bottom + margin <=
+        b.top ||
+      a.top - margin >=
+        b.bottom
+    );
+  }
+
+  function collectTopOccupiedRects(
+    button
+  ) {
+    const nodes =
+      Array.from(
+        document.querySelectorAll(
+          "a,button,input,select,[role='button'],span,strong"
+        )
+      );
+
+    const rects = [];
+
+    for (
+      const element of
+      nodes
+    ) {
+      if (
+        element ===
+          button ||
+        element.closest?.(
+          `#${GLOBAL_SWITCH_ID}`
+        ) ||
+        !isElementVisible(
+          element
+        )
+      ) {
+        continue;
+      }
+
+      const rect =
+        element.getBoundingClientRect();
+
+      if (
+        rect.bottom <= 0 ||
+        rect.top >= 92 ||
+        rect.width < 8 ||
+        rect.width > 320 ||
+        rect.height < 8 ||
+        rect.height > 58
+      ) {
+        continue;
+      }
+
+      const text =
+        getDirectVisibleText(
+          element
+        );
+
+      const tag =
+        element.tagName
+          ?.toLowerCase();
+
+      const interactive =
+        [
+          "a",
+          "button",
+          "input",
+          "select"
+        ].includes(
+          tag
+        ) ||
+        element.getAttribute(
+          "role"
+        ) === "button";
+
+      if (
+        !text &&
+        !interactive
+      ) {
+        continue;
+      }
+
+      rects.push({
+        left:
+          rect.left,
+        top:
+          rect.top,
+        right:
+          rect.right,
+        bottom:
+          rect.bottom
+      });
+    }
+
+    return rects;
+  }
+
+  function fixedPlacementIsSafe(
+    left,
+    top,
+    width,
+    height,
+    occupiedRects
+  ) {
+    if (
+      left < 6 ||
+      top < 3 ||
+      left + width >
+        window.innerWidth - 6 ||
+      top + height > 92
+    ) {
+      return false;
+    }
+
+    const target = {
+      left,
+      top,
+      right:
+        left + width,
+      bottom:
+        top + height
+    };
+
+    return !occupiedRects.some(
+      rect =>
+        rectanglesOverlap(
+          target,
+          rect,
+          6
+        )
+    );
+  }
+
+  function findSafeFixedPlacement(
+    button,
+    anchor,
+    remembered
+  ) {
+    const width =
+      Math.max(
+        108,
+        Math.ceil(
+          button.getBoundingClientRect()
+            .width || 108
+        )
+      );
+
+    const height =
+      Math.max(
+        27,
+        Math.ceil(
+          button.getBoundingClientRect()
+            .height || 27
+        )
+      );
+
+    const occupiedRects =
+      collectTopOccupiedRects(
+        button
+      );
+
+    if (
+      remembered?.mode ===
+        "fixed" &&
+      Number.isFinite(
+        Number(
+          remembered.left
+        )
+      ) &&
+      Number.isFinite(
+        Number(
+          remembered.top
+        )
+      ) &&
+      fixedPlacementIsSafe(
+        Number(
+          remembered.left
+        ),
+        Number(
+          remembered.top
+        ),
+        width,
+        height,
+        occupiedRects
+      )
+    ) {
+      return {
+        left:
+          Number(
+            remembered.left
+          ),
+        top:
+          Number(
+            remembered.top
+          )
+      };
+    }
+
+    const anchorRect =
+      anchor?.getBoundingClientRect?.();
+
+    const preferredTop =
+      anchorRect
+        ? Math.max(
+            4,
+            Math.round(
+              anchorRect.top +
+              (
+                anchorRect.height -
+                height
+              ) /
+              2
+            )
+          )
+        : 10;
+
+    const startLeft =
+      anchorRect
+        ? Math.min(
+            window.innerWidth -
+              width -
+              8,
+            Math.round(
+              anchorRect.left -
+              width -
+              18
+            )
+          )
+        : window.innerWidth -
+          width -
+          180;
+
+    const topCandidates =
+      Array.from(
+        new Set([
+          preferredTop,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32
+        ])
+      );
+
+    for (
+      const top of
+      topCandidates
+    ) {
+      for (
+        let left =
+          Math.max(
+            120,
+            startLeft
+          );
+        left >= 120;
+        left -= 8
+      ) {
+        if (
+          fixedPlacementIsSafe(
+            left,
+            top,
+            width,
+            height,
+            occupiedRects
+          )
+        ) {
+          return {
+            left,
+            top
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function applyFixedGlobalSwitch(
+    button,
+    placement
+  ) {
+    if (
+      !button ||
+      !placement
+    ) {
+      return false;
+    }
+
+    if (
+      button.parentElement !==
+      document.body
+    ) {
+      document.body.appendChild(
+        button
+      );
+    }
+
+    button.classList.remove(
+      "is-inline"
+    );
+
+    button.classList.add(
+      "is-fixed"
+    );
+
+    button.style.left =
+      `${Math.round(
+        placement.left
+      )}px`;
+
+    button.style.top =
+      `${Math.round(
+        placement.top
+      )}px`;
+
+    button.style.right =
+      "auto";
+
+    return true;
+  }
+
+  function getGlobalSwitchLayoutSnapshot() {
+    const anchor =
+      findSoaRegionAnchor();
+
+    const rect =
+      anchor?.getBoundingClientRect?.();
+
+    return [
+      window.innerWidth,
+      window.innerHeight,
+      anchor
+        ? getDirectVisibleText(
+            anchor
+          )
+        : "",
+      rect
+        ? Math.round(
+            rect.left
+          )
+        : -1,
+      rect
+        ? Math.round(
+            rect.top
+          )
+        : -1,
+      rect
+        ? Math.round(
+            rect.width
+          )
+        : -1,
+      document.querySelectorAll(
+        "body *"
+      ).length
+    ].join("|");
+  }
+
+  async function waitForStableGlobalSwitchLayout(
+    generation
+  ) {
+    let lastSnapshot =
+      "";
+
+    let stableCount =
+      0;
+
+    for (
+      let index = 0;
+      index <
+        GLOBAL_SWITCH_STABLE_MAX_CHECKS;
+      index += 1
+    ) {
+      if (
+        generation !==
+          globalSwitchPlacementGeneration ||
+        location.hostname !==
+          HOST_SOA
+      ) {
+        return false;
+      }
+
+      const snapshot =
+        getGlobalSwitchLayoutSnapshot();
+
+      if (
+        snapshot ===
+        lastSnapshot
+      ) {
+        stableCount += 1;
+      } else {
+        lastSnapshot =
+          snapshot;
+
+        stableCount =
+          1;
+      }
+
+      if (
+        stableCount >=
+        GLOBAL_SWITCH_STABLE_REQUIRED
+      ) {
+        return true;
+      }
+
+      await sleep(
+        GLOBAL_SWITCH_STABLE_INTERVAL_MS
+      );
+    }
+
+    return true;
+  }
+
+  function placeGlobalSwitchOnce(
+    button
+  ) {
+    const anchor =
+      findSoaRegionAnchor();
+
+    const inlineContext =
+      findInlineContainerForAnchor(
+        anchor
+      );
+
+    const remembered =
+      getRememberedGlobalSwitchPlacement();
+
+    if (
+      inlineContext &&
+      inlineContainerHasRoom(
+        inlineContext,
+        button
+      )
+    ) {
+      applyInlineGlobalSwitch(
+        button,
+        inlineContext
+      );
+
+      saveGlobalSwitchPlacement({
+        mode:
+          "inline"
+      });
+
+      return true;
+    }
+
+    const fixedPlacement =
+      findSafeFixedPlacement(
+        button,
+        anchor,
+        remembered
+      );
+
+    if (
+      fixedPlacement &&
+      applyFixedGlobalSwitch(
+        button,
+        fixedPlacement
+      )
+    ) {
+      saveGlobalSwitchPlacement({
+        mode:
+          "fixed",
+        left:
+          fixedPlacement.left,
+        top:
+          fixedPlacement.top
+      });
+
+      return true;
+    }
+
+    return false;
+  }
+
+  function createGlobalSwitchButton() {
     let button =
       document.getElementById(
         GLOBAL_SWITCH_ID
       );
 
     if (button) {
-      updateGlobalSwitchState();
-      scheduleGlobalSwitchAlignment();
       return button;
     }
 
@@ -5957,6 +6692,9 @@
 
     button.type =
       "button";
+
+    button.style.visibility =
+      "hidden";
 
     button.innerHTML = `
       <svg
@@ -5992,47 +6730,204 @@
     );
 
     updateGlobalSwitchState();
-    scheduleGlobalSwitchAlignment();
 
     return button;
+  }
+
+  function scheduleGlobalSwitchPlacement(
+    force = false
+  ) {
+    if (
+      location.hostname !==
+      HOST_SOA
+    ) {
+      return;
+    }
+
+    if (
+      globalSwitchPlacementTask &&
+      !force
+    ) {
+      return;
+    }
+
+    if (force) {
+      globalSwitchPlacementGeneration +=
+        1;
+
+      globalSwitchPlacementTask =
+        null;
+    }
+
+    const generation =
+      globalSwitchPlacementGeneration;
+
+    const button =
+      createGlobalSwitchButton();
+
+    if (!button) {
+      return;
+    }
+
+    button.style.visibility =
+      "hidden";
+
+    globalSwitchPlacementTask =
+      (
+        async () => {
+          try {
+            await waitForStableGlobalSwitchLayout(
+              generation
+            );
+
+            if (
+              generation !==
+                globalSwitchPlacementGeneration ||
+              location.hostname !==
+                HOST_SOA
+            ) {
+              return;
+            }
+
+            if (
+              !document.getElementById(
+                GLOBAL_SWITCH_ID
+              )
+            ) {
+              return;
+            }
+
+            placeGlobalSwitchOnce(
+              button
+            );
+
+            button.style.visibility =
+              "visible";
+
+            updateGlobalSwitchState();
+          } finally {
+            if (
+              generation ===
+              globalSwitchPlacementGeneration
+            ) {
+              globalSwitchPlacementTask =
+                null;
+            }
+          }
+        }
+      )();
+  }
+
+  function handleSoaRouteOrHeaderChange() {
+    if (
+      location.hostname !==
+      HOST_SOA
+    ) {
+      return;
+    }
+
+    const routeKey =
+      getSoaRouteKey();
+
+    const button =
+      document.getElementById(
+        GLOBAL_SWITCH_ID
+      );
+
+    const routeChanged =
+      routeKey !==
+      globalSwitchRouteKey;
+
+    const buttonMissing =
+      !button ||
+      !button.isConnected;
+
+    if (
+      !routeChanged &&
+      !buttonMissing
+    ) {
+      return;
+    }
+
+    globalSwitchRouteKey =
+      routeKey;
+
+    scheduleGlobalSwitchPlacement(
+      true
+    );
+  }
+
+  function bindGlobalSwitchObserver() {
+    if (
+      globalSwitchObserver ||
+      location.hostname !==
+        HOST_SOA
+    ) {
+      return;
+    }
+
+    globalSwitchRouteKey =
+      getSoaRouteKey();
+
+    let debounceTimer =
+      null;
+
+    globalSwitchObserver =
+      new MutationObserver(
+        () => {
+          clearTimeout(
+            debounceTimer
+          );
+
+          debounceTimer =
+            setTimeout(
+              handleSoaRouteOrHeaderChange,
+              180
+            );
+        }
+      );
+
+    globalSwitchObserver.observe(
+      document.body,
+      {
+        childList:
+          true,
+        subtree:
+          true
+      }
+    );
+
+    window.addEventListener(
+      "hashchange",
+      () => {
+        setTimeout(
+          handleSoaRouteOrHeaderChange,
+          80
+        );
+      }
+    );
+
+    window.addEventListener(
+      "popstate",
+      () => {
+        setTimeout(
+          handleSoaRouteOrHeaderChange,
+          80
+        );
+      }
+    );
   }
 
   // ============================================================
   // 9. 启动
   // ============================================================
 
-  let globalSwitchResizeBound =
-    false;
-
-  function bindGlobalSwitchResize() {
-    if (
-      globalSwitchResizeBound
-    ) {
-      return;
-    }
-
-    globalSwitchResizeBound =
-      true;
-
-    window.addEventListener(
-      "resize",
-      () => {
-        setTimeout(
-          alignGlobalSwitchToPage,
-          80
-        );
-      },
-      {
-        passive:
-          true
-      }
-    );
-  }
-
   function boot() {
+    /*
+     * 业务入口只在SOA顶层页面显示。
+     * Fly站点已在前面的授权捕获分支 return，不会创建业务UI。
+     */
     if (
-      location.hostname !==
-        HOST_HOME &&
       location.hostname !==
         HOST_SOA
     ) {
@@ -6047,8 +6942,11 @@
       createPanel();
     }
 
-    ensureGlobalSwitch();
-    bindGlobalSwitchResize();
+    createGlobalSwitchButton();
+    bindGlobalSwitchObserver();
+    scheduleGlobalSwitchPlacement(
+      true
+    );
     updateGlobalSwitchState();
   }
 
@@ -6067,4 +6965,5 @@
   } else {
     boot();
   }
+
 })();
