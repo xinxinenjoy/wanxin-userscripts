@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.5业绩报表辅助
 // @namespace    https://tampermonkey.net/
-// @version      1.1.2
+// @version      1.1.3
 // @description  SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -34,6 +34,12 @@
  * - 支持Fly授权自动获取、失效刷新、网络重试，并可与对账报表v1.9同时使用。
  *
  * 更新记录：
+ *
+ * v1.1.3  -  2026-09-11
+ * - 顶部“报表工具”入口改为与“卡类汇总”一致的原生按钮风格，使用浅绿色区分。
+ * - 两个工具入口统一收纳到SOA顶部最右侧独立工具组，保持小间距，不再参与原生菜单布局。
+ * - 报表工具与卡类汇总仍保持独立脚本、独立事件与独立面板；任一模块单独启用均可正常工作。
+ * - SPA顶部导航重建后自动恢复工具组，并自动重新吸附已存在的卡类汇总按钮。
  *
  * v1.1.2  -  2026-09-10
  * - 取消门户首页显示，业务入口仅在SOA页面展示；Fly页面仍仅用于授权捕获。
@@ -186,7 +192,13 @@
     "__hlj_fly_report_global_switch_v023";
 
   const GLOBAL_SWITCH_STYLE_ID =
-    "__hlj_fly_report_global_switch_style_v112";
+    "__hlj_fly_report_global_switch_style_v113";
+
+  const GLOBAL_SWITCH_SLOT_ID =
+    "__hlj_fly_report_switch_slot_v113";
+
+  const TOP_TOOL_GROUP_ID =
+    "__hlj_soa_top_tool_group_v1";
 
   const GLOBAL_SWITCH_PLACEMENT_KEY =
     "__hlj_fly_report_switch_placement_v112";
@@ -5634,62 +5646,112 @@
       GLOBAL_SWITCH_STYLE_ID;
 
     style.textContent = `
-      #${GLOBAL_SWITCH_ID} {
-        z-index:2147483645;
-        display:inline-flex;
+      /*
+       * SOA顶部独立工具组。
+       * 只占用顶部导航最右侧的独立区域，不参与原生Ant Menu菜单项排序。
+       * 卡类汇总脚本即使单独运行也不依赖本容器；当本脚本存在时仅把它的slot吸附进来。
+       */
+      #${TOP_TOOL_GROUP_ID} {
+        display:flex;
+        align-items:center;
+        justify-content:flex-end;
+        align-self:stretch;
+        flex:0 0 auto;
+        gap:9px;
+        margin-left:18px;
+        margin-right:18px;
+        padding:0;
+        box-sizing:border-box;
+        position:relative;
+        z-index:3;
+        white-space:nowrap;
+      }
+
+      #${GLOBAL_SWITCH_SLOT_ID} {
+        display:flex;
         align-items:center;
         justify-content:center;
-        gap:6px;
-        height:27px;
-        padding:0 10px;
+        flex:0 0 auto;
+        margin:0;
+        padding:0;
         box-sizing:border-box;
-        border:1px solid rgba(255,255,255,.38);
-        border-radius:5px;
-        background:rgba(4,70,166,.80);
-        color:#fff;
-        font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif;
-        font-size:13px;
-        font-weight:700;
-        line-height:1;
-        letter-spacing:.2px;
+      }
+
+      /*
+       * 卡类汇总自身slot原本带左右margin。
+       * 被收进共享工具组后只归零slot外边距，按钮本身的样式完全不修改。
+       */
+      #${TOP_TOOL_GROUP_ID} > [id^="__hlj_card_summary_detect_"][id$="_switch_slot"] {
+        margin-left:0 !important;
+        margin-right:0 !important;
+        padding-left:0 !important;
+        padding-right:0 !important;
+        flex:0 0 auto !important;
+      }
+
+      #${GLOBAL_SWITCH_ID} {
+        min-width:104px;
+        height:31px;
+        padding:0 13px;
+        box-sizing:border-box;
+        border:1px solid #77b993;
+        border-radius:7px;
+        background:linear-gradient(180deg,#f1fbf5 0%,#dff3e7 100%);
+        color:#205d3b;
+        font:700 14px/29px "Microsoft YaHei","PingFang SC",Arial,sans-serif;
+        letter-spacing:.1px;
         white-space:nowrap;
         cursor:pointer;
         user-select:none;
-        text-shadow:0 1px 1px rgba(0,35,90,.30);
-        box-shadow:0 1px 4px rgba(0,38,96,.18);
-        transition:background .15s ease,border-color .15s ease,box-shadow .15s ease;
+        outline:none;
+        box-shadow:
+          0 1px 2px rgba(36,95,60,.10),
+          inset 0 1px 0 rgba(255,255,255,.78);
+        transition:
+          background .12s ease,
+          border-color .12s ease,
+          color .12s ease,
+          box-shadow .12s ease,
+          transform .08s ease;
       }
 
       #${GLOBAL_SWITCH_ID}:hover {
-        background:rgba(3,60,150,.94);
-        border-color:rgba(255,255,255,.52);
-        box-shadow:0 2px 7px rgba(0,38,96,.24);
+        background:linear-gradient(180deg,#e9f8ef 0%,#d3ecdd 100%);
+        border-color:#5ea97e;
+        color:#174f31;
+        box-shadow:
+          0 2px 6px rgba(36,95,60,.16),
+          inset 0 1px 0 rgba(255,255,255,.84);
+      }
+
+      #${GLOBAL_SWITCH_ID}:active {
+        transform:translateY(1px);
+        box-shadow:
+          0 1px 2px rgba(36,95,60,.12),
+          inset 0 1px 2px rgba(36,95,60,.10);
       }
 
       #${GLOBAL_SWITCH_ID}.is-active {
-        background:rgba(2,53,137,.98);
-        border-color:rgba(255,255,255,.58);
-        box-shadow:0 2px 8px rgba(0,38,96,.28);
+        background:linear-gradient(180deg,#def3e7 0%,#c8e8d5 100%);
+        border-color:#4c9a6d;
+        color:#154c2d;
+        box-shadow:
+          0 2px 6px rgba(36,95,60,.18),
+          inset 0 1px 0 rgba(255,255,255,.78);
       }
 
-      #${GLOBAL_SWITCH_ID}.is-inline {
-        position:relative;
-        top:auto;
-        left:auto;
-        right:auto;
-        bottom:auto;
-        flex:0 0 auto;
-        margin:0 14px 0 0;
-        vertical-align:middle;
-      }
+      @media (max-width:1100px) {
+        #${TOP_TOOL_GROUP_ID} {
+          gap:7px;
+          margin-left:12px;
+          margin-right:12px;
+        }
 
-      #${GLOBAL_SWITCH_ID}.is-fixed {
-        position:fixed;
-        margin:0;
-      }
-
-      #${GLOBAL_SWITCH_ID} svg {
-        flex:0 0 auto;
+        #${GLOBAL_SWITCH_ID} {
+          min-width:96px;
+          padding:0 11px;
+          font-size:13px;
+        }
       }
     `;
 
@@ -5701,6 +5763,155 @@
     );
 
     return style;
+  }
+
+  function findCardSummarySwitchSlots() {
+    return Array.from(
+      document.querySelectorAll(
+        '[id^="__hlj_card_summary_detect_"][id$="_switch_slot"]'
+      )
+    ).filter(
+      slot =>
+        slot &&
+        slot.isConnected
+    );
+  }
+
+  function ensureTopToolGroup() {
+    const headerInner =
+      document.querySelector(
+        "#layout-header .header-inner"
+      );
+
+    if (!headerInner) {
+      return null;
+    }
+
+    let group =
+      document.getElementById(
+        TOP_TOOL_GROUP_ID
+      );
+
+    if (!group) {
+      group =
+        document.createElement(
+          "div"
+        );
+
+      group.id =
+        TOP_TOOL_GROUP_ID;
+    }
+
+    if (
+      group.parentElement !==
+      headerInner
+    ) {
+      const userBox =
+        headerInner.querySelector(
+          ":scope > .user"
+        );
+
+      if (userBox) {
+        headerInner.insertBefore(
+          group,
+          userBox
+        );
+      } else {
+        headerInner.appendChild(
+          group
+        );
+      }
+    }
+
+    return group;
+  }
+
+  function syncTopToolGroup(
+    button =
+      document.getElementById(
+        GLOBAL_SWITCH_ID
+      )
+  ) {
+    if (!button) {
+      return false;
+    }
+
+    const group =
+      ensureTopToolGroup();
+
+    if (!group) {
+      return false;
+    }
+
+    let reportSlot =
+      document.getElementById(
+        GLOBAL_SWITCH_SLOT_ID
+      );
+
+    if (!reportSlot) {
+      reportSlot =
+        document.createElement(
+          "div"
+        );
+
+      reportSlot.id =
+        GLOBAL_SWITCH_SLOT_ID;
+    }
+
+    if (
+      button.parentElement !==
+      reportSlot
+    ) {
+      reportSlot.appendChild(
+        button
+      );
+    }
+
+    /*
+     * 固定顺序：
+     * 报表工具在左，卡类汇总在右。
+     * 只移动卡类汇总的slot，不改它的按钮、事件、面板或显示逻辑。
+     */
+    if (
+      reportSlot.parentElement !==
+      group
+    ) {
+      group.insertBefore(
+        reportSlot,
+        group.firstChild
+      );
+    } else if (
+      group.firstElementChild !==
+      reportSlot
+    ) {
+      group.insertBefore(
+        reportSlot,
+        group.firstChild
+      );
+    }
+
+    for (
+      const cardSlot
+      of findCardSummarySwitchSlots()
+    ) {
+      if (
+        cardSlot ===
+        reportSlot
+      ) {
+        continue;
+      }
+
+      if (
+        cardSlot.parentElement !==
+        group
+      ) {
+        group.appendChild(
+          cardSlot
+        );
+      }
+    }
+
+    return true;
   }
 
   function getDirectVisibleText(
@@ -6610,64 +6821,9 @@
   function placeGlobalSwitchOnce(
     button
   ) {
-    const anchor =
-      findSoaRegionAnchor();
-
-    const inlineContext =
-      findInlineContainerForAnchor(
-        anchor
-      );
-
-    const remembered =
-      getRememberedGlobalSwitchPlacement();
-
-    if (
-      inlineContext &&
-      inlineContainerHasRoom(
-        inlineContext,
-        button
-      )
-    ) {
-      applyInlineGlobalSwitch(
-        button,
-        inlineContext
-      );
-
-      saveGlobalSwitchPlacement({
-        mode:
-          "inline"
-      });
-
-      return true;
-    }
-
-    const fixedPlacement =
-      findSafeFixedPlacement(
-        button,
-        anchor,
-        remembered
-      );
-
-    if (
-      fixedPlacement &&
-      applyFixedGlobalSwitch(
-        button,
-        fixedPlacement
-      )
-    ) {
-      saveGlobalSwitchPlacement({
-        mode:
-          "fixed",
-        left:
-          fixedPlacement.left,
-        top:
-          fixedPlacement.top
-      });
-
-      return true;
-    }
-
-    return false;
+    return syncTopToolGroup(
+      button
+    );
   }
 
   function createGlobalSwitchButton() {
@@ -6676,58 +6832,60 @@
         GLOBAL_SWITCH_ID
       );
 
-    if (button) {
-      return button;
-    }
-
     ensureGlobalSwitchStyle();
 
-    button =
-      document.createElement(
-        "button"
+    if (!button) {
+      button =
+        document.createElement(
+          "button"
+        );
+
+      button.id =
+        GLOBAL_SWITCH_ID;
+
+      button.type =
+        "button";
+
+      button.style.visibility =
+        "hidden";
+
+      button.innerHTML =
+        "<span>报表工具</span>";
+
+      // 与SOA原生菜单及卡类汇总按钮的指针事件完全隔离。
+      [
+        "pointerdown",
+        "mousedown",
+        "mouseup",
+        "pointerup"
+      ].forEach(
+        eventName => {
+          button.addEventListener(
+            eventName,
+            event => {
+              event.stopPropagation();
+            }
+          );
+        }
       );
 
-    button.id =
-      GLOBAL_SWITCH_ID;
+      button.addEventListener(
+        "click",
+        event => {
+          event.preventDefault();
+          event.stopPropagation();
 
-    button.type =
-      "button";
+          setPanelVisible(
+            !panelVisible
+          );
+        }
+      );
 
-    button.style.visibility =
-      "hidden";
-
-    button.innerHTML = `
-      <svg
-        width="14"
-        height="14"
-        viewBox="0 0 24 24"
-        fill="none"
-        xmlns="http://www.w3.org/2000/svg"
-        aria-hidden="true"
-      >
-        <path d="M6 4h12v16H6V4Z"
-          stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
-        <path d="M9 8h6M9 12h6M9 16h4"
-          stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
-      </svg>
-      <span>报表工具</span>
-    `;
-
-    button.addEventListener(
-      "click",
-      event => {
-        event.preventDefault();
-        event.stopPropagation();
-
-        setPanelVisible(
-          !panelVisible
-        );
-      }
-    );
-
-    document.body.appendChild(
-      button
-    );
+      // Header尚未生成时先临时挂在body，真正显示前会移入顶部工具组。
+      document.body.appendChild(
+        button
+      );
+    }
 
     updateGlobalSwitchState();
 
@@ -6776,35 +6934,40 @@
       (
         async () => {
           try {
-            await waitForStableGlobalSwitchLayout(
-              generation
-            );
-
-            if (
-              generation !==
-                globalSwitchPlacementGeneration ||
-              location.hostname !==
-                HOST_SOA
+            /*
+             * React顶部导航可能晚于DOMContentLoaded生成。
+             * 最多等待约2秒；MutationObserver后续仍会继续补位。
+             */
+            for (
+              let index = 0;
+              index < 20;
+              index += 1
             ) {
-              return;
+              if (
+                generation !==
+                  globalSwitchPlacementGeneration ||
+                location.hostname !==
+                  HOST_SOA
+              ) {
+                return;
+              }
+
+              if (
+                syncTopToolGroup(
+                  button
+                )
+              ) {
+                button.style.visibility =
+                  "visible";
+
+                updateGlobalSwitchState();
+                return;
+              }
+
+              await sleep(
+                100
+              );
             }
-
-            if (
-              !document.getElementById(
-                GLOBAL_SWITCH_ID
-              )
-            ) {
-              return;
-            }
-
-            placeGlobalSwitchOnce(
-              button
-            );
-
-            button.style.visibility =
-              "visible";
-
-            updateGlobalSwitchState();
           } finally {
             if (
               generation ===
@@ -6834,6 +6997,21 @@
         GLOBAL_SWITCH_ID
       );
 
+    const group =
+      document.getElementById(
+        TOP_TOOL_GROUP_ID
+      );
+
+    const reportSlot =
+      document.getElementById(
+        GLOBAL_SWITCH_SLOT_ID
+      );
+
+    const headerInner =
+      document.querySelector(
+        "#layout-header .header-inner"
+      );
+
     const routeChanged =
       routeKey !==
       globalSwitchRouteKey;
@@ -6842,9 +7020,29 @@
       !button ||
       !button.isConnected;
 
+    const groupBroken =
+      !group ||
+      !group.isConnected ||
+      !headerInner ||
+      group.parentElement !==
+        headerInner ||
+      !reportSlot ||
+      reportSlot.parentElement !==
+        group;
+
+    const looseCardSlot =
+      findCardSummarySwitchSlots()
+        .some(
+          slot =>
+            slot.parentElement !==
+            group
+        );
+
     if (
       !routeChanged &&
-      !buttonMissing
+      !buttonMissing &&
+      !groupBroken &&
+      !looseCardSlot
     ) {
       return;
     }
