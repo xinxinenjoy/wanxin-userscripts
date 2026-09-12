@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.1单位信息填充
 // @namespace    https://dime.health-100.cn/
-// @version      7.8.3
+// @version      7.8.4
 // @description  蝶美自动填充单位信息：按输入字段自适应填写，支持重复运行跳过、缺失字段跳过、行业/经济末级匹配、地区、单位类型、社会信用代码、企业规模及人数等字段。
 
 //
@@ -49,7 +49,6 @@
   const STYLE_ID = TOOL_ID + "-style";
   const LAUNCHER_ID = TOOL_ID + "-launcher";
   const LAUNCHER_POSITION_KEY = "dime-company-fill-launcher-position-v775";
-  const OPEN_EVENT = "dime-floating-tool-open";
   const POSITION_KEY = TOOL_ID + "-position";
   const WIDTH_KEY = TOOL_ID + "-width";
   const COLLAPSED_KEY = TOOL_ID + "-collapsed";
@@ -1354,105 +1353,6 @@
       treeVisible
         ? `“${fieldName}”仍停留在普通级联列表，未切换到搜索结果模式`
         : `“${fieldName}”搜索结果没有稳定显示`
-    );
-  }
-
-  function createSearchKeyboardEvent(
-    type,
-    key,
-    keyCode
-  ) {
-    const event = new KeyboardEvent(type, {
-      key,
-      code: key,
-      keyCode,
-      which: keyCode,
-      charCode:
-        type === "keypress" ? keyCode : 0,
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      repeat: false,
-      location: 0
-    });
-
-    // 兼容 Vue 2 和旧版 Element UI 对 keyCode / which 的读取。
-    for (const property of [
-      "keyCode",
-      "which",
-      "charCode"
-    ]) {
-      try {
-        Object.defineProperty(event, property, {
-          configurable: true,
-          get: () =>
-            property === "charCode" &&
-            type !== "keypress"
-              ? 0
-              : keyCode
-        });
-      } catch {}
-    }
-
-    return event;
-  }
-
-  function dispatchSearchKey(
-    input,
-    key,
-    keyCode
-  ) {
-    if (!input) return;
-
-    try {
-      input.focus({ preventScroll: true });
-    } catch {
-      input.focus();
-    }
-
-    input.dispatchEvent(
-      createSearchKeyboardEvent(
-        "keydown",
-        key,
-        keyCode
-      )
-    );
-
-    if (key === "Enter") {
-      input.dispatchEvent(
-        createSearchKeyboardEvent(
-          "keypress",
-          key,
-          keyCode
-        )
-      );
-    }
-
-    input.dispatchEvent(
-      createSearchKeyboardEvent(
-        "keyup",
-        key,
-        keyCode
-      )
-    );
-  }
-
-  function getHighlightedSuggestion(popup) {
-    const candidates = getSuggestionCandidates(popup);
-
-    return candidates.find(item =>
-      item.classList.contains("hover") ||
-      item.classList.contains("is-hover") ||
-      item.classList.contains("is-focus") ||
-      item.classList.contains("is-active") ||
-      item.classList.contains("is-checked") ||
-      item.getAttribute("aria-selected") === "true"
-    ) || null;
-  }
-
-  function getHighlightedSuggestionText(popup) {
-    return getSuggestionCandidateText(
-      getHighlightedSuggestion(popup)
     );
   }
 

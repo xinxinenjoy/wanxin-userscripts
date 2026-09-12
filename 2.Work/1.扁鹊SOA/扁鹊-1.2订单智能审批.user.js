@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -8717,67 +8717,6 @@
           top
         );
       }
-    );
-  }
-
-
-  function getPanelCollapsed() {
-    try {
-      return (
-        localStorage.getItem(
-          UI.PANEL_COLLAPSED_KEY
-        ) === "1"
-      );
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function setPanelCollapsed(
-    collapsed
-  ) {
-    const body =
-      document.getElementById(
-        UI.PANEL_BODY_ID
-      );
-
-    const button =
-      document.getElementById(
-        UI.COLLAPSE_BUTTON_ID
-      );
-
-    if (body) {
-      body.style.display =
-        collapsed
-          ? "none"
-          : "block";
-    }
-
-    if (button) {
-      button.textContent =
-        collapsed
-          ? "+"
-          : "−";
-
-      button.title =
-        collapsed
-          ? "展开"
-          : "折叠";
-    }
-
-    try {
-      localStorage.setItem(
-        UI.PANEL_COLLAPSED_KEY,
-        collapsed
-          ? "1"
-          : "0"
-      );
-    } catch (_) {}
-  }
-
-  function togglePanelCollapsed() {
-    setPanelCollapsed(
-      !getPanelCollapsed()
     );
   }
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         前台-1.1批量预约工具
 // @namespace    https://tampermonkey.net/
-// @version      1.16
+// @version      1.17
 // @description  前台批量预约工具：在前台批量登记页面增加工具窗口，自动识别粘贴的14位预约单号并自动进行登记填写。同时在“已到检”页签中自动勾选“仅当日”，并在请求层强制将首次列表查询改为仅当日。
 
 // @match        *://checkup-register.health-100.cn/*
@@ -75,8 +75,6 @@
     BUTTON_MAX_SHIFT: 900,
     BUTTON_SAFE_GAP: 8,
 
-    BUTTON_POS_KEY: "__soa_batch_booking_button_pos_v11",
-
     // 批量窗口宽度与记忆
     PANEL_WIDTH_KEY: "__soa_batch_booking_panel_width_v19",
     PANEL_DEFAULT_WIDTH: 640,
@@ -86,7 +84,6 @@
     // 工具是否显示只判断预约单号输入框 #vid。
     // SPA 页面切换后无需依赖 URL，也无需刷新页面。
     // 输入框出现且可见 -> 显示；输入框不存在 -> 隐藏。
-    BUTTON_GAP: 10,
 
     // 单次提交后等待预约号出现在“预约列表”的最长时间
     RESULT_TIMEOUT: 4000,
@@ -1034,10 +1031,6 @@
     });
   }
 
-  function getAppointmentRowCount() {
-    return getAppointmentRows().length;
-  }
-
   function codeExistsInList(code) {
     const target = normalizeText(code);
 
@@ -1759,10 +1752,6 @@
       unrecognized,
       duplicated
     };
-  }
-
-  function parseCodes(text) {
-    return analyzeCodes(text).valid;
   }
 
   function renderAnomalySummary() {
@@ -2507,207 +2496,6 @@
 
     document.head.appendChild(
       style
-    );
-  }
-
-  function loadButtonPosition(button) {
-    try {
-      const raw =
-        localStorage.getItem(
-          CONFIG.BUTTON_POS_KEY
-        );
-
-      if (!raw) return;
-
-      const pos = JSON.parse(raw);
-
-      if (
-        Number.isFinite(pos.left) &&
-        Number.isFinite(pos.top)
-      ) {
-        button.style.left =
-          `${pos.left}px`;
-        button.style.top =
-          `${pos.top}px`;
-      }
-    } catch {
-      // 保持默认位置
-    }
-  }
-
-  function saveButtonPosition(button) {
-    try {
-      const rect =
-        button.getBoundingClientRect();
-
-      localStorage.setItem(
-        CONFIG.BUTTON_POS_KEY,
-        JSON.stringify({
-          left: Math.round(rect.left),
-          top: Math.round(rect.top)
-        })
-      );
-    } catch {
-      // 忽略存储失败
-    }
-  }
-
-  function clampButton(button) {
-    const rect =
-      button.getBoundingClientRect();
-
-    const margin = 6;
-
-    const left =
-      Math.min(
-        Math.max(rect.left, margin),
-        Math.max(
-          margin,
-          window.innerWidth -
-          rect.width -
-          margin
-        )
-      );
-
-    const top =
-      Math.min(
-        Math.max(rect.top, margin),
-        Math.max(
-          margin,
-          window.innerHeight -
-          rect.height -
-          margin
-        )
-      );
-
-    button.style.left =
-      `${left}px`;
-
-    button.style.top =
-      `${top}px`;
-  }
-
-  function initDraggableButton(
-    button,
-    openHandler
-  ) {
-    let dragging = false;
-    let moved = false;
-
-    let startX = 0;
-    let startY = 0;
-    let startLeft = 0;
-    let startTop = 0;
-
-    button.addEventListener(
-      "pointerdown",
-      e => {
-        if (e.button !== 0) return;
-
-        dragging = true;
-        moved = false;
-
-        const rect =
-          button.getBoundingClientRect();
-
-        startX = e.clientX;
-        startY = e.clientY;
-
-        startLeft = rect.left;
-        startTop = rect.top;
-
-        button.classList.add(
-          "__soa_dragging"
-        );
-
-        try {
-          button.setPointerCapture?.(
-            e.pointerId
-          );
-        } catch {
-          // 忽略
-        }
-
-        e.preventDefault();
-      }
-    );
-
-    button.addEventListener(
-      "pointermove",
-      e => {
-        if (!dragging) return;
-
-        const dx =
-          e.clientX - startX;
-
-        const dy =
-          e.clientY - startY;
-
-        if (
-          Math.abs(dx) > 4 ||
-          Math.abs(dy) > 4
-        ) {
-          moved = true;
-        }
-
-        if (!moved) return;
-
-        button.style.left =
-          `${startLeft + dx}px`;
-
-        button.style.top =
-          `${startTop + dy}px`;
-
-        clampButton(button);
-      }
-    );
-
-    button.addEventListener(
-      "pointerup",
-      e => {
-        if (!dragging) return;
-
-        dragging = false;
-
-        button.classList.remove(
-          "__soa_dragging"
-        );
-
-        try {
-          button.releasePointerCapture?.(
-            e.pointerId
-          );
-        } catch {
-          // 忽略
-        }
-
-        if (moved) {
-          saveButtonPosition(
-            button
-          );
-        } else {
-          openHandler();
-        }
-      }
-    );
-
-    button.addEventListener(
-      "pointercancel",
-      () => {
-        dragging = false;
-
-        button.classList.remove(
-          "__soa_dragging"
-        );
-      }
-    );
-
-    window.addEventListener(
-      "resize",
-      () => {
-        clampButton(button);
-        saveButtonPosition(button);
-      }
     );
   }
 

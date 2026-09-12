@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.6制卡管理查询
 // @namespace    https://tampermonkey.net/
-// @version      0.3.0
+// @version      0.3.1
 // @description  查询并汇总本年度的邀约、贵宾、核磁、CT等制卡记录，按部门/人员统计办卡进度。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -260,14 +260,6 @@
     '销售三部',
     '销售四部',
     '大客户部',
-  ];
-
-  const ROUTES = [
-    '#/card',
-    '#/order-center/localThree/3',
-    '#/card/categories',
-    '#/card/bindCardApply',
-    '#/order/package',
   ];
 
   const state = {
