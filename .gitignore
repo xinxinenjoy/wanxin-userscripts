@@ -1,0 +1,31 @@
+# WorkBuddy AI 项目级目录（若本目录被当 workspace 打开）
+.workbuddy-ai/
+
+# OS 垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 临时 / 备份
+*.tmp
+*.temp
+*.bak
+*.log
+*~
+
+# 本地调试资料
+private/
+screenshots/
+test-data/
+
+# Node（备用，万一以后加构建）
+node_modules/
+
+# 构建产物
+dist/
+build/
