@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.2套餐危害核对
 // @namespace    https://dime.health-100.cn/
-// @version      4.2.16
+// @version      4.2.17
 // @description  蝶美套餐危害核对：提供自动化核对、批量处理、自动选择等功能。注意：套餐名称的标准格式应为：XX-危害1+危害2+危害3+岗中+男，不保证能识别其他格式。
 
 // @match        https://dime.health-100.cn/*
@@ -85,7 +85,6 @@
   const STYLE_ID = TOOL_ID + "-style";
   const LAUNCHER_ID = TOOL_ID + "-launcher";
   const LAUNCHER_POSITION_KEY = "dime-hazard-checker-launcher-position-v383";
-  const OPEN_EVENT = "dime-floating-tool-open";
   const POSITION_KEY = TOOL_ID + "-position";
   const MARKER_CLASS = "dime-hazard-check-marker-v3";
   const AUTO_PANEL_CLASS = "dime-hazard-autofill-panel-v377";

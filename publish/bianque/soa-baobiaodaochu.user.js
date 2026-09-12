@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.5业绩报表辅助
 // @namespace    https://tampermonkey.net/
-// @version      1.1.3
+// @version      1.1.4
 // @description  SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -199,18 +199,6 @@
 
   const TOP_TOOL_GROUP_ID =
     "__hlj_soa_top_tool_group_v1";
-
-  const GLOBAL_SWITCH_PLACEMENT_KEY =
-    "__hlj_fly_report_switch_placement_v112";
-
-  const GLOBAL_SWITCH_STABLE_INTERVAL_MS =
-    120;
-
-  const GLOBAL_SWITCH_STABLE_REQUIRED =
-    3;
-
-  const GLOBAL_SWITCH_STABLE_MAX_CHECKS =
-    15;
 
   let panelVisible =
     false;
@@ -5914,49 +5902,6 @@
     return true;
   }
 
-  function getDirectVisibleText(
-    element
-  ) {
-    if (!element) {
-      return "";
-    }
-
-    const directText =
-      Array.from(
-        element.childNodes ||
-          []
-      )
-        .filter(
-          node =>
-            node.nodeType ===
-            Node.TEXT_NODE
-        )
-        .map(
-          node =>
-            cleanText(
-              node.textContent
-            )
-        )
-        .filter(Boolean)
-        .join(" ");
-
-    if (directText) {
-      return directText;
-    }
-
-    if (
-      element.children &&
-      element.children.length ===
-        0
-    ) {
-      return cleanText(
-        element.textContent
-      );
-    }
-
-    return "";
-  }
-
   function getSoaRouteKey() {
     const hashPath =
       cleanText(
@@ -5991,905 +5936,169 @@
     );
   }
 
-  function readGlobalSwitchPlacementMap() {
-    const value =
-      GM_getValue(
-        GLOBAL_SWITCH_PLACEMENT_KEY,
-        {}
+  /*
+   * 创建/维护“报表工具”顶部入口。
+   *
+   * 与卡类汇总（1.6）保持一致：
+   * - 只在SOA顶部header已生成时创建；header不存在时直接返回，
+   *   不在body里留下隐藏的游离节点。
+   * - 入口用独立slot包裹，便于与卡类汇总共用同一个顶部工具组。
+   * - 不适用时（离开SOA站点）由removeGlobalSwitchEntry整体移除。
+   */
+  function ensureGlobalSwitchEntry() {
+    const headerInner =
+      document.querySelector(
+        "#layout-header .header-inner"
       );
 
-    return (
-      value &&
-      typeof value ===
-        "object" &&
-      !Array.isArray(
-        value
-      )
-    )
-      ? value
-      : {};
-  }
-
-  function saveGlobalSwitchPlacement(
-    placement
-  ) {
-    if (
-      !placement ||
-      typeof placement !==
-        "object"
-    ) {
-      return;
-    }
-
-    const map =
-      readGlobalSwitchPlacementMap();
-
-    map[
-      getSoaRouteKey()
-    ] = {
-      mode:
-        cleanText(
-          placement.mode
-        ),
-      left:
-        Number.isFinite(
-          Number(
-            placement.left
-          )
-        )
-          ? Number(
-              placement.left
-            )
-          : null,
-      top:
-        Number.isFinite(
-          Number(
-            placement.top
-          )
-        )
-          ? Number(
-              placement.top
-            )
-          : null
-    };
-
-    GM_setValue(
-      GLOBAL_SWITCH_PLACEMENT_KEY,
-      map
-    );
-  }
-
-  function getRememberedGlobalSwitchPlacement() {
-    return (
-      readGlobalSwitchPlacementMap()[
-        getSoaRouteKey()
-      ] ||
-      null
-    );
-  }
-
-  function isElementVisible(
-    element
-  ) {
-    if (!element) {
-      return false;
-    }
-
-    const rect =
-      element.getBoundingClientRect();
-
-    if (
-      rect.width <= 0 ||
-      rect.height <= 0
-    ) {
-      return false;
-    }
-
-    const style =
-      getComputedStyle(
-        element
-      );
-
-    return !(
-      style.display ===
-        "none" ||
-      style.visibility ===
-        "hidden" ||
-      Number(
-        style.opacity
-      ) === 0
-    );
-  }
-
-  function findSoaRegionAnchor() {
-    const candidates =
-      Array.from(
-        document.querySelectorAll(
-          "span,div,a,strong"
-        )
-      );
-
-    let best =
-      null;
-
-    let bestScore =
-      -Infinity;
-
-    for (
-      const element of
-      candidates
-    ) {
-      if (
-        !isElementVisible(
-          element
-        ) ||
-        element.id ===
-          GLOBAL_SWITCH_ID ||
-        element.closest?.(
-          `#${GLOBAL_SWITCH_ID}`
-        )
-      ) {
-        continue;
-      }
-
-      const text =
-        getDirectVisibleText(
-          element
-        );
-
-      if (
-        !/地区$/.test(
-          text
-        ) ||
-        text.length > 12
-      ) {
-        continue;
-      }
-
-      const rect =
-        element.getBoundingClientRect();
-
-      if (
-        rect.top < 0 ||
-        rect.bottom > 92 ||
-        rect.left <
-          window.innerWidth *
-            0.52 ||
-        rect.width > 180 ||
-        rect.height > 48
-      ) {
-        continue;
-      }
-
-      const score =
-        rect.left +
-        (
-          92 -
-          Math.abs(
-            rect.top +
-            rect.height / 2 -
-            28
-          )
-        ) * 5;
-
-      if (
-        score >
-        bestScore
-      ) {
-        bestScore =
-          score;
-
-        best =
-          element;
-      }
-    }
-
-    return best;
-  }
-
-  function findInlineContainerForAnchor(
-    anchor
-  ) {
-    if (!anchor) {
+    if (!headerInner) {
       return null;
     }
 
-    let current =
-      anchor.parentElement;
+    ensureGlobalSwitchStyle();
 
-    for (
-      let depth = 0;
-      current &&
-      depth < 6;
-      depth += 1,
-      current =
-        current.parentElement
-    ) {
-      const rect =
-        current.getBoundingClientRect();
-
-      const style =
-        getComputedStyle(
-          current
-        );
-
-      if (
-        (
-          style.display ===
-            "flex" ||
-          style.display ===
-            "inline-flex"
-        ) &&
-        rect.top >= 0 &&
-        rect.bottom <= 96 &&
-        rect.width >= 120 &&
-        rect.width <= 720 &&
-        rect.right >=
-          window.innerWidth *
-            0.78
-      ) {
-        let directChild =
-          anchor;
-
-        while (
-          directChild.parentElement &&
-          directChild.parentElement !==
-            current
-        ) {
-          directChild =
-            directChild.parentElement;
-        }
-
-        if (
-          directChild.parentElement ===
-          current
-        ) {
-          return {
-            container:
-              current,
-            anchorChild:
-              directChild
-          };
-        }
-      }
-    }
-
-    return null;
-  }
-
-  function getOuterWidth(
-    element
-  ) {
-    if (!element) {
-      return 0;
-    }
-
-    const rect =
-      element.getBoundingClientRect();
-
-    const style =
-      getComputedStyle(
-        element
+    let slot =
+      document.getElementById(
+        GLOBAL_SWITCH_SLOT_ID
       );
 
-    return (
-      rect.width +
-      (
-        parseFloat(
-          style.marginLeft
-        ) || 0
-      ) +
-      (
-        parseFloat(
-          style.marginRight
-        ) || 0
-      )
-    );
-  }
-
-  function inlineContainerHasRoom(
-    context,
-    button
-  ) {
-    if (
-      !context?.container ||
-      !button
-    ) {
-      return false;
-    }
-
-    const container =
-      context.container;
-
-    const rect =
-      container.getBoundingClientRect();
-
-    const style =
-      getComputedStyle(
-        container
-      );
-
-    const gap =
-      parseFloat(
-        style.columnGap ||
-        style.gap
-      ) || 0;
-
-    const children =
-      Array.from(
-        container.children
-      ).filter(
-        child =>
-          child !==
-            button &&
-          isElementVisible(
-            child
-          )
-      );
-
-    const occupied =
-      children.reduce(
-        (
-          total,
-          child
-        ) =>
-          total +
-          getOuterWidth(
-            child
-          ),
-        0
-      ) +
-      Math.max(
-        0,
-        children.length - 1
-      ) *
-      gap;
-
-    const estimatedButtonWidth =
-      Math.max(
-        108,
-        button.getBoundingClientRect()
-          .width || 108
-      );
-
-    return (
-      rect.width -
-      occupied >=
-      estimatedButtonWidth +
-      12
-    );
-  }
-
-  function applyInlineGlobalSwitch(
-    button,
-    context
-  ) {
-    if (
-      !button ||
-      !context?.container ||
-      !context?.anchorChild
-    ) {
-      return false;
-    }
-
-    button.classList.remove(
-      "is-fixed"
-    );
-
-    button.classList.add(
-      "is-inline"
-    );
-
-    button.style.left =
-      "auto";
-
-    button.style.top =
-      "auto";
-
-    button.style.right =
-      "auto";
-
-    context.container.insertBefore(
-      button,
-      context.anchorChild
-    );
-
-    return true;
-  }
-
-  function rectanglesOverlap(
-    a,
-    b,
-    margin = 0
-  ) {
-    return !(
-      a.right + margin <=
-        b.left ||
-      a.left - margin >=
-        b.right ||
-      a.bottom + margin <=
-        b.top ||
-      a.top - margin >=
-        b.bottom
-    );
-  }
-
-  function collectTopOccupiedRects(
-    button
-  ) {
-    const nodes =
-      Array.from(
-        document.querySelectorAll(
-          "a,button,input,select,[role='button'],span,strong"
-        )
-      );
-
-    const rects = [];
-
-    for (
-      const element of
-      nodes
-    ) {
-      if (
-        element ===
-          button ||
-        element.closest?.(
-          `#${GLOBAL_SWITCH_ID}`
-        ) ||
-        !isElementVisible(
-          element
-        )
-      ) {
-        continue;
-      }
-
-      const rect =
-        element.getBoundingClientRect();
-
-      if (
-        rect.bottom <= 0 ||
-        rect.top >= 92 ||
-        rect.width < 8 ||
-        rect.width > 320 ||
-        rect.height < 8 ||
-        rect.height > 58
-      ) {
-        continue;
-      }
-
-      const text =
-        getDirectVisibleText(
-          element
-        );
-
-      const tag =
-        element.tagName
-          ?.toLowerCase();
-
-      const interactive =
-        [
-          "a",
-          "button",
-          "input",
-          "select"
-        ].includes(
-          tag
-        ) ||
-        element.getAttribute(
-          "role"
-        ) === "button";
-
-      if (
-        !text &&
-        !interactive
-      ) {
-        continue;
-      }
-
-      rects.push({
-        left:
-          rect.left,
-        top:
-          rect.top,
-        right:
-          rect.right,
-        bottom:
-          rect.bottom
-      });
-    }
-
-    return rects;
-  }
-
-  function fixedPlacementIsSafe(
-    left,
-    top,
-    width,
-    height,
-    occupiedRects
-  ) {
-    if (
-      left < 6 ||
-      top < 3 ||
-      left + width >
-        window.innerWidth - 6 ||
-      top + height > 92
-    ) {
-      return false;
-    }
-
-    const target = {
-      left,
-      top,
-      right:
-        left + width,
-      bottom:
-        top + height
-    };
-
-    return !occupiedRects.some(
-      rect =>
-        rectanglesOverlap(
-          target,
-          rect,
-          6
-        )
-    );
-  }
-
-  function findSafeFixedPlacement(
-    button,
-    anchor,
-    remembered
-  ) {
-    const width =
-      Math.max(
-        108,
-        Math.ceil(
-          button.getBoundingClientRect()
-            .width || 108
-        )
-      );
-
-    const height =
-      Math.max(
-        27,
-        Math.ceil(
-          button.getBoundingClientRect()
-            .height || 27
-        )
-      );
-
-    const occupiedRects =
-      collectTopOccupiedRects(
-        button
-      );
-
-    if (
-      remembered?.mode ===
-        "fixed" &&
-      Number.isFinite(
-        Number(
-          remembered.left
-        )
-      ) &&
-      Number.isFinite(
-        Number(
-          remembered.top
-        )
-      ) &&
-      fixedPlacementIsSafe(
-        Number(
-          remembered.left
-        ),
-        Number(
-          remembered.top
-        ),
-        width,
-        height,
-        occupiedRects
-      )
-    ) {
-      return {
-        left:
-          Number(
-            remembered.left
-          ),
-        top:
-          Number(
-            remembered.top
-          )
-      };
-    }
-
-    const anchorRect =
-      anchor?.getBoundingClientRect?.();
-
-    const preferredTop =
-      anchorRect
-        ? Math.max(
-            4,
-            Math.round(
-              anchorRect.top +
-              (
-                anchorRect.height -
-                height
-              ) /
-              2
-            )
-          )
-        : 10;
-
-    const startLeft =
-      anchorRect
-        ? Math.min(
-            window.innerWidth -
-              width -
-              8,
-            Math.round(
-              anchorRect.left -
-              width -
-              18
-            )
-          )
-        : window.innerWidth -
-          width -
-          180;
-
-    const topCandidates =
-      Array.from(
-        new Set([
-          preferredTop,
-          8,
-          12,
-          16,
-          20,
-          24,
-          28,
-          32
-        ])
-      );
-
-    for (
-      const top of
-      topCandidates
-    ) {
-      for (
-        let left =
-          Math.max(
-            120,
-            startLeft
-          );
-        left >= 120;
-        left -= 8
-      ) {
-        if (
-          fixedPlacementIsSafe(
-            left,
-            top,
-            width,
-            height,
-            occupiedRects
-          )
-        ) {
-          return {
-            left,
-            top
-          };
-        }
-      }
-    }
-
-    return null;
-  }
-
-  function applyFixedGlobalSwitch(
-    button,
-    placement
-  ) {
-    if (
-      !button ||
-      !placement
-    ) {
-      return false;
-    }
-
-    if (
-      button.parentElement !==
-      document.body
-    ) {
-      document.body.appendChild(
-        button
-      );
-    }
-
-    button.classList.remove(
-      "is-inline"
-    );
-
-    button.classList.add(
-      "is-fixed"
-    );
-
-    button.style.left =
-      `${Math.round(
-        placement.left
-      )}px`;
-
-    button.style.top =
-      `${Math.round(
-        placement.top
-      )}px`;
-
-    button.style.right =
-      "auto";
-
-    return true;
-  }
-
-  function getGlobalSwitchLayoutSnapshot() {
-    const anchor =
-      findSoaRegionAnchor();
-
-    const rect =
-      anchor?.getBoundingClientRect?.();
-
-    return [
-      window.innerWidth,
-      window.innerHeight,
-      anchor
-        ? getDirectVisibleText(
-            anchor
-          )
-        : "",
-      rect
-        ? Math.round(
-            rect.left
-          )
-        : -1,
-      rect
-        ? Math.round(
-            rect.top
-          )
-        : -1,
-      rect
-        ? Math.round(
-            rect.width
-          )
-        : -1,
-      document.querySelectorAll(
-        "body *"
-      ).length
-    ].join("|");
-  }
-
-  async function waitForStableGlobalSwitchLayout(
-    generation
-  ) {
-    let lastSnapshot =
-      "";
-
-    let stableCount =
-      0;
-
-    for (
-      let index = 0;
-      index <
-        GLOBAL_SWITCH_STABLE_MAX_CHECKS;
-      index += 1
-    ) {
-      if (
-        generation !==
-          globalSwitchPlacementGeneration ||
-        location.hostname !==
-          HOST_SOA
-      ) {
-        return false;
-      }
-
-      const snapshot =
-        getGlobalSwitchLayoutSnapshot();
-
-      if (
-        snapshot ===
-        lastSnapshot
-      ) {
-        stableCount += 1;
-      } else {
-        lastSnapshot =
-          snapshot;
-
-        stableCount =
-          1;
-      }
-
-      if (
-        stableCount >=
-        GLOBAL_SWITCH_STABLE_REQUIRED
-      ) {
-        return true;
-      }
-
-      await sleep(
-        GLOBAL_SWITCH_STABLE_INTERVAL_MS
-      );
-    }
-
-    return true;
-  }
-
-  function placeGlobalSwitchOnce(
-    button
-  ) {
-    return syncTopToolGroup(
-      button
-    );
-  }
-
-  function createGlobalSwitchButton() {
     let button =
       document.getElementById(
         GLOBAL_SWITCH_ID
       );
 
-    ensureGlobalSwitchStyle();
+    if (
+      button &&
+      slot &&
+      button.isConnected &&
+      slot.isConnected
+    ) {
+      updateGlobalSwitchState();
 
-    if (!button) {
-      button =
-        document.createElement(
-          "button"
+      return button;
+    }
+
+    // 清理SPA重绘后可能残留的半成品节点。
+    if (slot) {
+      slot.remove();
+    } else if (button) {
+      button.remove();
+    }
+
+    slot =
+      document.createElement(
+        "div"
+      );
+
+    slot.id =
+      GLOBAL_SWITCH_SLOT_ID;
+
+    button =
+      document.createElement(
+        "button"
+      );
+
+    button.id =
+      GLOBAL_SWITCH_ID;
+
+    button.type =
+      "button";
+
+    button.innerHTML =
+      "<span>报表工具</span>";
+
+    // 与SOA原生菜单及卡类汇总按钮的指针事件完全隔离。
+    [
+      "pointerdown",
+      "mousedown",
+      "mouseup",
+      "pointerup"
+    ].forEach(
+      eventName => {
+        button.addEventListener(
+          eventName,
+          event => {
+            event.stopPropagation();
+          }
+        );
+      }
+    );
+
+    button.addEventListener(
+      "click",
+      event => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        setPanelVisible(
+          !panelVisible
+        );
+      }
+    );
+
+    slot.appendChild(
+      button
+    );
+
+    /*
+     * 报表工具负责创建共享工具组：报表工具在左、卡类汇总在右。
+     * 工具组不可用时退化为独立入口，放在顶部最右侧、紧贴用户区左侧。
+     */
+    const group =
+      ensureTopToolGroup();
+
+    if (group) {
+      group.insertBefore(
+        slot,
+        group.firstChild
+      );
+    } else {
+      const userBox =
+        headerInner.querySelector(
+          ":scope > .user"
         );
 
-      button.id =
-        GLOBAL_SWITCH_ID;
-
-      button.type =
-        "button";
-
-      button.style.visibility =
-        "hidden";
-
-      button.innerHTML =
-        "<span>报表工具</span>";
-
-      // 与SOA原生菜单及卡类汇总按钮的指针事件完全隔离。
-      [
-        "pointerdown",
-        "mousedown",
-        "mouseup",
-        "pointerup"
-      ].forEach(
-        eventName => {
-          button.addEventListener(
-            eventName,
-            event => {
-              event.stopPropagation();
-            }
-          );
-        }
-      );
-
-      button.addEventListener(
-        "click",
-        event => {
-          event.preventDefault();
-          event.stopPropagation();
-
-          setPanelVisible(
-            !panelVisible
-          );
-        }
-      );
-
-      // Header尚未生成时先临时挂在body，真正显示前会移入顶部工具组。
-      document.body.appendChild(
-        button
-      );
+      if (userBox) {
+        headerInner.insertBefore(
+          slot,
+          userBox
+        );
+      } else {
+        headerInner.appendChild(
+          slot
+        );
+      }
     }
 
     updateGlobalSwitchState();
 
     return button;
+  }
+
+  /*
+   * 与卡类汇总（1.6）一致：不再适用时直接移除入口节点，
+   * 而不是留下隐藏按钮。
+   */
+  function removeGlobalSwitchEntry() {
+    const slot =
+      document.getElementById(
+        GLOBAL_SWITCH_SLOT_ID
+      );
+
+    if (slot) {
+      slot.remove();
+
+      return;
+    }
+
+    const button =
+      document.getElementById(
+        GLOBAL_SWITCH_ID
+      );
+
+    if (button) {
+      button.remove();
+    }
   }
 
   function scheduleGlobalSwitchPlacement(
@@ -6920,16 +6129,6 @@
     const generation =
       globalSwitchPlacementGeneration;
 
-    const button =
-      createGlobalSwitchButton();
-
-    if (!button) {
-      return;
-    }
-
-    button.style.visibility =
-      "hidden";
-
     globalSwitchPlacementTask =
       (
         async () => {
@@ -6937,6 +6136,7 @@
             /*
              * React顶部导航可能晚于DOMContentLoaded生成。
              * 最多等待约2秒；MutationObserver后续仍会继续补位。
+             * header未生成时不创建入口，避免留下游离节点。
              */
             for (
               let index = 0;
@@ -6952,14 +6152,15 @@
                 return;
               }
 
+              const button =
+                ensureGlobalSwitchEntry();
+
               if (
+                button &&
                 syncTopToolGroup(
                   button
                 )
               ) {
-                button.style.visibility =
-                  "visible";
-
                 updateGlobalSwitchState();
                 return;
               }
@@ -6986,6 +6187,8 @@
       location.hostname !==
       HOST_SOA
     ) {
+      removeGlobalSwitchEntry();
+
       return;
     }
 
@@ -7140,7 +6343,7 @@
       createPanel();
     }
 
-    createGlobalSwitchButton();
+    ensureGlobalSwitchEntry();
     bindGlobalSwitchObserver();
     scheduleGlobalSwitchPlacement(
       true
