@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -27,6 +27,10 @@
  * - 面板支持显示开关、拖动、折叠、位置记忆和网页提示记录。
  *
  * 更新记录
+ *
+ * v2.7  -  2026-9-13
+ * - 合同补充阶段的合同开始/结束日期改为直接点击日期面板内置“今天”按钮填入，
+ *   不再模拟手填日期，也不再自动推算“开始+1年”作为结束日期。
  *
  * v2.5  -  2026-9-3
  * - 修复落单审核短暂进入“落单中”后又真实回到“落单审核”时持续等待的问题；检测到落单审核操作已重新可用后自动回正并继续处理。
@@ -3560,6 +3564,116 @@
     }
   }
 
+  /*
+   * 在日期面板中查找内置“今天”按钮。
+   * 兼容不同 antd 版本：老版在 footer 的 .ant-picker-today-btn，
+   * 新版预设区在 .ant-picker-presets；最终兜底按可见文字匹配“今天”。
+   */
+  function getPickerTodayButton(
+    dropdown
+  ) {
+    if (!dropdown) {
+      return null;
+    }
+
+    const direct =
+      dropdown.querySelector(
+        ".ant-picker-today-btn"
+      );
+
+    if (
+      direct &&
+      isVisible(direct)
+    ) {
+      return direct;
+    }
+
+    return (
+      Array.from(
+        dropdown.querySelectorAll(
+          ".ant-picker-presets button, .ant-picker-presets a, .ant-picker-footer button, .ant-picker-footer a, button, a"
+        )
+      ).find(node => {
+        return (
+          isVisible(node) &&
+          compactText(
+            node.textContent
+          ) ===
+            "今天"
+        );
+      }) ||
+      null
+    );
+  }
+
+  /*
+   * 打开指定日期字段的面板并点击内置“今天”按钮完成填入。
+   * 只走面板点击，不回退为模拟手填。
+   */
+  async function setContractDateToday(
+    input,
+    label,
+    token = null
+  ) {
+    throwIfFlowCancelled(
+      token
+    );
+
+    const todayText =
+      formatDate(
+        new Date()
+      );
+
+    fireMouseSequence(
+      input.closest(
+        ".ant-picker"
+      ) || input
+    );
+
+    let dropdown =
+      await waitFor(
+        getVisiblePickerDropdown,
+        CONFIG.PICKER_TIMEOUT,
+        80
+      );
+
+    if (!dropdown) {
+      throw new Error(
+        `${label}未能打开日期选择面板`
+      );
+    }
+
+    let todayButton =
+      getPickerTodayButton(
+        dropdown
+      );
+
+    if (!todayButton) {
+      throw new Error(
+        `${label}的面板中未找到“今天”按钮`
+      );
+    }
+
+    todayButton.click();
+
+    const confirmed =
+      await waitFor(
+        () =>
+          cleanText(
+            input.value
+          ) ===
+          todayText,
+        2200,
+        80
+      );
+
+    if (!confirmed) {
+      throw new Error(
+        `${label}点击“今天”后未能写入 ${todayText}`
+      );
+    }
+  }
+
   async function setContractDates(
     token = null
   ) {
@@ -3602,66 +3716,16 @@
       };
     }
 
-    const today =
-      new Date();
-
-    let beginTarget =
-      null;
-
-    let endTarget =
-      null;
-
     if (!existingBegin) {
-      beginTarget =
-        today;
-    }
-
-    if (!existingEnd) {
-      const existingBeginDate =
-        existingBegin
-          ? parseYmdDate(
-              existingBegin
-            )
-          : null;
-
-      endTarget =
-        addYearsClamped(
-          existingBeginDate ||
-          beginTarget ||
-          today,
-          1
-        );
-    }
-
-    if (beginTarget) {
-      const beginText =
-        formatDate(
-          beginTarget
-        );
-
       log(
-        `合同开始日期为空，补充为 ${beginText}...`
+        "合同开始日期为空，点击日期面板“今天”按钮填入..."
       );
 
-      let beginOk =
-        await chooseDateByPicker(
-          begin,
-          beginTarget
-        );
-
-      if (!beginOk) {
-        beginOk =
-          await setDateFallback(
-            begin,
-            beginTarget
-          );
-      }
-
-      if (!beginOk) {
-        throw new Error(
-          `合同开始日期未能写入 ${beginText}`
-        );
-      }
+      await setContractDateToday(
+        begin,
+        "合同开始日期",
+        token
+      );
 
       throwIfFlowCancelled(
         token
@@ -3674,35 +3738,16 @@
       );
     }
 
-    if (endTarget) {
-      const endText =
-        formatDate(
-          endTarget
-        );
-
+    if (!existingEnd) {
       log(
-        `合同结束日期为空，补充为 ${endText}...`
+        "合同结束日期为空，点击日期面板“今天”按钮填入..."
       );
 
-      let endOk =
-        await chooseDateByPicker(
-          end,
-          endTarget
-        );
-
-      if (!endOk) {
-        endOk =
-          await setDateFallback(
-            end,
-            endTarget
-          );
-      }
-
-      if (!endOk) {
-        throw new Error(
-          `合同结束日期未能写入 ${endText}`
-        );
-      }
+      await setContractDateToday(
+        end,
+        "合同结束日期",
+        token
+      );
     } else {
       log(
         `✓ 合同结束日期已有值：${existingEnd}，保留。`
