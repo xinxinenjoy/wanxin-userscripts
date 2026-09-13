@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         前台-1.1批量预约工具
 // @namespace    https://tampermonkey.net/
-// @version      1.17
+// @version      1.18
 // @description  前台批量预约工具：在前台批量登记页面增加工具窗口，自动识别粘贴的14位预约单号并自动进行登记填写。同时在“已到检”页签中自动勾选“仅当日”，并在请求层强制将首次列表查询改为仅当日。
 
 // @match        *://checkup-register.health-100.cn/*
@@ -3189,7 +3189,7 @@
     initLauncherWatcher();
 
     console.log(
-      "[SOA批量预约] v1.15 已加载。已启用“已到检”首次查询一次性仅当日保护及批量预约功能。"
+      "[SOA批量预约] v1.18 已加载。已启用“已到检”首次查询一次性仅当日保护及批量预约功能。"
     );
   }
 

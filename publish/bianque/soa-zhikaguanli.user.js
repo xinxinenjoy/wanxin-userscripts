@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.6制卡管理查询
 // @namespace    https://tampermonkey.net/
-// @version      0.3.1
+// @version      0.3.2
 // @description  查询并汇总本年度的邀约、贵宾、核磁、CT等制卡记录，按部门/人员统计办卡进度。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -2302,7 +2302,7 @@
     panel.innerHTML = `
       <div class="hlj-head" data-drag-handle="1">
         <div>
-          <div class="hlj-title">卡类汇总 <span style="font-size:10px;color:#64748b;">v0.3.0</span></div>
+          <div class="hlj-title">卡类汇总 <span style="font-size:10px;color:#64748b;">v0.3.2</span></div>
         </div>
         <div class="hlj-head-actions">
           <button id="${IDS.query}" class="hlj-head-query" type="button">重新查询</button>

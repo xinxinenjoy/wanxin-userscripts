@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.1单位信息填充
 // @namespace    https://dime.health-100.cn/
-// @version      7.8.4
+// @version      7.8.5
 // @description  蝶美自动填充单位信息：按输入字段自适应填写，支持重复运行跳过、缺失字段跳过、行业/经济末级匹配、地区、单位类型、社会信用代码、企业规模及人数等字段。
 
 //
@@ -3555,7 +3555,7 @@
   tool.id = TOOL_ID;
   tool.innerHTML = `
     <div class="tool-header">
-      <strong>单位信息自动填写工具 v7.8.3</strong>
+      <strong>单位信息自动填写工具 v7.8.5</strong>
       <div class="tool-header-actions">
         <button class="tool-header-button tool-collapse" type="button" title="折叠工具">−</button>
         <button class="tool-header-button tool-close" type="button" title="收起到快捷按钮">×</button>
@@ -4822,5 +4822,5 @@
   });
 
   textBox.focus();
-  console.log("单位信息自动填写工具 v7.8.3 最后一项弹层收起版 已加载。");
+  console.log("单位信息自动填写工具 v7.8.5 最后一项弹层收起版 已加载。");
 })();
