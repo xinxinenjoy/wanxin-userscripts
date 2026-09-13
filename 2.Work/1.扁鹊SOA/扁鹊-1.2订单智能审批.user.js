@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -27,6 +27,10 @@
  * - 面板支持显示开关、拖动、折叠、位置记忆和网页提示记录。
  *
  * 更新记录
+ *
+ * v2.8  -  2026-9-13
+ * - 合同日期“今天”按钮改为稳定等待后点击（按钮渲染完成才点，最多重试3轮），
+ *   仍未生效时自动降级为按标准格式（YYYY-MM-DD）填入并回车，双路径兜底。
  *
  * v2.7  -  2026-9-13
  * - 合同补充阶段的合同开始/结束日期改为直接点击日期面板内置“今天”按钮填入，
@@ -3608,7 +3612,9 @@
 
   /*
    * 打开指定日期字段的面板并点击内置“今天”按钮完成填入。
-   * 只走面板点击，不回退为模拟手填。
+   * 点击前等待按钮渲染稳定，未生效自动重试；
+   * 按钮不可用或多次点击无效时，降级为按标准格式（YYYY-MM-DD）
+   * 直接填入并回车生效。两条路径最终都以输入框真实值为准。
    */
   async function setContractDateToday(
     input,
@@ -3624,54 +3630,162 @@
         new Date()
       );
 
-    fireMouseSequence(
+    const picker =
       input.closest(
         ".ant-picker"
-      ) || input
+      ) ||
+      input;
+
+    const isConfirmed =
+      () =>
+        cleanText(
+          input.value
+        ) ===
+        todayText;
+
+    /*
+     * 路径一：等“今天”按钮出现且稳定后点击，最多重试3轮。
+     */
+    for (
+      let attempt = 1;
+      attempt <= 3 &&
+      !isConfirmed();
+      attempt++
+    ) {
+      throwIfFlowCancelled(
+        token
+      );
+
+      if (
+        !getVisiblePickerDropdown()
+      ) {
+        fireMouseSequence(
+          picker
+        );
+      }
+
+      const dropdown =
+        await waitFor(
+          getVisiblePickerDropdown,
+          CONFIG.PICKER_TIMEOUT,
+          80
+        );
+
+      if (!dropdown) {
+        throw new Error(
+          `${label}未能打开日期选择面板`
+        );
+      }
+
+      const readyButton =
+        await waitFor(
+          () =>
+            getPickerTodayButton(
+              getVisiblePickerDropdown() ||
+              dropdown
+            ),
+          2000,
+          80
+        );
+
+      if (!readyButton) {
+        log(
+          `${label}的面板中未找到“今天”按钮，改为直接填入日期。`
+        );
+
+        break;
+      }
+
+      /*
+       * 等面板动画/渲染完成后再取一次最新按钮并点击，
+       * 避免面板刚挂载时点击被吞。
+       */
+      await nextPaint(2);
+
+      await sleep(120);
+
+      const latestButton =
+        getPickerTodayButton(
+          getVisiblePickerDropdown() ||
+          dropdown
+        );
+
+      if (!latestButton) {
+        continue;
+      }
+
+      fireMouseSequence(
+        latestButton
+      );
+
+      let confirmed =
+        await waitFor(
+          isConfirmed,
+          2000,
+          80
+        );
+
+      if (confirmed) {
+        await nextPaint(2);
+
+        confirmed =
+          isConfirmed();
+      }
+
+      if (confirmed) {
+        return true;
+      }
+
+      log(
+        `${label}第${attempt}次点击“今天”未生效，重试...`
+      );
+    }
+
+    if (isConfirmed()) {
+      return true;
+    }
+
+    /*
+     * 路径二（兜底）：页面日期框支持标准格式手填，
+     * 填入 YYYY-MM-DD 后回车即可生效。
+     */
+    log(
+      `${label}改用直接填入 ${todayText} 并回车...`
     );
 
-    let dropdown =
-      await waitFor(
-        getVisiblePickerDropdown,
-        CONFIG.PICKER_TIMEOUT,
-        80
+    const typedOk =
+      await setDateFallback(
+        input,
+        new Date()
       );
 
-    if (!dropdown) {
+    /*
+     * 兜底路径若残留打开的日期面板，按 Esc 收起。
+     */
+    if (
+      getVisiblePickerDropdown()
+    ) {
+      input.dispatchEvent(
+        new KeyboardEvent(
+          "keydown",
+          {
+            key: "Escape",
+            code: "Escape",
+            keyCode: 27,
+            which: 27,
+            bubbles: true
+          }
+        )
+      );
+    }
+
+    if (!typedOk) {
       throw new Error(
-        `${label}未能打开日期选择面板`
+        `${label}点击“今天”与手填 ${todayText} 均未能写入`
       );
     }
 
-    let todayButton =
-      getPickerTodayButton(
-        dropdown
-      );
-
-    if (!todayButton) {
-      throw new Error(
-        `${label}的面板中未找到“今天”按钮`
-      );
-    }
-
-    todayButton.click();
-
-    const confirmed =
-      await waitFor(
-        () =>
-          cleanText(
-            input.value
-          ) ===
-          todayText,
-        2200,
-        80
-      );
-
-    if (!confirmed) {
-      throw new Error(
-        `${label}点击“今天”后未能写入 ${todayText}`
-      );
-    }
+    return true;
   }
 
   async function setContractDates(
