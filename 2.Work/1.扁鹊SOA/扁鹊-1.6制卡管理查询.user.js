@@ -40,6 +40,9 @@
   const CACHE_KEY = `${NS}_cache`;
   const CACHE_SCHEMA = 2;
 
+  // 版本号单一来源：改动时与文件头 @version 一并同步
+  const SCRIPT_VERSION = '0.3.2';
+
   const PROCESS_API = '/soa-card/api/v1/bqcard/process/page';
   const POOL_API = '/soa-card/api/v1/card/business/pool/display';
 
@@ -1053,7 +1056,7 @@
 
       const data = {
         schema: CACHE_SCHEMA,
-        version: '0.2.3',
+        version: SCRIPT_VERSION,
         updatedAt: nowText(),
         queryPeriod: { startDate, endDate },
         config: {
@@ -2302,7 +2305,7 @@
     panel.innerHTML = `
       <div class="hlj-head" data-drag-handle="1">
         <div>
-          <div class="hlj-title">卡类汇总 <span style="font-size:10px;color:#64748b;">v0.3.2</span></div>
+          <div class="hlj-title">卡类汇总 <span style="font-size:10px;color:#64748b;">v${SCRIPT_VERSION}</span></div>
         </div>
         <div class="hlj-head-actions">
           <button id="${IDS.query}" class="hlj-head-query" type="button">重新查询</button>
