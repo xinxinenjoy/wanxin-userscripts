@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.7.6
+// @version      1.7.7
 // @description  SOA体检数据：自动读取落单数据、体检汇总及三类卡数量，并支持按制卡批次查询卡备注。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -6384,7 +6384,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.7.5
+          体检数据 v1.7.7
         </strong>
 
         <div style="

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.5业绩报表辅助
 // @namespace    https://tampermonkey.net/
-// @version      1.1.4
+// @version      1.1.5
 // @description  SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -2932,7 +2932,7 @@
                 font-size:10px;
                 line-height:16px;
                 font-weight:700;
-              ">v1.1.2</span>
+              ">v1.1.5</span>
             </div>
 
             <div style="

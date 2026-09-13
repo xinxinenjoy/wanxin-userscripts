@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.2套餐危害核对
 // @namespace    https://dime.health-100.cn/
-// @version      4.2.17
+// @version      4.2.18
 // @description  蝶美套餐危害核对：提供自动化核对、批量处理、自动选择等功能。注意：套餐名称的标准格式应为：XX-危害1+危害2+危害3+岗中+男，不保证能识别其他格式。
 
 // @match        https://dime.health-100.cn/*
@@ -3156,7 +3156,7 @@
   tool.id = TOOL_ID;
   tool.innerHTML = `
     <div class="tool-header">
-      <strong>套餐危害因素核对工具 v4.2.16</strong>
+      <strong>套餐危害因素核对工具 v4.2.18</strong>
       <div class="tool-header-actions">
         <button class="tool-header-button tool-collapse" type="button" title="折叠工具">−</button>
         <button class="tool-header-button tool-close" type="button" title="收起到快捷按钮">×</button>
@@ -8555,5 +8555,5 @@
     hideToolPanel();
     enhanceVisibleEditDialogs();
   });
-  console.log("套餐危害因素核对工具 v4.2.15 已加载。");
+  console.log("套餐危害因素核对工具 v4.2.18 已加载。");
 })();
