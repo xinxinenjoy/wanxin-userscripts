@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.6制卡管理查询
 // @namespace    https://tampermonkey.net/
-// @version      0.3.2
+// @version      0.3.3
 // @description  查询并汇总本年度的邀约、贵宾、核磁、CT等制卡记录，按部门/人员统计办卡进度。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -41,7 +41,7 @@
   const CACHE_SCHEMA = 2;
 
   // 版本号单一来源：改动时与文件头 @version 一并同步
-  const SCRIPT_VERSION = '0.3.2';
+  const SCRIPT_VERSION = '0.3.3';
 
   const PROCESS_API = '/soa-card/api/v1/bqcard/process/page';
   const POOL_API = '/soa-card/api/v1/card/business/pool/display';
@@ -2112,9 +2112,9 @@
         text-align:center;
       }
 
-      /* 部门进度数据较少，不再铺满整个面板 */
+      /* v0.3.3：部门进度居中、宽度收到 400px，列间距由 space-between 均分 */
       #${IDS.panel} .hlj-department-overview {
-        width:min(84%,610px);
+        width:min(100%,400px);
         margin:0 auto 12px;
       }
 
@@ -2141,8 +2141,11 @@
         padding:5px 7px;
       }
 
-      /* 部门进度与领取状态：字体略大，行更紧凑 */
+      /* v0.3.3：列宽按内容固定 + 均分剩余宽度，数字不再被拉散 */
       #${IDS.panel} .hlj-department-row {
+        grid-template-columns:auto 52px 52px 52px;
+        justify-content:space-between;
+        gap:12px;
         padding:5px 10px;
         font-size:12px;
         line-height:1.15;
@@ -2152,6 +2155,14 @@
         font-size:11px;
       }
 
+      /* 数值定宽右对齐：两位数与三位数混排时，标签与数字仍逐列对齐 */
+      #${IDS.panel} .hlj-department-stat b {
+        display:inline-block;
+        min-width:22px;
+        text-align:right;
+      }
+
+      /* 领取状态表：字号提高，行距压缩 */
       #${IDS.panel} .hlj-card-matrix th,
       #${IDS.panel} .hlj-card-matrix td {
         padding:4px 8px;
