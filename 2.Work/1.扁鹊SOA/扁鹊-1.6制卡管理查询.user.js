@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.6制卡管理查询
 // @namespace    https://tampermonkey.net/
-// @version      0.5.0
+// @version      0.5.3
 // @description  查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -48,11 +48,14 @@
   const PANEL_WIDTH_MAX = 1400;
   // 面板宽度小于该值时内部 grid 降列（视口 media query 管不到浮层自身的宽度）
   const PANEL_COMPACT_WIDTH = 620;
+  // 更窄一档。四张卡类汇总（贵宾/邀约/核磁/CT）在 620 降到 2×2 太早了 ——
+  // 单卡 100px 左右就够放「贵宾 541 张」，所以它们只在 <480 时才折两排。
+  const PANEL_NARROW_WIDTH = 480;
   // 面板左右两侧最少留白（右 24px 初始定位 + 左 16px），用来算「视口限制下的最大宽度」
   const PANEL_VIEWPORT_MARGIN = 40;
 
   // 版本号单一来源：改动时与文件头 @version 一并同步
-  const SCRIPT_VERSION = '0.5.0';
+  const SCRIPT_VERSION = '0.5.3';
 
   const PROCESS_API = '/soa-card/api/v1/bqcard/process/page';
   const POOL_API = '/soa-card/api/v1/card/business/pool/display';
@@ -1016,7 +1019,7 @@
         ${columns.map((category) => `<th class="hlj-col-cat">${escapeHtml(category)}</th>`).join('')}
         <th class="hlj-col-stat">总数</th>
         <th class="hlj-col-stat">已办</th>
-        <th class="hlj-col-stat">剩余 / 超出</th>
+        <th class="hlj-col-stat hlj-col-balance">剩余 / 超出</th>
       </tr>
     `;
 
@@ -1040,7 +1043,7 @@
           }).join('')}
           <td class="hlj-col-stat">${Number(item?.plan || 0)}</td>
           <td class="hlj-col-stat">${Number(item?.current || 0)}</td>
-          <td class="hlj-col-stat ${overPlan > 0 ? 'is-over' : (balance > 0 ? 'is-remaining' : 'is-zero')}">
+          <td class="hlj-col-stat hlj-col-balance ${overPlan > 0 ? 'is-over' : (balance > 0 ? 'is-remaining' : 'is-zero')}">
             ${overPlan > 0 ? '超出' : '剩余'} <b>${overPlan > 0 ? overPlan : balance}</b>
           </td>
         </tr>
@@ -1647,21 +1650,24 @@
       #${IDS.panel} .hlj-resize-handle {
         position:absolute;
         top:52px;
-        right:0;
-        width:9px;
+        /* v0.5.1：原来 right:0，正好压在 #body 的滚动条上 —— 两条灰竖线叠在一起，
+           分不清哪条能拖。现在把滚动条定死 8px 宽（见下方 ::-webkit-scrollbar），
+           把手退到它左侧的 8px 缝里（#body 的 padding-right 12px 正好让出这条缝），
+           并换成琥珀色，跟灰色滚动条一眼区分。 */
+        right:8px;
+        width:8px;
         height:72px;
         display:flex;
         align-items:center;
         justify-content:center;
-        border:1px solid #cbd5e1;
-        border-right:0;
-        border-radius:5px 0 0 5px;
-        background:#e8edf4;
+        border:1px solid #e8b96a;
+        border-radius:4px;
+        background:#fdf1de;
         cursor:ew-resize;
-        opacity:.7;
-        transition:opacity .12s ease, background .12s ease;
+        opacity:.92;
+        transition:opacity .12s ease, background .12s ease, border-color .12s ease;
         touch-action:none;
-        z-index:2;
+        z-index:3;
       }
 
       /* 三条短横纹，一眼看出这是可以拖的栅格条 */
@@ -1670,41 +1676,59 @@
         width:3px;
         height:34px;
         border-radius:2px;
-        background:repeating-linear-gradient(180deg,#94a3b8 0 2px,transparent 2px 5px);
+        background:repeating-linear-gradient(180deg,#c8790c 0 2px,transparent 2px 5px);
       }
 
       #${IDS.panel} .hlj-resize-handle:hover,
       #${IDS.panel} .hlj-resize-handle.is-active {
         opacity:1;
-        background:#dbe3ed;
+        background:#fbe4c2;
+        border-color:#c8790c;
       }
+
+      /* 滚动条宽度定死 8px：上面把手的退让距离就是按它算出来的，
+         宽度一变把手会重新压回滚动条上。顺带去掉系统默认的箭头按钮。 */
+      #${IDS.body}::-webkit-scrollbar { width:8px; height:8px; }
+      #${IDS.body}::-webkit-scrollbar-track { background:#f1f5f9; }
+      #${IDS.body}::-webkit-scrollbar-thumb { background:#c9d3df; border-radius:4px; }
+      #${IDS.body}::-webkit-scrollbar-thumb:hover { background:#a9b6c6; }
 
       /* 面板被拖窄时内部降列。
          面板里的响应式现在是按「视口宽度」写的 media query，浮层自己变窄它不会响应，
          所以按面板实际宽度再切一档（JS 加 .is-compact）。
          特异性 (1,2,0) 高于 #panel .hlj-kpis 的 (1,1,0)，也高于 media query 里同选择器。 */
       #${IDS.panel}.is-compact .hlj-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); }
-      #${IDS.panel}.is-compact .hlj-main-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
       #${IDS.panel}.is-compact .hlj-detail-grid { grid-template-columns:1fr; }
+      /* 四张卡类汇总不跟着 620 一起降列 —— 卡本身只要 ~100px 就放得下，
+         620 就折成 2×2 会白占一大块竖向空间。只在 <480 时才两排（.is-narrow）。 */
+      #${IDS.panel}.is-narrow .hlj-main-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
       #${IDS.panel}.is-compact .hlj-detail-meta { grid-template-columns:repeat(2,minmax(0,1fr)); }
-      #${IDS.panel}.is-compact .hlj-personnel-head { flex-direction:column; align-items:flex-start; }
-      #${IDS.panel}.is-compact .hlj-personnel-scope-hint { margin-left:0; margin-top:4px; }
-      #${IDS.panel}.is-compact .hlj-personnel-selects { width:100%; flex-wrap:wrap; }
-      #${IDS.panel}.is-compact .hlj-personnel-select { flex:1 1 0; width:auto; min-width:0; }
-      /* 窄面板：搜索框单独占一行（两个下拉保持原样，不跟它挤） */
-      #${IDS.panel}.is-compact .hlj-person-search { flex:1 1 100%; width:auto; }
-      /* v0.4.1：窄面板下进度表（真表格）的列宽与字号一起收一档。
-         420px 面板实测：卡种 4×40 + 数字 3×54 = 322px，姓名列还剩约 70px，不溢出。 */
+      /* v0.5.2：head 已恒为纵向（见 .hlj-personnel-head）、selects 已恒为
+         width:100% + flex-wrap（见 .hlj-personnel-selects），
+         原来这里那三条 compact 覆盖（head 折列 / hint 边距 / selects 宽度）全部作废，删掉。 */
+      /* 搜索框不再独占一行：改成「先自己缩，缩到 96px 还放不下才换行」。
+         603px 面板（compact）实测内容 543px，两个下拉 188×2 + 间隙 16 = 392px，
+         搜索框拿到 151px，与两个下拉并排同一行。 */
+      #${IDS.panel}.is-compact .hlj-person-search {
+        flex:1 1 96px;
+        width:auto;
+        max-width:168px;
+        min-width:96px;
+      }
+      /* v0.5.1：窄档只把姓名列与「剩余 / 超出」列收一档，其余列一律 auto ——
+         列宽由表格剩余宽度等分，窄了自动收、宽了自动摊开。
+         旧写法给卡种/数字列写死 px，剩余宽度全被「姓名」那一列吃掉，
+         窄面板下姓名后面能空出一大截（红领巾 2026-09-15 反馈的「左侧空间大」）。
+         420px 面板实测：内容 388 - 姓名 78 - 余额 70 = 240，7 个 auto 列各 34px，不溢出。 */
       #${IDS.panel}.is-compact .hlj-progress-table th,
-      #${IDS.panel}.is-compact .hlj-progress-table td { padding:4px 4px; font-size:10px; }
-      #${IDS.panel}.is-compact .hlj-progress-table .hlj-col-cat { width:40px; }
-      #${IDS.panel}.is-compact .hlj-progress-table .hlj-col-stat { width:54px; }
-      /* 窄档最后一列表头「剩余 / 超出」放不进 54px，允许折成两行 ——
-         被截成「剩余 / 超…」比折行更难认。只放开表头，单元格仍 nowrap。 */
+      #${IDS.panel}.is-compact .hlj-progress-table td { padding:4px 4px; font-size:11px; }
+      #${IDS.panel}.is-compact .hlj-progress-table .hlj-col-name { width:78px; }
+      #${IDS.panel}.is-compact .hlj-progress-table .hlj-col-balance { width:70px; padding-left:8px; }
+      /* 窄档表头放开折行：「剩余 / 超出」被截成「剩余 / 超…」比折行更难认。 */
       #${IDS.panel}.is-compact .hlj-progress-table thead th {
         white-space:normal;
         word-break:keep-all;
-        line-height:1.05;
+        line-height:1.15;
       }
       #${IDS.panel} .hlj-head {
         display:flex; align-items:center; justify-content:space-between; gap:10px;
@@ -1847,11 +1871,17 @@
         overflow:hidden;
       }
 
+      /* v0.5.2：这里由**横向**改成**纵向** —— 选择行在上、「人员计划及办理进度」在下。
+         横向时右侧那 9 个字（实测 99px + 12px gap = 111px）是从选择行里切走的：
+         603px 面板下内容只有 543px，两个下拉 188×2 + 间隙 16 = 392，
+         剩给搜索框的不足 168px → 它只能换行独占一行（红领巾 2026-09-15 反馈）。
+         文案移到下一行后，选择行拿到整幅宽度，任何面板宽度下都不再被这几个字影响。
+         原来 2880 行那条只有 justify-content/align-items 的重复定义已一并合到这里。 */
       #${IDS.panel} .hlj-personnel-head {
         display:flex;
-        align-items:center;
-        justify-content:flex-start;
-        gap:12px;
+        flex-direction:column;
+        align-items:flex-start;
+        gap:5px;
         padding:10px 12px;
         border-bottom:1px solid #e2e8f0;
         background:#f8fafc;
@@ -1864,38 +1894,22 @@
         flex:0 0 auto;
       }
 
+      /* 选择行：两个下拉 + 人名搜索框。gap 取原来两处定义里**真正生效**的 8px
+         （1884 行那条 7px 被后一处覆盖，是死值，v0.5.2 合并时删掉）。
+         flex-wrap 放这里（原来只在窄档加）：万一真放不下，宁可搜索框换行，
+         也不要横向溢出把面板撑出滚动条。 */
       #${IDS.panel} .hlj-personnel-selects {
         display:flex;
-        gap:7px;
         align-items:center;
-      }
-
-      #${IDS.panel} .hlj-personnel-select {
-        height:30px;
+        gap:8px;
+        flex-wrap:wrap;
+        width:100%;
         min-width:0;
-        padding:0 28px 0 10px;
-        border:1px solid #cbd5e1;
-        border-radius:7px;
-        background:#fff;
-        color:#1f2937;
-        font-family:"Microsoft YaHei UI","Microsoft YaHei","Segoe UI",sans-serif;
-        font-size:12px;
-        font-weight:600;
-        font-variant-numeric:tabular-nums;
-        letter-spacing:0;
-        outline:none;
-        cursor:pointer;
-      }
-      #${IDS.panel} [data-personnel-department="1"] { width:210px; }
-      #${IDS.panel} [data-personnel-person="1"] { width:210px; }
-      #${IDS.panel} .hlj-personnel-select option {
-        font-variant-numeric:tabular-nums;
       }
 
-      #${IDS.panel} .hlj-personnel-select:focus {
-        border-color:#94a3b8;
-        box-shadow:0 0 0 2px rgba(100,116,139,.08);
-      }
+      /* v0.5.1 删除：原生 select 时代的 .hlj-personnel-select / [data-personnel-department]
+         / [data-personnel-person] / option / :focus 共 5 条规则 —— 下拉早改成
+         .hlj-smart-select 自定义组件，这些选择器在 DOM 里一个都不存在（死规则）。 */
 
       #${IDS.panel} .hlj-personnel-kpis {
         display:grid;
@@ -2172,21 +2186,31 @@
         border-bottom:0;
       }
 
-      /* 固定列宽：卡种列与数字列写死，姓名列不设宽 ——
-         fixed 布局会把剩下的宽度整段交给它，列宽因此与内容无关。 */
+      /* v0.5.1：只有「姓名」和「剩余 / 超出」写死宽度，卡种与总数/已办一律 auto。
+         table-layout:fixed 会把剩余宽度平分给所有 auto 列 —— 列宽因此随面板宽度自适应，
+         窄面板收得住、宽面板摊得开。旧写法把卡种/数字列写死，剩余宽度整段落到姓名列，
+         姓名后面空出一大截（红领巾反馈的「左侧空间大」，面板越窄越明显）。 */
       #${IDS.panel} .hlj-progress-table .hlj-col-name {
-        width:auto;
+        width:92px;
         text-align:left;
         color:#334155;
         font-weight:800;
       }
 
       #${IDS.panel} .hlj-progress-table .hlj-col-cat {
-        width:56px;
+        width:auto;
       }
 
       #${IDS.panel} .hlj-progress-table .hlj-col-stat {
-        width:66px;
+        width:auto;
+      }
+
+      /* 「剩余 / 超出」列左对齐：文案长度不等（剩余 5 / 剩余 22），居中会让
+         「剩余」「超出」这两个词逐行错开，整列看着是歪的。 */
+      #${IDS.panel} .hlj-progress-table .hlj-col-balance {
+        width:84px;
+        text-align:left;
+        padding-left:10px;
       }
 
       /* 没领的卡种写 0 而不是留空：留空会被误读成「数据没取到」。
@@ -2581,27 +2605,34 @@
         margin-top:0;
       }
 
-      /* 自定义部门 / 人员下拉。原生select无法稳定做三列对齐，因此改为真正的分列菜单。 */
+      /* 自定义部门 / 人员下拉。原生select无法稳定做三列对齐，因此改为真正的分列菜单。
+         ⚠️ 外观与几何都写在**这一处**（几何值见下方注释），不要再另开一条同名规则 ——
+         v0.5.1 之前这里和后面各有一条 .hlj-smart-select，后者整段覆盖前者，
+         调宽度时对着前一条改半天没反应（真的踩过）。 */
       #${IDS.panel} .hlj-smart-select {
         position:relative;
-        width:220px;
-        flex:0 0 220px;
+        /* 188px 里三列的分配：姓名 52 + 进度 50 + 余额 40 + gap/padding 46 = 188 */
+        width:188px;
+        flex:0 0 188px;
       }
 
       #${IDS.panel} .hlj-smart-select-btn {
         width:100%;
         height:31px;
         display:grid;
-        grid-template-columns:minmax(0,1fr) 58px 44px;
+        grid-template-columns:minmax(0,1fr) 50px 40px;
         align-items:center;
-        gap:7px;
-        padding:0 28px 0 10px;
+        gap:6px;
+        padding:0 25px 0 9px;
         border:1px solid #cbd5e1;
         border-radius:7px;
         background:#fff;
         color:#1f2937;
         font-family:inherit;
-        font-size:11px;
+        /* v0.5.1：11px → 12px。组员下拉里的姓名/进度/余额挤在 188px 里，
+           11px 在 100% 缩放下发虚（红领巾反馈看不清）。列宽是写死的 px，
+           字号只影响字本身，不会把三列撑开。 */
+        font-size:12px;
         cursor:pointer;
         text-align:left;
         position:relative;
@@ -2623,18 +2654,20 @@
         box-shadow:0 0 0 2px rgba(100,116,139,.06);
       }
 
+      /* v0.5.1：姓名加重加深（11px/#334155 → 12px 继承、#1f2937），
+         进度数字同步加深到 #334155 —— 这三个字段挤在 188px 里，浅灰在 100% 缩放下发虚。 */
       #${IDS.panel} .hlj-smart-name {
         min-width:0;
         overflow:hidden;
         text-overflow:ellipsis;
         white-space:nowrap;
-        color:#334155;
+        color:#1f2937;
         font-weight:700;
       }
 
       #${IDS.panel} .hlj-smart-progress {
         text-align:right;
-        color:#475569;
+        color:#334155;
         font-variant-numeric:tabular-nums;
         font-weight:700;
         white-space:nowrap;
@@ -2686,7 +2719,7 @@
         top:0;
         left:0;
         z-index:2147483647;
-        width:270px;
+        width:238px;
         max-height:340px;
         display:none;
         overflow:auto;
@@ -2705,16 +2738,16 @@
         width:100%;
         min-height:31px;
         display:grid;
-        grid-template-columns:minmax(92px,1fr) 64px 48px;
+        grid-template-columns:minmax(80px,1fr) 56px 43px;
         align-items:center;
-        gap:8px;
-        padding:5px 8px;
+        gap:6px;
+        padding:5px 7px;
         border:0;
         border-radius:6px;
         background:#fff;
         color:#334155;
         font-family:inherit;
-        font-size:11px;
+        font-size:12px;
         cursor:pointer;
         text-align:left;
       }
@@ -2829,28 +2862,9 @@
         margin:0 12px 12px;
       }
 
-      /* 部门 / 人员选择框再收窄一些 */
-      #${IDS.panel} .hlj-smart-select {
-        width:188px;
-        flex:0 0 188px;
-      }
-
-      #${IDS.panel} .hlj-smart-select-btn {
-        grid-template-columns:minmax(0,1fr) 50px 40px;
-        gap:6px;
-        padding-left:9px;
-        padding-right:25px;
-      }
-
-      #${IDS.panel} .hlj-smart-menu {
-        width:238px;
-      }
-
-      #${IDS.panel} .hlj-smart-option {
-        grid-template-columns:minmax(80px,1fr) 56px 43px;
-        gap:6px;
-        padding:5px 7px;
-      }
+      /* v0.5.1：这里原来又写了一遍 .hlj-smart-select / -btn / -menu / -option 的几何，
+         把上面那套整段覆盖掉（220px→188px、菜单 270px→238px…），属于纯死规则，
+         已全部并入上面的单条规则。下面是原 v0.4.1 的五列行说明，保留备查。 */
 
       /* v0.4.1：这里原来的五列 grid 行（姓名 / 卡种 chip / 总数 / 已办 / 剩余）已整体删除，
          进度表改成 .hlj-progress-table 真表格 —— 列定义只在上方那一处，单一来源。
@@ -2883,14 +2897,16 @@
         letter-spacing:.1px;
       }
 
-      #${IDS.panel} .hlj-personnel-head {
-        justify-content:space-between;
-        align-items:center;
-      }
+      /* v0.5.2 删除：这里原来的 .hlj-personnel-head（justify-content / align-items）
+         与 .hlj-personnel-selects（display / align-items / gap:8px）各是**第二处定义**，
+         属性早被上面 1873 / 1894 那两处覆盖 —— 纯死规则，改这几行不会生效。
+         有效值已合并上去，这里只留 hint 与搜索框。 */
 
+      /* 「人员计划及办理进度」：head 改成纵向后，它不再靠 margin-left:auto 挤到右侧，
+         而是紧随选择行之下、左对齐 —— 占的是竖向空间，不再抢选择行的横向宽度。 */
       #${IDS.panel} .hlj-personnel-scope-hint {
         flex:0 0 auto;
-        margin-left:auto;
+        margin-left:0;
         color:#64748b;
         font-size:11px;
         line-height:1.3;
@@ -2898,18 +2914,16 @@
         white-space:nowrap;
       }
 
-      #${IDS.panel} .hlj-personnel-selects {
-        display:flex;
-        align-items:center;
-        gap:8px;
-      }
-
       /* 人名搜索框：接在两个下拉右侧，独立一列。
-         两个下拉的宽度规则一个字没改 —— 搜索框只占自己的那份。 */
+         两个下拉的宽度规则一个字没改 —— 搜索框只占自己的那份。
+         v0.5.2：改成**允许收缩**（0 1 168px）+ 下限 96px。宽档仍是 168px；
+         compact 档由下面 .is-compact 那条接管，它会缩到刚好放得下、不再换行。
+         96px 下限的依据：图标 25px +「搜索人名」4 字 ×12px ≈ 48px + 右内边距 10px ≈ 83px。 */
       #${IDS.panel} .hlj-person-search {
         position:relative;
-        flex:0 0 168px;
+        flex:0 1 168px;
         width:168px;
+        min-width:96px;
       }
 
       #${IDS.panel} .hlj-person-search::before {
@@ -2918,8 +2932,8 @@
         left:9px;
         top:50%;
         transform:translateY(-52%);
-        color:#94a3b8;
-        font-size:13px;
+        color:#64748b;
+        font-size:14px;
         pointer-events:none;
       }
 
@@ -2933,12 +2947,14 @@
         background:#fff;
         color:#1f2937;
         font-family:inherit;
-        font-size:11px;
+        /* v0.5.1：11px → 12px（同两个下拉，红领巾反馈字太小看不清） */
+        font-size:12px;
         outline:none;
       }
 
+      /* 占位符原来 #9aa7b6 太浅，100% 缩放下几乎糊在框里。降到 slate 系 #64748b。 */
       #${IDS.panel} .hlj-person-search-input::placeholder {
-        color:#9aa7b6;
+        color:#64748b;
         font-weight:600;
       }
 
@@ -2983,18 +2999,21 @@
         border-radius:6px;
         background:#fff;
         font-family:inherit;
-        font-size:11px;
+        font-size:12px;
         text-align:left;
         cursor:pointer;
       }
 
-      #${IDS.panel} .hlj-person-search-item:hover {
+      /* v0.5.3：键盘高亮（上下键）与鼠标 hover 共用同一套底色。
+         两者视觉一致，「看到的那一行」和「回车选中的那一行」才不会打架。 */
+      #${IDS.panel} .hlj-person-search-item:hover,
+      #${IDS.panel} .hlj-person-search-item.is-active {
         background:#eff6ff;
       }
 
       #${IDS.panel} .hlj-person-search-dept {
         color:#64748b;
-        font-size:10px;
+        font-size:11px;
         font-weight:700;
         overflow:hidden;
         text-overflow:ellipsis;
@@ -3014,14 +3033,15 @@
         color:#b91c1c;
       }
 
-      #${IDS.panel} .hlj-person-search-item.is-alert:hover {
+      #${IDS.panel} .hlj-person-search-item.is-alert:hover,
+      #${IDS.panel} .hlj-person-search-item.is-alert.is-active {
         background:#fde8e8;
       }
 
       #${IDS.panel} .hlj-person-search-empty {
         padding:8px 10px;
-        color:#94a3b8;
-        font-size:11px;
+        color:#7b8797;
+        font-size:12px;
         font-weight:600;
       }
 
@@ -3031,19 +3051,13 @@
       }
       @media (max-width: 900px) {
         #${IDS.panel} { width:calc(100vw - 24px); right:12px; }
-        #${IDS.panel} .hlj-personnel-head {
-          align-items:flex-start;
-          flex-direction:column;
-        }
-        #${IDS.panel} .hlj-personnel-scope-hint {
-          margin-left:0;
-          margin-top:4px;
-        }
+        /* v0.5.2：head 折列 / hint 边距 / selects 宽度三条覆盖已删 —— 基础规则里就是这套，
+           这里再写一遍只会让"改哪一处生效"变糊涂。 */
         #${IDS.panel} .hlj-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); }
-        #${IDS.panel} .hlj-main-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
-        #${IDS.panel} .hlj-personnel-selects { width:100%; flex-wrap:wrap; }
-        #${IDS.panel} .hlj-personnel-select { flex:1 1 0; width:auto; min-width:0; }
-        #${IDS.panel} .hlj-person-search { flex:1 1 100%; width:auto; }
+        /* v0.5.1：四张卡类汇总不再跟着视口降列 —— 视口窄不代表面板窄（浮层只是贴右显示），
+           降列改由 .is-narrow（按面板真实宽度）判定。 */
+        /* v0.5.2：搜索框同 .is-compact —— 先自己缩，缩到 96px 才换行，不再整行独占。 */
+        #${IDS.panel} .hlj-person-search { flex:1 1 96px; width:auto; max-width:168px; min-width:96px; }
         #${IDS.panel} .hlj-personnel-kpis { grid-template-columns:repeat(3,minmax(0,1fr)); }
         #${IDS.panel} .hlj-detail-grid { grid-template-columns:1fr; }
         #${IDS.panel} .hlj-detail-meta { grid-template-columns:repeat(3,minmax(0,1fr)); }
@@ -3500,8 +3514,10 @@
     const next = Math.round(Math.max(PANEL_WIDTH_MIN, Math.min(limit, Number(width) || PANEL_WIDTH_DEFAULT)));
 
     panel.style.width = `${next}px`;
-    // 面板自己变窄时，视口 media query 不会触发，得靠这个类降列
+    // 面板自己变窄时，视口 media query 不会触发，得靠这两个类降列。
+    // is-compact：表格 / 下拉区收窄一档；is-narrow：只给四张卡类汇总折成两排。
     panel.classList.toggle('is-compact', next < PANEL_COMPACT_WIDTH);
+    panel.classList.toggle('is-narrow', next < PANEL_NARROW_WIDTH);
 
     if (opts.persist) GM_setValue(PANEL_WIDTH_KEY, next);
     return next;
@@ -4490,6 +4506,53 @@
       searchHost?.classList.remove('is-open');
     }
 
+    // ---------- 搜索结果的键盘导航（v0.5.3 新增）----------
+    // 上下键高亮的当前项下标，-1 = 没有高亮（焦点始终留在输入框里）。
+    // 老做法是「ArrowDown 把焦点交给第一个菜单项」—— 焦点一离开输入框，
+    // 后面再按 ArrowDown 就没人接，浏览器只能去滚页面（红领巾 2026-09-15 反馈：
+    // 「只能下移一格，再操作就变成网页整体下移」）。
+    // 改成在输入框里维护高亮下标后，焦点从不离开输入框，输入、上下键、回车都在同一处接管。
+    // ⚠️ 别顺手加「鼠标划过就同步高亮」：Chrome 在**布局变化后**会按上一帧的鼠标位置
+    // 补发一次 mouseover，菜单刚渲染出来就可能把高亮推到光标底下那一项上 ——
+    // 于是上下键的起点变成"看运气"（2026-09-15 真机实测：连按三次高亮落在 2/3/4 而不是 1/2/3）。
+    // 鼠标悬停有自己的 :hover 底色，键盘游标只归键盘管，两边互不干扰。
+    let searchActiveIndex = -1;
+
+    const searchItemNodes = () =>
+      searchMenu ? Array.from(searchMenu.querySelectorAll('.hlj-person-search-item')) : [];
+
+    function setSearchActive(index) {
+      const items = searchItemNodes();
+      searchActiveIndex = items.length ? Math.max(0, Math.min(index, items.length - 1)) : -1;
+      items.forEach((item, i) => item.classList.toggle('is-active', i === searchActiveIndex));
+      return items;
+    }
+
+    // 菜单是 fixed + overflow:auto，scrollIntoView 有可能连着把页面一起滚走，
+    // 所以自己算 scrollTop，只动菜单自己的滚动条。
+    function scrollSearchActiveIntoView() {
+      if (!searchMenu) return;
+      const item = searchItemNodes()[searchActiveIndex];
+      if (!item) return;
+
+      const top = item.offsetTop;
+      const bottom = top + item.offsetHeight;
+      if (top < searchMenu.scrollTop) {
+        searchMenu.scrollTop = top - 4;
+      } else if (bottom > searchMenu.scrollTop + searchMenu.clientHeight) {
+        searchMenu.scrollTop = bottom - searchMenu.clientHeight + 4;
+      }
+    }
+
+    // 点菜单项 / 高亮项上按回车，走的都是这里
+    function activateSearchItem(item) {
+      if (!item) return;
+      jumpTo(
+        item.getAttribute('data-person-department') || '全部部门',
+        item.getAttribute('data-person-name') || '全部人员'
+      );
+    }
+
     function renderPersonSearch() {
       if (!searchInput || !searchMenu) return;
 
@@ -4524,6 +4587,10 @@
         }).join('');
       }
 
+      // 结果集换了一批，高亮清零：箭头键从第一项重新开始。
+      // （菜单 DOM 整个重建过，上一轮的 .is-active 不会残留。）
+      searchActiveIndex = -1;
+
       // 先给菜单布局，再量尺寸 —— 顺序反了就量到 0
       searchMenu.hidden = false;
       positionSmartMenu(searchHost, searchInput, searchMenu);
@@ -4550,22 +4617,46 @@
 
       // 无需回车 / 无确认按钮：输入即过滤
       searchInput.addEventListener('input', renderPersonSearch);
-      searchInput.addEventListener('focus', () => {
-        if (String(searchInput.value || '').trim()) renderPersonSearch();
+
+      // 聚焦即开、失焦即关 —— 开与关各有唯一入口，不再依赖「点了面板里的空白处」才收起。
+      // 空关键字时菜单里显示用法提示：原来只有「输入后又删光」才看得到，等于把提示藏起来了。
+      searchInput.addEventListener('focus', renderPersonSearch);
+
+      // v0.5.3 修复（红领巾反馈「焦点移除后搜索框并未消失」）：
+      // 原来的收起入口只有面板空白点击 + 滚动 + 缩放，点面板外的页面、点顶部按钮都关不掉。
+      // 现在只要焦点离开整个搜索控件就收起。
+      // relatedTarget 还落在控件内（点的是菜单项）时不关 —— 菜单一 hidden，
+      // 焦点元素就没了，后续的 click 事件再也到不了菜单项上。
+      searchInput.addEventListener('blur', (e) => {
+        if (e.relatedTarget && searchHost.contains(e.relatedTarget)) return;
+        closePersonSearch();
       });
 
       searchInput.addEventListener('keydown', (e) => {
+        const items = searchItemNodes();
+        // 菜单没开、或一条结果都没有时一律不拦 —— 方向键该滚页面就滚页面
+        const navigable = !searchMenu.hidden && items.length > 0;
+
         if (e.key === 'Escape') {
           searchInput.value = '';
           closePersonSearch();
           return;
         }
-        if (e.key === 'ArrowDown') {
-          const first = searchMenu.querySelector('.hlj-person-search-item');
-          if (first) {
-            e.preventDefault();
-            first.focus();
-          }
+
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          if (!navigable) return;
+          e.preventDefault();
+          setSearchActive(
+            searchActiveIndex < 0 ? 0 : searchActiveIndex + (e.key === 'ArrowDown' ? 1 : -1)
+          );
+          scrollSearchActiveIntoView();
+          return;
+        }
+
+        if (e.key === 'Enter') {
+          if (!navigable) return;
+          e.preventDefault();
+          activateSearchItem(items[searchActiveIndex < 0 ? 0 : searchActiveIndex]);
         }
       });
 
@@ -4573,10 +4664,7 @@
         const item = e.target.closest('.hlj-person-search-item');
         if (!item) return;
         e.stopPropagation();
-        jumpTo(
-          item.getAttribute('data-person-department') || '全部部门',
-          item.getAttribute('data-person-name') || '全部人员'
-        );
+        activateSearchItem(item);
       });
     }
 
