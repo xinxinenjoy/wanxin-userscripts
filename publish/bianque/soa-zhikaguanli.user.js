@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.6制卡管理查询
 // @namespace    https://tampermonkey.net/
-// @version      0.3.3
-// @description  查询并汇总本年度的邀约、贵宾、核磁、CT等制卡记录，按部门/人员统计办卡进度。
+// @version      0.5.0
+// @description  查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -33,6 +33,7 @@
     query: `${NS}_query`,
     collapse: `${NS}_collapse`,
     close: `${NS}_close`,
+    cardModal: `${NS}_card_modal`,
   };
 
   const TOP_TOOL_GROUP_ID = '__hlj_soa_top_tool_group_v1';
@@ -40,14 +41,65 @@
   const CACHE_KEY = `${NS}_cache`;
   const CACHE_SCHEMA = 2;
 
+  // 面板宽度：右上角的竖条把手可拖动调整，宽度记在本地，下次打开沿用。
+  const PANEL_WIDTH_KEY = `${NS}_panelWidth`;
+  const PANEL_WIDTH_DEFAULT = 760;
+  const PANEL_WIDTH_MIN = 420;
+  const PANEL_WIDTH_MAX = 1400;
+  // 面板宽度小于该值时内部 grid 降列（视口 media query 管不到浮层自身的宽度）
+  const PANEL_COMPACT_WIDTH = 620;
+  // 面板左右两侧最少留白（右 24px 初始定位 + 左 16px），用来算「视口限制下的最大宽度」
+  const PANEL_VIEWPORT_MARGIN = 40;
+
   // 版本号单一来源：改动时与文件头 @version 一并同步
-  const SCRIPT_VERSION = '0.3.3';
+  const SCRIPT_VERSION = '0.5.0';
 
   const PROCESS_API = '/soa-card/api/v1/bqcard/process/page';
   const POOL_API = '/soa-card/api/v1/card/business/pool/display';
 
+  // 单卡详情。**卡备注（remark）只有这里能拿到** —— 2026-09-15 实测：
+  // 卡池列表接口（card/business/pool/display、card/info/query）返回的字段里都没有 remark，
+  // 必须按卡号单独查一次。实测单次 250~330ms、响应约 18KB
+  // （大头是 packageList 的体检项目明细，请求侧去不掉），所以只在用户点开时才拉、且带缓存。
+  const CARD_DETAIL_API = '/soa-card/api/v1/bqcard/detail';
+  const CARD_REMARK_CONCURRENCY = 4;
+  // 一次弹窗最多自动拉多少张卡的备注。超过就只拉前这么多，余下的点开单卡时再补 ——
+  // 免得手一抖点了几百张就把请求打爆。
+  const CARD_REMARK_AUTO_LIMIT = 60;
+
   const PAGE_SIZE = 100;
-  const SERIAL_DIGITS = 5;
+
+  // 卡号结构（2026-09-15 用真实登录态实测确认，354/354 样本一致）：
+  //   年份(2) + 标识(3，如 X7A) + 活动码(6) + 序号(6) = 共 17 位
+  //   例：26X7A210373130076 = 26 | X7A | 210373 | 130076
+  // 分组键取「年份 + 标识 + 活动码」，即一个活动一组：
+  // 序号再涨也不会把同一活动拆到两个组里，查询边界也用原始卡号透传，不靠位数重建。
+  const CARD_HEAD_LEN = 5;
+  const ACTIVITY_LEN = 6;
+  const SERIAL_LEN = 6;
+  const CARD_NO_LEN = CARD_HEAD_LEN + ACTIVITY_LEN + SERIAL_LEN;
+
+  // 相邻白名单卡号之间的「空洞」宽度 <= 该阈值时，跨过去合并成同一段查询。
+  //
+  // 为什么取 100，而不是按实测 gap 分布取「双峰中间」：
+  //   跨过空洞的代价 = ceil(空洞内的卡数 / 100) 页；
+  //   而同一个号段里一个序号最多对应一张卡，所以  卡数 <= 空洞宽度。
+  //   => 空洞宽度 <= 100 时，跨过去最多只多 1 页，无论空洞里塞了多少卡。
+  //   这是唯一一条不依赖「当前数据长什么样」的安全边界，永远成立。
+  //
+  // 收益是省下 1~2 页（把两个小段并成一段），封顶；亏损按阈值线性放大。
+  // 实测（2026-09-15）阈值 10~9000 之间段数与页数完全一致（9 段 / 17 页），
+  // 所以压到 100 不损失任何收益，只是把最坏情况从 5 页压到 1 页。
+  const GAP_LIMIT = 100;
+
+  // 运行参数。concurrency 默认 1（等同串行，行为与旧版一致），调高可提速但请求更密集。
+  const RUN_CONFIG = {
+    concurrency: 1,
+    requestTimeoutMs: 15000,
+    maxRequestsPerRun: 60,
+    segmentRetries: 2,
+    minPaceMs: 150,
+  };
 
   const ORDER_NAMES = [
     '新乡邀约体验2026贵宾检',
@@ -270,6 +322,9 @@
     collapsed: false,
     observerTimer: 0,
     drag: null,
+    // 最近一次渲染的结果，供「单独重查某段」时做增量更新
+    lastData: null,
+    rechecking: false,
   };
 
   // ============================================================
@@ -284,8 +339,10 @@
     return location.hostname === 'checkup-soa3.health-100.cn';
   }
 
-  function pad5(n) {
-    return String(Math.max(0, Math.min(99999, Number(n) || 0))).padStart(SERIAL_DIGITS, '0');
+  // 仅用于把序号补成定长字符串做展示/兜底。查询边界不靠它重建，直接用原始卡号。
+  function padSerial(n) {
+    const max = Math.pow(10, SERIAL_LEN) - 1;
+    return String(Math.max(0, Math.min(max, Number(n) || 0))).padStart(SERIAL_LEN, '0');
   }
 
   function todayYmd() {
@@ -378,17 +435,31 @@
   // ============================================================
   // 2. 请求层
   // ============================================================
-  async function postJson(url, body) {
-    const res = await fetch(url, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        accept: 'application/json, text/plain, */*',
-        'content-type': 'application/json;charset=UTF-8',
-        mnclientid: 'MN_SOA3',
-      },
-      body: JSON.stringify(body),
-    });
+  async function postJson(url, body, timeoutMs = RUN_CONFIG.requestTimeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          accept: 'application/json, text/plain, */*',
+          'content-type': 'application/json;charset=UTF-8',
+          mnclientid: 'MN_SOA3',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        throw new Error(`请求超时（${timeoutMs}ms）`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} ${res.statusText || ''}`.trim());
@@ -403,6 +474,59 @@
 
   function getDataBlock(json) {
     return json?.data && typeof json.data === 'object' ? json.data : {};
+  }
+
+  // ============================================================
+  // 2.1 单卡详情（卡备注）—— 按需拉取 + 内存缓存 + 限并发
+  // ============================================================
+  // 「卡备注」= 制卡时在卡详情弹窗里填的那段文字，只存在于单卡详情接口，
+  // 卡池列表接口一律不返回（实测确认）。所以只能在用户点开时才逐张查。
+  // 实测同一批制卡的备注常常一模一样（连续 6 张都是「刘承业办理」），
+  // 但不能据此推断，仍然逐张取真实值。
+  const cardDetailCache = new Map();
+
+  async function fetchCardDetail(cardNo) {
+    const key = String(cardNo || '').trim();
+    if (!key) return { status: 'error', error: '空卡号' };
+    if (cardDetailCache.has(key)) return cardDetailCache.get(key);
+
+    try {
+      const json = await postJson(CARD_DETAIL_API, { regionCode: 'XX', cardNo: key });
+      const data = getDataBlock(json);
+      const detail = {
+        status: 'ok',
+        remark: String(data?.remark ?? '').trim(),
+        corpName: String(data?.corpName ?? '').trim(),
+        orderCode: String(data?.orderCode ?? '').trim(),
+        orderBeginDate: String(data?.orderBeginDate ?? '').trim(),
+        orderEndDate: String(data?.orderEndDate ?? '').trim(),
+        currentAmount: data?.currentAmount,
+        saleAmount: data?.saleAmount,
+      };
+      cardDetailCache.set(key, detail);
+      return detail;
+    } catch (err) {
+      // 失败**不写缓存**，下次点开还能重试
+      return { status: 'error', error: String(err?.message || err) };
+    }
+  }
+
+  // 限并发跑一批任务。worker 每张回来就回调一次 —— 界面可以边拉边填，
+  // 不用等整批跑完（几十张串行要十几秒，弹窗看着就像卡死了）。
+  async function mapWithConcurrency(list, concurrency, worker) {
+    const queue = Array.isArray(list) ? list.slice() : [];
+    if (!queue.length) return;
+
+    const size = Math.max(1, Math.min(Number(concurrency) || 1, queue.length));
+    const runners = new Array(size).fill(null).map(async () => {
+      for (;;) {
+        const item = queue.shift();
+        if (item === undefined) return;
+        await worker(item);
+      }
+    });
+
+    await Promise.all(runners);
   }
 
   async function fetchProcessOrder(orderName, startDate, endDate) {
@@ -506,15 +630,28 @@
   // ============================================================
   // 3. 审批卡号白名单与精确查询区间
   // ============================================================
+  // 结构化解析卡号：年份(2) + 标识(3) + 活动码(6) + 序号(6) = 17 位。
+  // 长度或分段不符合该结构的一律返回 null（旧版纯数字卡等不在本脚本查询范围内）。
   function splitCardNo(cardNo) {
     const text = String(cardNo || '').trim();
-    if (text.length <= SERIAL_DIGITS) return null;
-    const serialText = text.slice(-SERIAL_DIGITS);
-    if (!/^\d{5}$/.test(serialText)) return null;
+    if (text.length !== CARD_NO_LEN) return null;
+
+    const head = text.slice(0, CARD_HEAD_LEN);
+    const activity = text.slice(CARD_HEAD_LEN, CARD_HEAD_LEN + ACTIVITY_LEN);
+    const serialText = text.slice(-SERIAL_LEN);
+
+    if (!/^\d{2}[A-Za-z0-9]{3}$/.test(head)) return null;
+    if (!/^\d+$/.test(activity)) return null;
+    if (!/^\d+$/.test(serialText)) return null;
+
     return {
       cardNo: text,
-      prefix: text.slice(0, -SERIAL_DIGITS),
+      head,
+      activity,
+      // 分组键：年份 + 标识 + 活动码，一个活动一组
+      prefix: head + activity,
       serial: Number(serialText),
+      serialText,
     };
   }
 
@@ -528,6 +665,19 @@
     const warnings = [];
     const rawIntervals = [];
     const seenRecords = new Set();
+
+    // 白名单为什么必须按「区间并集」算，而不是把各条审批的卡数相加：
+    //   同一批号可能被反复申请 —— 跳号提交后作废、再重新提交，号码被复用，
+    //   于是同一个卡号会落在多条审批记录里。实测 177 条记录共 865 个号，
+    //   去重后是 861 个（重叠 4 个），差额就来自 3 条 INVALID（作废）记录与 ACCESS 记录重叠。
+    //   卡池侧不用操心重复：每个卡号在卡池里只出现一次（实测三个范围共 2072 张，跨范围重复 0），
+    //   所以「审批侧去重 + 卡池侧天然唯一」两边一对，汇总不会虚增也不会漏。
+    //
+    // 关于 processStatus：
+    //   实测取值只有 ACCESS(174) 和 INVALID(3)。INVALID 的区间 100% 被 ACCESS 覆盖，
+    //   所以过不过滤对白名单并集都没影响（都是 861）。这里选择不过滤 ——
+    //   万一将来某个作废记录覆盖了 ACCESS 没覆盖的号（作废前已制卡），过滤掉就会漏卡，
+    //   而多带几个号的代价几乎为零。该字段仅用于诊断展示。
 
     for (const item of processItems) {
       const recordKey = recordKeyOf(item);
@@ -543,22 +693,25 @@
       }
 
       if (begin.prefix !== end.prefix) {
-        warnings.push(`审批区间跨前缀，暂不自动拆分：${begin.cardNo} ~ ${end.cardNo}`);
+        warnings.push(`审批区间跨越活动或年份，暂不自动拆分：${begin.cardNo} ~ ${end.cardNo}`);
         continue;
       }
 
       let startSerial = begin.serial;
       let endSerial = end.serial;
+      let startCardNo = begin.cardNo;
+      let endCardNo = end.cardNo;
       if (startSerial > endSerial) {
         warnings.push(`审批区间起止倒置，已自动交换：${begin.cardNo} ~ ${end.cardNo}`);
         [startSerial, endSerial] = [endSerial, startSerial];
+        [startCardNo, endCardNo] = [endCardNo, startCardNo];
       }
 
       const lengthByRange = endSerial - startSerial + 1;
       const cardNum = Number(item?.cardNum || 0) || 0;
       if (cardNum > 0 && cardNum !== lengthByRange) {
         warnings.push(
-          `cardNum与卡号区间长度不一致：${begin.prefix}${pad5(startSerial)} ~ ${begin.prefix}${pad5(endSerial)}，cardNum=${cardNum}，区间=${lengthByRange}`
+          `cardNum与卡号区间长度不一致：${startCardNo} ~ ${endCardNo}，cardNum=${cardNum}，区间=${lengthByRange}`
         );
       }
 
@@ -566,10 +719,13 @@
         recordKey,
         id: item?.id ?? null,
         prefix: begin.prefix,
+        head: begin.head,
+        activity: begin.activity,
         startSerial,
         endSerial,
-        beginNo: `${begin.prefix}${pad5(startSerial)}`,
-        endNo: `${begin.prefix}${pad5(endSerial)}`,
+        // 查询边界保留审批记录里的原始卡号，不做补零重建，避免位数假设出错
+        beginNo: startCardNo,
+        endNo: endCardNo,
         rangeCardCount: lengthByRange,
         cardNum,
         cardType: String(item?.cardType || ''),
@@ -609,28 +765,31 @@
         a.startSerial - b.startSerial || a.endSerial - b.endSerial
       );
 
-      // 白名单的“应有卡号”按区间并集计算，避免审批记录重叠时重复计数。
-      const whitelistSerials = new Set();
-      for (const it of intervals) {
-        for (let n = it.startSerial; n <= it.endSerial; n += 1) {
-          whitelistSerials.add(n);
-        }
-      }
+      // 白名单应有卡数：按区间并集直接算长度，不逐号展开成字符串集合
+      // （跨度大时不会瞬间生成几万个字符串对象）。
+      const whitelistTotal = unionLength(intervals);
 
-      // 只合并真正重叠或首尾连续的审批区间。中间只要有一个卡号未出现在审批白名单里，就不跨过去。
+      // 合并判据：相邻区间之间的空洞 <= GAP_LIMIT 就跨过去合并成一段。
+      // 空洞里可能堆着别的订单的卡（实测最多一段 1427 张），
+      // 那些卡查回来会被 isCardInWhitelist 过滤掉，代价只是多占一点页容量。
       const merged = [];
       for (const it of intervals) {
         const last = merged[merged.length - 1];
-        if (!last || it.startSerial > last.endSerial + 1) {
+        if (!last || it.startSerial > last.endSerial + GAP_LIMIT) {
           merged.push({
             prefix: group.prefix,
             startSerial: it.startSerial,
             endSerial: it.endSerial,
+            beginNo: it.beginNo,
+            endNo: it.endNo,
             sourceRecords: [it],
           });
         } else {
-          last.endSerial = Math.max(last.endSerial, it.endSerial);
           last.sourceRecords.push(it);
+          if (it.endSerial > last.endSerial) {
+            last.endSerial = it.endSerial;
+            last.endNo = it.endNo;
+          }
         }
       }
 
@@ -645,7 +804,7 @@
         processCardNum: cardNumSum,
         rawIntervalCount: intervals.length,
         mergedTaskCount: merged.length,
-        whitelistCardCount: whitelistSerials.size,
+        whitelistCardCount: whitelistTotal,
         firstBindTime: bindTimes[0] || '',
         lastBindTime: bindTimes[bindTimes.length - 1] || '',
       });
@@ -656,11 +815,13 @@
           prefix: group.prefix,
           cardTypes: [...group.cardTypes].sort(),
           orderNames: [...group.orderNames].sort(),
-          queryStart: `${group.prefix}${pad5(m.startSerial)}`,
-          queryEnd: `${group.prefix}${pad5(m.endSerial)}`,
+          // 原始卡号直接透传：queryStart/queryEnd 就是审批记录里的写法，不做位数重建
+          queryStart: m.beginNo,
+          queryEnd: m.endNo,
           startSerial: m.startSerial,
           endSerial: m.endSerial,
-          whitelistCardCount: m.endSerial - m.startSerial + 1,
+          // 本段真实白名单卡数（区间并集长度），不含被顺带合并进来的空洞
+          whitelistCardCount: unionLength(m.sourceRecords),
           sourceRecordCount: m.sourceRecords.length,
           sourceRecordIds: m.sourceRecords.map((x) => x.recordKey),
         });
@@ -689,14 +850,45 @@
     return false;
   }
 
-  function buildExpectedCardSet(rawIntervals) {
-    const expected = new Set();
-    for (const it of rawIntervals) {
-      for (let n = it.startSerial; n <= it.endSerial; n += 1) {
-        expected.add(`${it.prefix}${pad5(n)}`);
+  // 同一前缀内若干区间的并集长度（去重后的卡数）。
+  // 直接对区间端点做运算，不逐号展开成字符串，跨度再大也只是几段相加。
+  function unionLength(intervals) {
+    if (!intervals.length) return 0;
+
+    const list = intervals.slice().sort((a, b) =>
+      a.startSerial - b.startSerial || a.endSerial - b.endSerial
+    );
+
+    let total = 0;
+    let curStart = list[0].startSerial;
+    let curEnd = list[0].endSerial;
+
+    for (let i = 1; i < list.length; i += 1) {
+      const it = list[i];
+      if (it.startSerial <= curEnd + 1) {
+        if (it.endSerial > curEnd) curEnd = it.endSerial;
+      } else {
+        total += curEnd - curStart + 1;
+        curStart = it.startSerial;
+        curEnd = it.endSerial;
       }
     }
-    return expected;
+
+    total += curEnd - curStart + 1;
+    return total;
+  }
+
+  // 审批白名单去重后的卡数（跨前缀累计）。
+  function countExpectedCards(rawIntervals) {
+    const byPrefix = new Map();
+    for (const it of rawIntervals) {
+      if (!byPrefix.has(it.prefix)) byPrefix.set(it.prefix, []);
+      byPrefix.get(it.prefix).push(it);
+    }
+
+    let total = 0;
+    for (const list of byPrefix.values()) total += unionLength(list);
+    return total;
   }
 
   // ============================================================
@@ -762,9 +954,105 @@
     return labels[key] || '其他';
   }
 
+  // 卡种展示顺序：贵宾 / 邀约 / 核磁 / CT（「其他」垫底兜底）。
+  // 2026-09-15 红领巾指定，这里是**全脚本唯一来源** —— 顶部汇总卡、上方「领取卡类及状态」
+  // 表、下方「各部门 / 各人领取进度」表的列，全部由这个数组排出来，改这一处即全站一致。
+  const FIXED_CARD_CATEGORIES = ['贵宾', '邀约', '核磁', 'CT'];
+  const CARD_CATEGORY_ORDER = [...FIXED_CARD_CATEGORIES, '其他'];
+
+  // 把一批卡按卡种聚合，返回**全键**计数（没出现的卡种补 0）。
+  // v0.4.0 只返回出现过的卡种（数组）。那时卡种是缀在姓名后面的小标签，缺项无所谓；
+  // 现在卡种是固定列，缺一个键整行数量就会左移一格、列语义全错 —— 必须给全键。
+  function countCardsByCategory(cards) {
+    const counts = Object.fromEntries(CARD_CATEGORY_ORDER.map((category) => [category, 0]));
+
+    for (const card of Array.isArray(cards) ? cards : []) {
+      const category = getCardCategoryLabel(card?.activity_name);
+      if (Object.prototype.hasOwnProperty.call(counts, category)) counts[category] += 1;
+    }
+
+    return counts;
+  }
+
+  // 一次遍历把卡按领取人分好组，避免「每人再过滤一遍全部卡」（O(人数 × 卡数)）。
+  function groupCardsBySaleName(cards) {
+    const grouped = new Map();
+
+    for (const card of Array.isArray(cards) ? cards : []) {
+      const name = getCardSaleName(card);
+      if (!name) continue;
+      if (!grouped.has(name)) grouped.set(name, []);
+      grouped.get(name).push(card);
+    }
+
+    return grouped;
+  }
+
+  // 表头用哪几列卡种：固定四列；只有真的出现「其他」（储值卡 / 电商卡等非制卡类）时才多一列，
+  // 免得为个位数把四列主体结构挤变形。列集合是整表统一的，不存在逐行漂移。
+  function getCategoryColumns(items) {
+    const hasOther = (Array.isArray(items) ? items : [])
+      .some((item) => Number(item?.categoryCounts?.['其他'] || 0) > 0);
+
+    return hasOther ? CARD_CATEGORY_ORDER.slice() : FIXED_CARD_CATEGORIES.slice();
+  }
+
+  // 进度表（部门视角 / 个人视角共用）：**表头 = 卡类型，每行 = 对应数量**。
+  // 用真表格而不是 grid + 行内小标签 —— v0.4.0 把「贵宾36 邀约4」缀在姓名后面，
+  // 词组长度逐行不同，肉眼扫读很难归成列，"哪一格是什么"全靠脑补，就是红领巾说的视觉误差。
+  // table + table-layout:fixed 下，列宽由表头定死、跟内容无关，跨行严格对齐。
+  function buildProgressTableHtml(items, options) {
+    const list = Array.isArray(items) ? items : [];
+    const columns = getCategoryColumns(list);
+    const nameHead = options?.nameHead || '姓名';
+    const getName = typeof options?.getName === 'function' ? options.getName : (item) => item?.name || '';
+    // 名字格做成可点跳转（部门视角跳到该部门、个人视角跳到该人）。
+    // 具体挂什么 data 属性由调用方给 —— 这里只负责渲染，不猜跳转目标。
+    const jumpAttr = typeof options?.jumpAttr === 'function' ? options.jumpAttr : null;
+
+    const headHtml = `
+      <tr>
+        <th class="hlj-col-name">${escapeHtml(nameHead)}</th>
+        ${columns.map((category) => `<th class="hlj-col-cat">${escapeHtml(category)}</th>`).join('')}
+        <th class="hlj-col-stat">总数</th>
+        <th class="hlj-col-stat">已办</th>
+        <th class="hlj-col-stat">剩余 / 超出</th>
+      </tr>
+    `;
+
+    const bodyHtml = list.map((item) => {
+      const counts = item?.categoryCounts || {};
+      const overPlan = Number(item?.overPlan || 0);
+      const balance = Number(item?.balance || 0);
+      // 超出计划、或余额为 0（没额度了）：整行铺浅红，跟下拉列表的告警行一套视觉。
+      const alertClass = overPlan > 0 || balance === 0 ? ' is-alert' : '';
+      const nameText = String(getName(item));
+      const nameCell = jumpAttr
+        ? `<span class="hlj-jump-link" role="button" tabindex="0"${jumpAttr(item)}>${escapeHtml(nameText)}</span>`
+        : escapeHtml(nameText);
+
+      return `
+        <tr class="${alertClass.trim()}">
+          <td class="hlj-col-name" title="${escapeHtml(nameText)}">${nameCell}</td>
+          ${columns.map((category) => {
+            const value = Number(counts[category] || 0);
+            return `<td class="hlj-col-cat${value === 0 ? ' is-zero' : ''}">${value}</td>`;
+          }).join('')}
+          <td class="hlj-col-stat">${Number(item?.plan || 0)}</td>
+          <td class="hlj-col-stat">${Number(item?.current || 0)}</td>
+          <td class="hlj-col-stat ${overPlan > 0 ? 'is-over' : (balance > 0 ? 'is-remaining' : 'is-zero')}">
+            ${overPlan > 0 ? '超出' : '剩余'} <b>${overPlan > 0 ? overPlan : balance}</b>
+          </td>
+        </tr>
+      `;
+    }).join('');
+
+    return `<table class="hlj-progress-table"><thead>${headHtml}</thead><tbody>${bodyHtml}</tbody></table>`;
+  }
+
   function summarizePersonnelCardRows(cards) {
     const statusOrder = ['生效中', '已预约', '已核销', '冻结', '作废'];
-    const categoryOrder = ['核磁', 'CT', '邀约', '贵宾', '其他'];
+    const categoryOrder = CARD_CATEGORY_ORDER;
     const rows = new Map();
 
     for (const card of Array.isArray(cards) ? cards : []) {
@@ -818,12 +1106,16 @@
       : `${done}/${total} · 余${remain}`;
   }
 
+  // 部门 / 个人两种视角的进度：都带一份「卡种分布」，
+  // 由行内那排小标签渲染（放在姓名与汇总量之间）。
   function buildDepartmentProgress(cards) {
+    const grouped = groupCardsBySaleName(cards);
+
     return DEPARTMENT_ORDER.map((department) => {
       const people = PERSONNEL_PLAN.filter((item) => item.department === department);
       const plan = getPlanForPeople(people);
-      const names = new Set(people.map((item) => item.name));
-      const current = countCardsForNames(cards, names);
+      const deptCards = people.flatMap((item) => grouped.get(item.name) || []);
+      const current = deptCards.length;
 
       return {
         department,
@@ -833,6 +1125,7 @@
         balance: Math.max(0, plan - current),
         overPlan: Math.max(0, current - plan),
         progressText: getProgressText(current, plan),
+        categoryCounts: countCardsByCategory(deptCards),
       };
     });
   }
@@ -843,9 +1136,11 @@
         department === '全部部门' ||
         item.department === department
     );
+    const grouped = groupCardsBySaleName(cards);
 
     return people.map((item) => {
-      const current = countCardsForNames(cards, [item.name]);
+      const personCards = grouped.get(item.name) || [];
+      const current = personCards.length;
       const plan = Number(item.plan || 0);
 
       return {
@@ -854,6 +1149,7 @@
         balance: Math.max(0, plan - current),
         overPlan: Math.max(0, current - plan),
         progressText: getProgressText(current, plan),
+        categoryCounts: countCardsByCategory(personCards),
       };
     });
   }
@@ -941,7 +1237,7 @@
   }
 
   async function runDetection() {
-    if (state.running) return;
+    if (state.running || state.rechecking) return;
     state.running = true;
     refreshButtons();
 
@@ -985,14 +1281,12 @@
       }
 
       const matchedCards = new Map();
-      const rangeResults = [];
+      let rangeResults = new Array(tasks.length).fill(null);
+      let requestUsed = 0;
 
-      for (let i = 0; i < tasks.length; i += 1) {
-        const task = tasks[i];
-        const label = `精确查询 ${i + 1}/${tasks.length}：${task.queryStart} ~ ${task.queryEnd}`;
-        const pool = await fetchPoolRange(task, label);
-
-        let matchedInTask = 0;
+      // 把一段卡池结果并进全局汇总。按段独立计数，与执行顺序无关。
+      const collectPool = (task, pool) => {
+        const inTask = new Set();
         let rejectedInTask = 0;
 
         for (const card of pool.items) {
@@ -1000,31 +1294,88 @@
           if (!no) continue;
 
           if (isCardInWhitelist(no, intervalsByPrefix)) {
-            if (!matchedCards.has(no)) matchedInTask += 1;
+            inTask.add(no);
             matchedCards.set(no, card);
           } else {
             rejectedInTask += 1;
           }
         }
 
-        rangeResults.push({
+        return {
           ...task,
           poolTotalNum: pool.totalNum,
           poolFetched: pool.fetched,
           poolUniqueCards: pool.uniqueCards,
           poolPages: pool.pages,
-          matchedUniqueCards: matchedInTask,
+          matchedUniqueCards: inTask.size,
           rejectedUniqueCards: rejectedInTask,
-        });
+          failed: false,
+          error: '',
+        };
+      };
 
-        if (i < tasks.length - 1) {
-          // 精确区间通常页数不多。仍保留轻微节奏控制，连续多段后额外停顿一次。
-          await sleep(randomMs(100, 180));
-          if ((i + 1) % 8 === 0) {
-            await sleep(randomMs(650, 950));
+      const emptyResult = (task, message) => ({
+        ...task,
+        poolTotalNum: 0,
+        poolFetched: 0,
+        poolUniqueCards: 0,
+        poolPages: 0,
+        matchedUniqueCards: 0,
+        rejectedUniqueCards: 0,
+        failed: true,
+        error: message,
+      });
+
+      // 单段执行：失败自动重试，仍失败就标记该段未取到，其余段继续跑。
+      const runOneTask = async (task, index) => {
+        const label = `精确查询 ${index + 1}/${tasks.length}：${task.queryStart} ~ ${task.queryEnd}`;
+
+        for (let attempt = 0; attempt <= RUN_CONFIG.segmentRetries; attempt += 1) {
+          if (requestUsed >= RUN_CONFIG.maxRequestsPerRun) {
+            return emptyResult(task, `已达单次请求预算上限（${RUN_CONFIG.maxRequestsPerRun} 次）`);
+          }
+
+          try {
+            if (attempt > 0) {
+              setStatus(`${label}，第 ${attempt + 1} 次尝试…`, 'running');
+              await sleep(400 * attempt + randomMs(0, 200));
+            }
+            const pool = await fetchPoolRange(task, label);
+            requestUsed += pool.pages;
+            return collectPool(task, pool);
+          } catch (err) {
+            if (attempt >= RUN_CONFIG.segmentRetries) {
+              return emptyResult(task, String(err?.message || err));
+            }
           }
         }
-      }
+
+        return emptyResult(task, '未知错误');
+      };
+
+      // 段级并发闸门。默认 1（串行，与旧版行为一致），调高才并行。
+      const concurrency = Math.max(1, Math.min(6, Number(RUN_CONFIG.concurrency) || 1));
+      let cursor = 0;
+
+      const worker = async () => {
+        while (cursor < tasks.length) {
+          const index = cursor;
+          cursor += 1;
+
+          rangeResults[index] = await runOneTask(tasks[index], index);
+
+          if (concurrency === 1 && cursor < tasks.length) {
+            await sleep(RUN_CONFIG.minPaceMs + randomMs(0, 60));
+          }
+        }
+      };
+
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker())
+      );
+
+      rangeResults = rangeResults.filter(Boolean);
+      const failedResults = rangeResults.filter((x) => x.failed);
 
       const cards = [...matchedCards.values()].sort((a, b) => {
         const aa = String(a?.card_no || a?.cardNo || '');
@@ -1032,23 +1383,7 @@
         return aa.localeCompare(bb);
       });
 
-      const foundCardNos = new Set(matchedCards.keys());
-
-      const groupResultMap = new Map(
-        groupSummary.map((g) => [g.prefix, {
-          ...g,
-          foundCardCount: 0,
-        }])
-      );
-
-      for (const cardNo of foundCardNos) {
-        const parsed = splitCardNo(cardNo);
-        if (parsed && groupResultMap.has(parsed.prefix)) {
-          groupResultMap.get(parsed.prefix).foundCardCount += 1;
-        }
-      }
-
-      const finalGroupSummary = [...groupResultMap.values()].sort((a, b) => a.prefix.localeCompare(b.prefix));
+      const finalGroupSummary = withFoundCounts(groupSummary, cards);
 
       const approvalCardNumSum = orderResults
         .flatMap((x) => x.items || [])
@@ -1061,18 +1396,29 @@
         queryPeriod: { startDate, endDate },
         config: {
           pageSize: PAGE_SIZE,
-          serialDigits: SERIAL_DIGITS,
+          serialDigits: SERIAL_LEN,
+          gapLimit: GAP_LIMIT,
+          concurrency: RUN_CONFIG.concurrency,
           orderNames: ORDER_NAMES.slice(),
-          queryMode: '审批白名单 + 仅合并连续/重叠区间 + 查询后再次白名单过滤',
+          queryMode: `审批白名单 + 按卡号空洞合并（gap<=${GAP_LIMIT}）+ 查询后再次白名单过滤`,
         },
         orderSummary: orderResults.map(summarizeOrder),
         processRecordCount: allProcessItems.length,
         approvalCardNumSum,
-        approvalDistinctCardCount: buildExpectedCardSet(rawIntervals).size,
+        approvalDistinctCardCount: countExpectedCards(rawIntervals),
         foundDistinctCardCount: cards.length,
         rawIntervals,
         groupSummary: finalGroupSummary,
         rangeTasks: rangeResults,
+        failedSegmentCount: failedResults.length,
+        failedSegments: failedResults.map((x) => ({
+          taskId: x.taskId,
+          queryStart: x.queryStart,
+          queryEnd: x.queryEnd,
+          error: x.error,
+        })),
+        requestUsed,
+        partial: failedResults.length > 0,
         mainCategorySummary: summarizeMainCardCategories(cards),
         cardSummary: summarizeCards(cards),
         cards,        warnings,
@@ -1082,8 +1428,10 @@
       saveCache(data);
       renderResult(data);
       setStatus(
-        `查询完成：本次共整理 ${cards.length} 张卡池数据。`,
-        'success'
+        failedResults.length
+          ? `查询完成（部分数据）：整理 ${cards.length} 张，另有 ${failedResults.length} 段未取到，可在面板单独重查。`
+          : `查询完成：本次共整理 ${cards.length} 张卡池数据，共 ${requestUsed} 个请求。`,
+        failedResults.length ? 'error' : 'success'
       );
 
       setTimeout(() => {
@@ -1095,6 +1443,131 @@
       setStatus(`查询失败：${err?.message || err}。旧缓存未覆盖。`, 'error');
     } finally {
       state.running = false;
+      refreshButtons();
+    }
+  }
+
+  // ============================================================
+  // 4.5 结果后处理与单段重查
+  // ============================================================
+  // 重算每个活动分组里实际查到的卡数。
+  function withFoundCounts(groupSummary, cards) {
+    const map = new Map(groupSummary.map((g) => [g.prefix, { ...g, foundCardCount: 0 }]));
+
+    for (const card of cards) {
+      const no = String(card?.card_no || card?.cardNo || '').trim();
+      if (!no) continue;
+      const parsed = splitCardNo(no);
+      if (parsed && map.has(parsed.prefix)) {
+        map.get(parsed.prefix).foundCardCount += 1;
+      }
+    }
+
+    return [...map.values()].sort((a, b) => a.prefix.localeCompare(b.prefix));
+  }
+
+  // 单独重查某一失败段：只更新这一段，已成功获取的其他段不做调整。
+  async function requerySegment(taskId) {
+    const data = state.lastData;
+    if (!data || state.running || state.rechecking) return;
+
+    const ranges = Array.isArray(data.rangeTasks) ? data.rangeTasks.slice() : [];
+    const index = ranges.findIndex((x) => x && x.taskId === taskId);
+    if (index < 0) return;
+
+    const task = ranges[index];
+    state.rechecking = true;
+    refreshButtons();
+    setStatus(`单独重查：${task.queryStart} ~ ${task.queryEnd}`, 'running');
+
+    try {
+      const intervalsByPrefix = new Map();
+      for (const it of (Array.isArray(data.rawIntervals) ? data.rawIntervals : [])) {
+        if (!intervalsByPrefix.has(it.prefix)) intervalsByPrefix.set(it.prefix, []);
+        intervalsByPrefix.get(it.prefix).push(it);
+      }
+      for (const list of intervalsByPrefix.values()) {
+        list.sort((a, b) => a.startSerial - b.startSerial || a.endSerial - b.endSerial);
+      }
+
+      const pool = await fetchPoolRange(task, `单独重查：${task.queryStart} ~ ${task.queryEnd}`);
+
+      const inTask = new Set();
+      const fetched = new Map();
+      let rejected = 0;
+
+      for (const card of pool.items) {
+        const no = String(card?.card_no || card?.cardNo || '').trim();
+        if (!no) continue;
+
+        if (isCardInWhitelist(no, intervalsByPrefix)) {
+          inTask.add(no);
+          fetched.set(no, card);
+        } else {
+          rejected += 1;
+        }
+      }
+
+      ranges[index] = {
+        ...task,
+        poolTotalNum: pool.totalNum,
+        poolFetched: pool.fetched,
+        poolUniqueCards: pool.uniqueCards,
+        poolPages: pool.pages,
+        matchedUniqueCards: inTask.size,
+        rejectedUniqueCards: rejected,
+        failed: false,
+        error: '',
+      };
+
+      // 只把这一段的结果并进去，已成功获取的其他段原样保留
+      const merged = new Map();
+      for (const card of (Array.isArray(data.cards) ? data.cards : [])) {
+        const no = String(card?.card_no || card?.cardNo || '').trim();
+        if (no) merged.set(no, card);
+      }
+      for (const [no, card] of fetched) merged.set(no, card);
+
+      const cards = [...merged.values()].sort((a, b) =>
+        String(a?.card_no || a?.cardNo || '').localeCompare(String(b?.card_no || b?.cardNo || ''))
+      );
+
+      const failed = ranges.filter((x) => x && x.failed);
+
+      const nextData = {
+        ...data,
+        version: SCRIPT_VERSION,
+        updatedAt: nowText(),
+        cards,
+        rangeTasks: ranges,
+        foundDistinctCardCount: cards.length,
+        failedSegmentCount: failed.length,
+        failedSegments: failed.map((x) => ({
+          taskId: x.taskId,
+          queryStart: x.queryStart,
+          queryEnd: x.queryEnd,
+          error: x.error,
+        })),
+        partial: failed.length > 0,
+        mainCategorySummary: summarizeMainCardCategories(cards),
+        cardSummary: summarizeCards(cards),
+        groupSummary: withFoundCounts(Array.isArray(data.groupSummary) ? data.groupSummary : [], cards),
+      };
+
+      saveCache(nextData);
+      renderResult(nextData);
+
+      setStatus(
+        failed.length
+          ? `该段已重查完成，仍有 ${failed.length} 段未取到。`
+          : '该段已重查完成，数据已补齐。',
+        failed.length ? 'error' : 'success'
+      );
+    } catch (err) {
+      console.error('[卡类汇总] 单独重查失败：', err);
+      setStatus(`单独重查失败：${err?.message || err}`, 'error');
+    } finally {
+      state.rechecking = false;
       refreshButtons();
     }
   }
@@ -1166,6 +1639,73 @@
         text-rendering:optimizeLegibility;
       }
       #${IDS.panel} button { font-family:inherit; }
+
+      /* 面板右上角的竖向把手：左右拖动调整面板宽度，双击恢复默认。
+         放在头部下方（top 52px）是为了不压住头部右侧的「重新查询/折叠/关闭」按钮。
+         拖动时由 JS 把面板从 right 定位切成 left 定位 —— 这样右边缘（也就是把手）
+         才会跟着鼠标走；否则 right 钉死，拖动手感是反的。 */
+      #${IDS.panel} .hlj-resize-handle {
+        position:absolute;
+        top:52px;
+        right:0;
+        width:9px;
+        height:72px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        border:1px solid #cbd5e1;
+        border-right:0;
+        border-radius:5px 0 0 5px;
+        background:#e8edf4;
+        cursor:ew-resize;
+        opacity:.7;
+        transition:opacity .12s ease, background .12s ease;
+        touch-action:none;
+        z-index:2;
+      }
+
+      /* 三条短横纹，一眼看出这是可以拖的栅格条 */
+      #${IDS.panel} .hlj-resize-handle::before {
+        content:'';
+        width:3px;
+        height:34px;
+        border-radius:2px;
+        background:repeating-linear-gradient(180deg,#94a3b8 0 2px,transparent 2px 5px);
+      }
+
+      #${IDS.panel} .hlj-resize-handle:hover,
+      #${IDS.panel} .hlj-resize-handle.is-active {
+        opacity:1;
+        background:#dbe3ed;
+      }
+
+      /* 面板被拖窄时内部降列。
+         面板里的响应式现在是按「视口宽度」写的 media query，浮层自己变窄它不会响应，
+         所以按面板实际宽度再切一档（JS 加 .is-compact）。
+         特异性 (1,2,0) 高于 #panel .hlj-kpis 的 (1,1,0)，也高于 media query 里同选择器。 */
+      #${IDS.panel}.is-compact .hlj-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      #${IDS.panel}.is-compact .hlj-main-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      #${IDS.panel}.is-compact .hlj-detail-grid { grid-template-columns:1fr; }
+      #${IDS.panel}.is-compact .hlj-detail-meta { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      #${IDS.panel}.is-compact .hlj-personnel-head { flex-direction:column; align-items:flex-start; }
+      #${IDS.panel}.is-compact .hlj-personnel-scope-hint { margin-left:0; margin-top:4px; }
+      #${IDS.panel}.is-compact .hlj-personnel-selects { width:100%; flex-wrap:wrap; }
+      #${IDS.panel}.is-compact .hlj-personnel-select { flex:1 1 0; width:auto; min-width:0; }
+      /* 窄面板：搜索框单独占一行（两个下拉保持原样，不跟它挤） */
+      #${IDS.panel}.is-compact .hlj-person-search { flex:1 1 100%; width:auto; }
+      /* v0.4.1：窄面板下进度表（真表格）的列宽与字号一起收一档。
+         420px 面板实测：卡种 4×40 + 数字 3×54 = 322px，姓名列还剩约 70px，不溢出。 */
+      #${IDS.panel}.is-compact .hlj-progress-table th,
+      #${IDS.panel}.is-compact .hlj-progress-table td { padding:4px 4px; font-size:10px; }
+      #${IDS.panel}.is-compact .hlj-progress-table .hlj-col-cat { width:40px; }
+      #${IDS.panel}.is-compact .hlj-progress-table .hlj-col-stat { width:54px; }
+      /* 窄档最后一列表头「剩余 / 超出」放不进 54px，允许折成两行 ——
+         被截成「剩余 / 超…」比折行更难认。只放开表头，单元格仍 nowrap。 */
+      #${IDS.panel}.is-compact .hlj-progress-table thead th {
+        white-space:normal;
+        word-break:keep-all;
+        line-height:1.05;
+      }
       #${IDS.panel} .hlj-head {
         display:flex; align-items:center; justify-content:space-between; gap:10px;
         padding:8px 12px; background:#f8fafc;
@@ -1425,14 +1965,21 @@
         color:#15803d;
       }
 
-      #${IDS.panel} .hlj-personnel-kpi.is-empty {
-        border-color:#e2e8f0;
-        background:#f8fafc;
+      /* 余额为 0：额度已经用完（但没超）。
+         业务上这是「不能再申请了」，属于需要立刻看见的状态，所以跟超出一样走红色，
+         只是文案不同（「剩余 0」vs「超出 N」）。 */
+      #${IDS.panel} .hlj-personnel-kpi.is-zero {
+        border-color:#fecaca;
+        background:#fff7f7;
+        box-shadow:0 0 0 1px rgba(220,38,38,.03);
       }
 
-      #${IDS.panel} .hlj-personnel-kpi.is-empty .hlj-personnel-kpi-label,
-      #${IDS.panel} .hlj-personnel-kpi.is-empty .hlj-personnel-kpi-value {
-        color:#64748b;
+      #${IDS.panel} .hlj-personnel-kpi.is-zero .hlj-personnel-kpi-label {
+        color:#dc2626;
+      }
+
+      #${IDS.panel} .hlj-personnel-kpi.is-zero .hlj-personnel-kpi-value {
+        color:#b91c1c;
       }
 
       #${IDS.panel} .hlj-personnel-kpi.is-over {
@@ -1586,43 +2133,133 @@
         font-weight:600;
       }
 
-      #${IDS.panel} .hlj-department-row {
-        display:grid;
-        grid-template-columns:minmax(88px,1.2fr) repeat(3,minmax(68px,.8fr));
-        align-items:center;
-        gap:8px;
-        padding:8px 10px;
-        border-bottom:1px solid #eef2f6;
-        font-size:11px;
+      /* v0.4.1：进度表改真表格 —— 表头是卡类型，行里是数量，跟上方「领取卡类及状态」一套读法。
+         v0.4.0 把「贵宾36 邀约4」这类小标签缀在姓名后面，词组长度逐行不同，
+         肉眼扫读时根本归不成列，"哪一格是什么"全靠脑补 —— 这就是红领巾说的视觉误差。
+         table-layout:fixed 让列宽由表头定死、与内容无关，跨行严格对齐。 */
+      #${IDS.panel} .hlj-progress-table {
+        width:100%;
+        table-layout:fixed;
+        border-collapse:collapse;
       }
 
-      #${IDS.panel} .hlj-department-row:last-child {
+      #${IDS.panel} .hlj-progress-table th,
+      #${IDS.panel} .hlj-progress-table td {
+        padding:5px 6px;
+        font-size:11px;
+        line-height:1.2;
+        text-align:center;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        font-variant-numeric:tabular-nums;
+      }
+
+      #${IDS.panel} .hlj-progress-table thead th {
+        border-bottom:1px solid #e2e8f0;
+        background:#fbfcfe;
+        color:#64748b;
+        font-size:10px;
+        font-weight:800;
+      }
+
+      #${IDS.panel} .hlj-progress-table tbody td {
+        border-bottom:1px solid #eef2f6;
+        color:#475569;
+      }
+
+      #${IDS.panel} .hlj-progress-table tbody tr:last-child td {
         border-bottom:0;
       }
 
-      #${IDS.panel} .hlj-department-name {
+      /* 固定列宽：卡种列与数字列写死，姓名列不设宽 ——
+         fixed 布局会把剩下的宽度整段交给它，列宽因此与内容无关。 */
+      #${IDS.panel} .hlj-progress-table .hlj-col-name {
+        width:auto;
+        text-align:left;
         color:#334155;
         font-weight:800;
       }
 
-      #${IDS.panel} .hlj-department-stat {
-        text-align:right;
-        color:#64748b;
-        font-variant-numeric:tabular-nums;
+      #${IDS.panel} .hlj-progress-table .hlj-col-cat {
+        width:56px;
       }
 
-      #${IDS.panel} .hlj-department-stat b {
+      #${IDS.panel} .hlj-progress-table .hlj-col-stat {
+        width:66px;
+      }
+
+      /* 没领的卡种写 0 而不是留空：留空会被误读成「数据没取到」。
+         灰一档，不跟真实数量抢视线。 */
+      #${IDS.panel} .hlj-progress-table .hlj-col-cat.is-zero {
+        color:#c3cad4;
+      }
+
+      /* 余额告警（超出 / 剩余 0）整行铺一层浅红：
+         密集列表里只给数字换色不够跳，整行着色才能一眼扫出来是哪一条。 */
+      #${IDS.panel} .hlj-progress-table tr.is-alert td {
+        background:#fef2f2;
+      }
+
+      #${IDS.panel} .hlj-progress-table tr.is-alert .hlj-col-name {
+        color:#991b1b;
+      }
+
+      #${IDS.panel} .hlj-progress-table .hlj-col-stat b {
         margin-left:3px;
         color:#1f2937;
         font-size:12px;
       }
 
-      #${IDS.panel} .hlj-department-stat.is-remaining b {
+      #${IDS.panel} .hlj-progress-table .hlj-col-stat.is-remaining b {
         color:#15803d;
       }
 
-      #${IDS.panel} .hlj-department-stat.is-over b {
+      #${IDS.panel} .hlj-progress-table .hlj-col-stat.is-over b {
         color:#b91c1c;
+      }
+
+      /* 「剩余 0」的数字同样标红：绿色代表「还有额度」，0 是误导。 */
+      #${IDS.panel} .hlj-progress-table .hlj-col-stat.is-zero b {
+        color:#b91c1c;
+      }
+
+      /* 进度表里的部门名 / 人名：可点跳转。
+         用 span 而不是 button —— button 会带上浏览器默认样式，还得整段重置。 */
+      #${IDS.panel} .hlj-jump-link {
+        color:#334155;
+        font-weight:800;
+        cursor:pointer;
+        border-bottom:1px dashed transparent;
+      }
+
+      #${IDS.panel} .hlj-jump-link:hover,
+      #${IDS.panel} .hlj-jump-link:focus-visible {
+        color:#1d4ed8;
+        border-bottom-color:#93c5fd;
+        outline:none;
+      }
+
+      /* 卡类矩阵里的数字：数量格（粗体 b）与状态格（胶囊 span）都可点开对应卡片 */
+      #${IDS.panel} .hlj-count-value {
+        color:#1f2937;
+        font-weight:800;
+        font-variant-numeric:tabular-nums;
+      }
+
+      #${IDS.panel} .hlj-count-value.is-clickable,
+      #${IDS.panel} .hlj-status-value.is-clickable {
+        cursor:pointer;
+      }
+
+      #${IDS.panel} .hlj-count-value.is-clickable:hover {
+        color:#1d4ed8;
+        text-decoration:underline;
+      }
+
+      #${IDS.panel} .hlj-status-value.is-clickable:hover {
+        box-shadow:0 0 0 2px rgba(29,78,216,.18);
+        background:#eff6ff;
       }
 
       #${IDS.panel} .hlj-card-matrix-title {
@@ -1753,6 +2390,36 @@
       #${IDS.panel} .hlj-range-result.is-partial {
         color:#b45309;
         background:#fff7ed;
+      }
+
+      #${IDS.panel} .hlj-range-result.is-failed {
+        color:#a32d2d;
+        background:#fdecec;
+      }
+
+      #${IDS.panel} .hlj-recheck-btn {
+        margin-left:6px;
+        padding:1px 8px;
+        border:1px solid #d9a3a3;
+        border-radius:5px;
+        background:#ffffff;
+        color:#a32d2d;
+        font:700 10px/17px "Microsoft YaHei","PingFang SC",sans-serif;
+        cursor:pointer;
+      }
+
+      #${IDS.panel} .hlj-recheck-btn:hover {
+        background:#fdecec;
+      }
+
+      #${IDS.panel} .hlj-gap-hint {
+        margin:6px 0;
+        padding:7px 10px;
+        border-radius:6px;
+        background:#f1f5f9;
+        color:#475569;
+        font-size:10px;
+        line-height:1.6;
       }
 
       #${IDS.panel} .hlj-detail-grid {
@@ -1974,6 +2641,7 @@
       }
 
       #${IDS.panel} .hlj-smart-balance {
+        justify-self:end;
         text-align:right;
         color:#15803d;
         font-variant-numeric:tabular-nums;
@@ -1981,13 +2649,41 @@
         white-space:nowrap;
       }
 
-      #${IDS.panel} .hlj-smart-balance.is-over {
+      /* 余额告警色（超出 / 余量 0）：这里只负责把数字染红。
+         红底一律由外层「整行」承载 —— 展开后的列表行是 .hlj-smart-option.is-alert，
+         闭合态的按钮是 .hlj-smart-select-btn.is-alert。
+         早先是给余额这一格单独加 padding + 背景，结果格子撑出列宽、红块直接压到菜单边上。 */
+      #${IDS.panel} .hlj-smart-balance.is-over,
+      #${IDS.panel} .hlj-smart-balance.is-zero {
         color:#b91c1c;
       }
 
+      /* 闭合按钮：当前选中的那一项本身告警时，整个按钮铺浅红 ——
+         它和展开列表里的同一项是同一个东西，只红一小格跟列表对不上。 */
+      #${IDS.panel} .hlj-smart-select-btn.is-alert {
+        background:#fef2f2;
+        border-color:#fecaca;
+      }
+
+      /* 姓名也跟着加深，跟展开列表里的告警行保持同一个观感 */
+      #${IDS.panel} .hlj-smart-select-btn.is-alert .hlj-smart-name {
+        color:#991b1b;
+      }
+
+      #${IDS.panel} .hlj-smart-select-btn.is-alert:hover,
+      #${IDS.panel} .hlj-smart-select.is-open .hlj-smart-select-btn.is-alert {
+        border-color:#f0a9a9;
+      }
+
+      /* 下拉菜单必须用 fixed，不能用 absolute：
+         它是 .hlj-personnel-box(overflow:hidden) 和 #body(overflow:auto) 的后代，
+         absolute 会被这两层容器一路裁掉，菜单展开到底部就直接被截断。
+         面板自身是 position:fixed 且不带 transform（拖拽走 left/top），
+         所以 fixed 子元素相对视口定位，不会被任何祖先的 overflow 影响。
+         top/left 由 positionSmartMenu() 按按钮的实际位置算出来（含向上翻转）。 */
       #${IDS.panel} .hlj-smart-menu {
-        position:absolute;
-        top:calc(100% + 4px);
+        position:fixed;
+        top:0;
         left:0;
         z-index:2147483647;
         width:270px;
@@ -2028,23 +2724,35 @@
         background:#eff6ff;
       }
 
-      /* 部门进度：字体略大，但行更紧凑 */
-      #${IDS.panel} .hlj-department-row {
-        grid-template-columns:minmax(94px,1.2fr) repeat(3,minmax(66px,.8fr));
-        gap:7px;
-        padding:6px 10px;
-        font-size:12px;
-        line-height:1.2;
+      /* 下拉列表行的余额告警：整行铺浅红，跟下面「各部门 / 各人领取进度」表的
+         tr.is-alert 用同一套视觉。
+         原来只给余额那一格加红底，在列表里看着像贴边的小色块，不如整行好扫。 */
+      #${IDS.panel} .hlj-smart-option.is-alert {
+        background:#fef2f2;
       }
 
-      #${IDS.panel} .hlj-department-name {
-        font-size:12px;
-        color:#27364a;
+      #${IDS.panel} .hlj-smart-option.is-alert .hlj-smart-name {
+        color:#991b1b;
       }
 
-      #${IDS.panel} .hlj-department-stat {
-        font-size:11px;
+      /* 整行已铺红底，这一格只负责把数字染红（列表行的 span 不挂 is-over/is-zero，
+         颜色由这里给；红底由行级 .is-alert 给） */
+      #${IDS.panel} .hlj-smart-option.is-alert .hlj-smart-balance {
+        color:#b91c1c;
       }
+
+      /* 告警行 hover / 当前项：红系加深。
+         不加深就会翻回上面的蓝底，红底一 hover 就消失、反而更难分辨。 */
+      #${IDS.panel} .hlj-smart-option.is-alert:hover,
+      #${IDS.panel} .hlj-smart-option.is-alert.is-active {
+        background:#fde8e8;
+      }
+
+      /* v0.4.1：进度表的列宽与单元格样式统一在上方 .hlj-progress-table 一处定义。
+         v0.4.0 遗留的 .hlj-department-name / .hlj-department-stat 重复定义已删除 ——
+         同一个选择器散在三处，改样式时最容易对错表（上一轮排查就被绕过一圈）。
+         ⚠️ 这段是 JS 模板字符串里的注释，**任何位置都不能出现反引号** ——
+         反引号会直接终止模板字符串，语法立刻报错。 */
 
       /* 卡领取状态：字号提高，行距压缩 */
       #${IDS.panel} .hlj-card-matrix th,
@@ -2112,10 +2820,13 @@
         text-align:center;
       }
 
-      /* v0.3.3：部门进度居中、宽度收到 400px，列间距由 space-between 均分 */
+      /* v0.3.9：进度表与上方「领取卡类及状态」同宽、同左右边距。
+         v0.3.3 曾把它收成 min(100%,400px) + margin:auto 居中 —— 左边缘比兄弟块
+         缩进一大截（760px 面板下约 90px），纵向堆叠时整块看着就是"错位"。
+         宽度交回父容器，跟 .hlj-card-matrix 一个口径。 */
       #${IDS.panel} .hlj-department-overview {
-        width:min(100%,400px);
-        margin:0 auto 12px;
+        width:auto;
+        margin:0 12px 12px;
       }
 
       /* 部门 / 人员选择框再收窄一些 */
@@ -2141,26 +2852,10 @@
         padding:5px 7px;
       }
 
-      /* v0.3.3：列宽按内容固定 + 均分剩余宽度，数字不再被拉散 */
-      #${IDS.panel} .hlj-department-row {
-        grid-template-columns:auto 52px 52px 52px;
-        justify-content:space-between;
-        gap:12px;
-        padding:5px 10px;
-        font-size:12px;
-        line-height:1.15;
-      }
-
-      #${IDS.panel} .hlj-department-stat {
-        font-size:11px;
-      }
-
-      /* 数值定宽右对齐：两位数与三位数混排时，标签与数字仍逐列对齐 */
-      #${IDS.panel} .hlj-department-stat b {
-        display:inline-block;
-        min-width:22px;
-        text-align:right;
-      }
+      /* v0.4.1：这里原来的五列 grid 行（姓名 / 卡种 chip / 总数 / 已办 / 剩余）已整体删除，
+         进度表改成 .hlj-progress-table 真表格 —— 列定义只在上方那一处，单一来源。
+         行内 chip 的样式（.hlj-department-cats / .hlj-cat-chip / .hlj-cat-none）一并废弃：
+         卡种现在占固定列，不需要再靠小标签挤在姓名后面。 */
 
       /* 领取状态表：字号提高，行距压缩 */
       #${IDS.panel} .hlj-card-matrix th,
@@ -2209,6 +2904,127 @@
         gap:8px;
       }
 
+      /* 人名搜索框：接在两个下拉右侧，独立一列。
+         两个下拉的宽度规则一个字没改 —— 搜索框只占自己的那份。 */
+      #${IDS.panel} .hlj-person-search {
+        position:relative;
+        flex:0 0 168px;
+        width:168px;
+      }
+
+      #${IDS.panel} .hlj-person-search::before {
+        content:"⌕";
+        position:absolute;
+        left:9px;
+        top:50%;
+        transform:translateY(-52%);
+        color:#94a3b8;
+        font-size:13px;
+        pointer-events:none;
+      }
+
+      #${IDS.panel} .hlj-person-search-input {
+        width:100%;
+        height:31px;
+        box-sizing:border-box;
+        padding:0 10px 0 25px;
+        border:1px solid #cbd5e1;
+        border-radius:7px;
+        background:#fff;
+        color:#1f2937;
+        font-family:inherit;
+        font-size:11px;
+        outline:none;
+      }
+
+      #${IDS.panel} .hlj-person-search-input::placeholder {
+        color:#9aa7b6;
+        font-weight:600;
+      }
+
+      #${IDS.panel} .hlj-person-search.is-open .hlj-person-search-input,
+      #${IDS.panel} .hlj-person-search-input:focus {
+        border-color:#94a3b8;
+        box-shadow:0 0 0 2px rgba(100,116,139,.06);
+      }
+
+      /* 结果菜单同样 fixed（同 .hlj-smart-menu 的理由：躲开容器 overflow 裁剪），
+         坐标由 positionSmartMenu 按输入框实际位置算 */
+      #${IDS.panel} .hlj-person-search-menu {
+        position:fixed;
+        top:0;
+        left:0;
+        z-index:2147483647;
+        width:268px;
+        max-height:340px;
+        overflow:auto;
+        padding:4px;
+        border:1px solid #cbd5e1;
+        border-radius:8px;
+        background:#fff;
+        box-shadow:0 10px 28px rgba(15,23,42,.18);
+      }
+
+      #${IDS.panel} .hlj-person-search-menu[hidden] {
+        display:none;
+      }
+
+      #${IDS.panel} .hlj-person-search-item {
+        width:100%;
+        min-height:31px;
+        display:grid;
+        /* 四列合计 216 + gap 18 + padding 16 = 250，正好落在 268 宽的菜单里（留出滚动条）。
+           列宽写死是因为「余额」那列一旦被挤，超字数（超4）会先被裁掉一半。 */
+        grid-template-columns:minmax(54px,1fr) 66px 52px 44px;
+        align-items:center;
+        gap:6px;
+        padding:5px 8px;
+        border:0;
+        border-radius:6px;
+        background:#fff;
+        font-family:inherit;
+        font-size:11px;
+        text-align:left;
+        cursor:pointer;
+      }
+
+      #${IDS.panel} .hlj-person-search-item:hover {
+        background:#eff6ff;
+      }
+
+      #${IDS.panel} .hlj-person-search-dept {
+        color:#64748b;
+        font-size:10px;
+        font-weight:700;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+
+      /* 告警行沿用下拉列表那套（整行浅红 + 姓名深红） */
+      #${IDS.panel} .hlj-person-search-item.is-alert {
+        background:#fef2f2;
+      }
+
+      #${IDS.panel} .hlj-person-search-item.is-alert .hlj-smart-name {
+        color:#991b1b;
+      }
+
+      #${IDS.panel} .hlj-person-search-item.is-alert .hlj-smart-balance {
+        color:#b91c1c;
+      }
+
+      #${IDS.panel} .hlj-person-search-item.is-alert:hover {
+        background:#fde8e8;
+      }
+
+      #${IDS.panel} .hlj-person-search-empty {
+        padding:8px 10px;
+        color:#94a3b8;
+        font-size:11px;
+        font-weight:600;
+      }
+
       @media (max-width: 1100px) {
         #${IDS.switchSlot} { margin-left:12px; margin-right:12px; }
         #${IDS.switch} { min-width:96px; padding:0 11px; font-size:13px; }
@@ -2225,11 +3041,266 @@
         }
         #${IDS.panel} .hlj-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); }
         #${IDS.panel} .hlj-main-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
-        #${IDS.panel} .hlj-personnel-selects { width:100%; }
+        #${IDS.panel} .hlj-personnel-selects { width:100%; flex-wrap:wrap; }
         #${IDS.panel} .hlj-personnel-select { flex:1 1 0; width:auto; min-width:0; }
+        #${IDS.panel} .hlj-person-search { flex:1 1 100%; width:auto; }
         #${IDS.panel} .hlj-personnel-kpis { grid-template-columns:repeat(3,minmax(0,1fr)); }
         #${IDS.panel} .hlj-detail-grid { grid-template-columns:1fr; }
         #${IDS.panel} .hlj-detail-meta { grid-template-columns:repeat(3,minmax(0,1fr)); }
+      }
+
+      /* ============================================================
+         卡片明细弹窗。挂在 document.body 下（不是面板里），
+         所以每条规则都用弹窗自己的 id 起头，不带面板前缀，也不会外溢到页面其它元素。
+         ============================================================ */
+      #${IDS.cardModal} {
+        position:fixed;
+        inset:0;
+        z-index:2147483647;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        padding:24px;
+        background:rgba(15,23,42,.42);
+      }
+
+      #${IDS.cardModal}[hidden] {
+        display:none;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-panel {
+        width:min(760px,100%);
+        max-height:min(80vh,760px);
+        display:flex;
+        flex-direction:column;
+        overflow:hidden;
+        border-radius:12px;
+        background:#fff;
+        box-shadow:0 24px 60px rgba(15,23,42,.32);
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-head {
+        display:flex;
+        align-items:flex-start;
+        gap:10px;
+        padding:12px 14px;
+        border-bottom:1px solid #e2e8f0;
+        background:#f8fafc;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-titles {
+        flex:1 1 auto;
+        min-width:0;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-title {
+        color:#172033;
+        font-size:13px;
+        font-weight:800;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-sub {
+        margin-top:3px;
+        color:#64748b;
+        font-size:11px;
+        font-weight:600;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-close {
+        flex:0 0 auto;
+        width:26px;
+        height:26px;
+        border:1px solid #cbd5e1;
+        border-radius:7px;
+        background:#fff;
+        color:#475569;
+        font-size:15px;
+        line-height:1;
+        cursor:pointer;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-close:hover {
+        border-color:#94a3b8;
+        color:#1f2937;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-body {
+        flex:1 1 auto;
+        overflow:auto;
+        padding:10px 12px 14px;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-sum {
+        margin-bottom:8px;
+        color:#64748b;
+        font-size:11px;
+        font-weight:700;
+      }
+
+      #${IDS.cardModal} .hlj-card-modal-sum b {
+        color:#1f2937;
+        font-size:12px;
+      }
+
+      #${IDS.cardModal} .hlj-card-list {
+        display:flex;
+        flex-direction:column;
+        gap:4px;
+      }
+
+      #${IDS.cardModal} .hlj-card-item {
+        overflow:hidden;
+        border:1px solid #e2e8f0;
+        border-radius:8px;
+        background:#fff;
+      }
+
+      #${IDS.cardModal} .hlj-card-item.is-open {
+        border-color:#bfdbfe;
+        background:#f8fbff;
+      }
+
+      #${IDS.cardModal} .hlj-card-main {
+        display:grid;
+        grid-template-columns:152px minmax(72px,1fr) 62px minmax(110px,1.4fr) 14px;
+        align-items:center;
+        gap:8px;
+        padding:7px 9px;
+        cursor:pointer;
+      }
+
+      #${IDS.cardModal} .hlj-card-main:hover {
+        background:#f1f5f9;
+      }
+
+      #${IDS.cardModal} .hlj-card-no {
+        color:#172033;
+        font-size:11px;
+        font-weight:800;
+        font-variant-numeric:tabular-nums;
+        letter-spacing:.3px;
+      }
+
+      #${IDS.cardModal} .hlj-card-act {
+        color:#475569;
+        font-size:11px;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+
+      #${IDS.cardModal} .hlj-card-status {
+        justify-self:start;
+        padding:2px 6px;
+        border-radius:999px;
+        font-size:10px;
+        font-weight:800;
+        white-space:nowrap;
+        background:#f1f5f9;
+        color:#475569;
+      }
+
+      #${IDS.cardModal} .hlj-card-status.is-enable { background:#ecfdf5; color:#15803d; }
+      #${IDS.cardModal} .hlj-card-status.is-booked { background:#eff6ff; color:#1d4ed8; }
+      #${IDS.cardModal} .hlj-card-status.is-used { background:#f5f3ff; color:#6d28d9; }
+      #${IDS.cardModal} .hlj-card-status.is-freeze { background:#fff7ed; color:#c2410c; }
+      #${IDS.cardModal} .hlj-card-status.is-invalid { background:#fef2f2; color:#b91c1c; }
+
+      #${IDS.cardModal} .hlj-card-remark {
+        color:#334155;
+        font-size:11px;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+
+      #${IDS.cardModal} .hlj-card-remark.is-pending { color:#94a3b8; }
+      #${IDS.cardModal} .hlj-card-remark.is-empty { color:#c3cad4; }
+      #${IDS.cardModal} .hlj-card-remark.is-error { color:#b91c1c; }
+
+      #${IDS.cardModal} .hlj-card-caret {
+        color:#94a3b8;
+        font-size:13px;
+        text-align:right;
+        transform:rotate(90deg);
+      }
+
+      #${IDS.cardModal} .hlj-card-detail {
+        padding:9px 10px 11px;
+        border-top:1px dashed #dbe3ec;
+        background:#fbfcfe;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail[hidden] {
+        display:none;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-loading {
+        color:#94a3b8;
+        font-size:11px;
+        font-weight:600;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-grid {
+        display:grid;
+        grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+        gap:6px;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-cell {
+        display:flex;
+        gap:6px;
+        align-items:baseline;
+        padding:5px 7px;
+        border:1px solid #e6ecf3;
+        border-radius:6px;
+        background:#fff;
+        font-size:11px;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-label {
+        flex:0 0 auto;
+        color:#64748b;
+        font-weight:700;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-value {
+        flex:1 1 auto;
+        min-width:0;
+        overflow:hidden;
+        color:#1f2937;
+        font-weight:700;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-remark {
+        margin-top:8px;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-remark-title {
+        color:#64748b;
+        font-size:11px;
+        font-weight:800;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-remark-body {
+        margin-top:4px;
+        padding:8px 9px;
+        border:1px solid #e6ecf3;
+        border-radius:7px;
+        background:#fff;
+        color:#1f2937;
+        font-size:12px;
+        line-height:1.5;
+        white-space:pre-wrap;
+        word-break:break-word;
+      }
+
+      #${IDS.cardModal} .hlj-card-detail-remark-body.is-error {
+        border-color:#fecaca;
+        background:#fff7f7;
+        color:#b91c1c;
       }
     `;
     document.head.appendChild(style);
@@ -2324,6 +3395,7 @@
           <button id="${IDS.close}" class="hlj-icon-btn" type="button" title="关闭">×</button>
         </div>
       </div>
+      <div class="hlj-resize-handle" data-resize-handle="1" title="拖动调整面板宽度，双击恢复默认宽度"></div>
       <div id="${IDS.body}">
         <div id="${IDS.status}">尚未查询。</div>
         <div id="${IDS.result}"></div>
@@ -2334,7 +3406,19 @@
     document.getElementById(IDS.query).addEventListener('click', runDetection);
     document.getElementById(IDS.close).addEventListener('click', closePanel);
     document.getElementById(IDS.collapse).addEventListener('click', toggleCollapse);
+
+    // 失败段的「单独重查」用事件委托，结果区整块重绘后不用重新绑定
+    document.getElementById(IDS.result).addEventListener('click', (e) => {
+      const btn = e.target.closest?.('.hlj-recheck-btn');
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      requerySegment(btn.dataset.taskId);
+    });
+
     installDrag(panel);
+    installPanelResize(panel);
+    applyPanelWidth(panel, readPanelWidth());
 
     const cache = loadCache();
     if (cache) {
@@ -2350,8 +3434,8 @@
     const query = document.getElementById(IDS.query);
     if (!query) return;
 
-    query.disabled = state.running;
-    query.textContent = state.running ? '查询中…' : '重新查询';
+    query.disabled = state.running || state.rechecking;
+    query.textContent = state.rechecking ? '重查中…' : (state.running ? '查询中…' : '重新查询');
   }
 
   function togglePanel() {
@@ -2397,6 +3481,89 @@
 
     if (body) body.style.display = state.collapsed ? 'none' : 'block';
     if (btn) btn.textContent = state.collapsed ? '▸' : '▾';
+  }
+
+  function readPanelWidth() {
+    const raw = Number(GM_getValue(PANEL_WIDTH_KEY, 0));
+    if (!raw || Number.isNaN(raw)) return PANEL_WIDTH_DEFAULT;
+    return Math.max(PANEL_WIDTH_MIN, Math.min(PANEL_WIDTH_MAX, raw));
+  }
+
+  // 统一出口：宽度始终夹在 [PANEL_WIDTH_MIN, limit] 之间。
+  // limit 由调用方给 —— 初始化时按「视口宽度 - 两侧留白」，
+  // 拖动时按「面板左边界到屏幕右边的余量」，否则往右拖会直接把面板顶出屏幕。
+  function applyPanelWidth(panel, width, options) {
+    const opts = options || {};
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const room = Number(opts.maxWidth) > 0 ? Number(opts.maxWidth) : (vw - PANEL_VIEWPORT_MARGIN);
+    const limit = Math.max(PANEL_WIDTH_MIN, Math.min(PANEL_WIDTH_MAX, room));
+    const next = Math.round(Math.max(PANEL_WIDTH_MIN, Math.min(limit, Number(width) || PANEL_WIDTH_DEFAULT)));
+
+    panel.style.width = `${next}px`;
+    // 面板自己变窄时，视口 media query 不会触发，得靠这个类降列
+    panel.classList.toggle('is-compact', next < PANEL_COMPACT_WIDTH);
+
+    if (opts.persist) GM_setValue(PANEL_WIDTH_KEY, next);
+    return next;
+  }
+
+  function installPanelResize(panel) {
+    const handle = panel.querySelector('[data-resize-handle="1"]');
+    if (!handle || handle.dataset.resizeBound === '1') return;
+
+    handle.dataset.resizeBound = '1';
+
+    let drag = null;
+
+    const onMove = (e) => {
+      if (!drag) return;
+      e.preventDefault();
+      applyPanelWidth(panel, drag.startWidth + (e.clientX - drag.startX), {
+        maxWidth: drag.viewportWidth - drag.startLeft - 12,
+      });
+    };
+
+    const onUp = () => {
+      if (!drag) return;
+      drag = null;
+      handle.classList.remove('is-active');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      applyPanelWidth(panel, panel.getBoundingClientRect().width, { persist: true });
+    };
+
+    handle.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+
+      const rect = panel.getBoundingClientRect();
+
+      // 关键：面板初始是 right:24px 定位，右边缘钉在屏幕右边、宽度变化只会动左边缘。
+      // 先切成 left 定位，宽度才是长在右边缘上的 —— 把手才会跟着鼠标走，手感才对。
+      panel.style.left = `${rect.left}px`;
+      panel.style.right = 'auto';
+
+      drag = {
+        startX: e.clientX,
+        startWidth: rect.width,
+        startLeft: rect.left,
+        viewportWidth: document.documentElement.clientWidth || window.innerWidth,
+      };
+
+      handle.classList.add('is-active');
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    });
+
+    // 双击恢复默认宽度。
+    // 恢复后必须再收一次位置：默认宽度往往比当前宽，而面板此时是 left 定位、
+    // 右边会直接顶出视口（左边界越靠右越明显）。
+    handle.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      applyPanelWidth(panel, PANEL_WIDTH_DEFAULT, { persist: true });
+      ensurePanelInViewport(panel);
+    });
   }
 
   function installDrag(panel) {
@@ -2445,7 +3612,14 @@
 
   function ensurePanelInViewport(panel) {
     const rect = panel.getBoundingClientRect();
-    if (rect.right > window.innerWidth) panel.style.right = '12px';
+    if (rect.right > window.innerWidth) {
+      // 已经切成 left 定位（拖过分隔条或拖动过面板）时不能再改 right，改了没用还会打架
+      if (panel.style.left && panel.style.right === 'auto') {
+        panel.style.left = `${Math.max(4, window.innerWidth - rect.width - 12)}px`;
+      } else {
+        panel.style.right = '12px';
+      }
+    }
     if (rect.bottom > window.innerHeight && rect.top > 80) panel.style.top = '82px';
   }
 
@@ -2459,6 +3633,9 @@
   function renderResult(data) {
     const host = document.getElementById(IDS.result);
     if (!host || !data) return;
+
+    // 记住当前展示的结果，供「单独重查某段」做增量更新
+    state.lastData = data;
 
     const cards = Array.isArray(data.cards) ? data.cards : [];
     const ranges = Array.isArray(data.rangeTasks) ? data.rangeTasks : [];
@@ -2493,19 +3670,22 @@
       true
     );
 
+    // 审批白名单卡号数 vs 卡池实际取到数。
+    // 差额通常来自储值卡、电商卡等非制卡类（不在本汇总范围内），不是遗漏。
+    const approvedTotal = Number(data.approvalDistinctCardCount || 0);
+    const foundTotal = Number(data.foundDistinctCardCount || 0);
+    const approvedGap = Math.max(0, approvedTotal - foundTotal);
+    const approvedGapHtml = approvedGap > 0
+      ? `<div class="hlj-gap-hint">白名单比实际取到多 ${approvedGap} 张：这些卡号在制卡卡池里查不到，通常是储值卡、电商卡等非制卡类（不在本汇总范围内），并非遗漏。</div>`
+      : '';
+
     host.innerHTML = `
       <div class="hlj-scope-hint">本年度实际办卡情况（全量）</div>
 
       <div class="hlj-main-summary">
-        <div class="hlj-main-card hlj-main-card-mri">
-          <div class="hlj-main-card-label">核磁</div>
-          <div class="hlj-main-card-value">${Number(categorySummary.mri || 0)}</div>
-          <div class="hlj-main-card-unit">张</div>
-        </div>
-
-        <div class="hlj-main-card hlj-main-card-ct">
-          <div class="hlj-main-card-label">CT</div>
-          <div class="hlj-main-card-value">${Number(categorySummary.ct || 0)}</div>
+        <div class="hlj-main-card hlj-main-card-vip">
+          <div class="hlj-main-card-label">贵宾</div>
+          <div class="hlj-main-card-value">${Number(categorySummary.vip || 0)}</div>
           <div class="hlj-main-card-unit">张</div>
         </div>
 
@@ -2515,9 +3695,15 @@
           <div class="hlj-main-card-unit">张</div>
         </div>
 
-        <div class="hlj-main-card hlj-main-card-vip">
-          <div class="hlj-main-card-label">贵宾</div>
-          <div class="hlj-main-card-value">${Number(categorySummary.vip || 0)}</div>
+        <div class="hlj-main-card hlj-main-card-mri">
+          <div class="hlj-main-card-label">核磁</div>
+          <div class="hlj-main-card-value">${Number(categorySummary.mri || 0)}</div>
+          <div class="hlj-main-card-unit">张</div>
+        </div>
+
+        <div class="hlj-main-card hlj-main-card-ct">
+          <div class="hlj-main-card-label">CT</div>
+          <div class="hlj-main-card-value">${Number(categorySummary.ct || 0)}</div>
           <div class="hlj-main-card-unit">张</div>
         </div>
       </div>
@@ -2538,6 +3724,16 @@
           <div class="hlj-personnel-selects">
             <div class="hlj-smart-select" data-smart-select="department"></div>
             <div class="hlj-smart-select" data-smart-select="person"></div>
+            <div class="hlj-person-search" data-person-search="1">
+              <input
+                type="text"
+                class="hlj-person-search-input"
+                placeholder="搜索人名"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <div class="hlj-person-search-menu" hidden></div>
+            </div>
           </div>
           <div class="hlj-personnel-scope-hint">人员计划及办理进度</div>
         </div>
@@ -2560,7 +3756,16 @@
               <div class="hlj-detail-meta-label">审批办卡数量</div>
               <div class="hlj-detail-meta-value">${Number(data.approvalCardNumSum || 0)} 张</div>
             </div>
+            <div class="hlj-detail-meta-item">
+              <div class="hlj-detail-meta-label">白名单卡号（去重）</div>
+              <div class="hlj-detail-meta-value">${approvedTotal} 张</div>
+            </div>
+            <div class="hlj-detail-meta-item">
+              <div class="hlj-detail-meta-label">实际取到</div>
+              <div class="hlj-detail-meta-value">${foundTotal} 张</div>
+            </div>
           </div>
+          ${approvedGapHtml}
           ${detailHtml}
         </div>
       </details>
@@ -2606,38 +3811,349 @@
     bindPersonnelSelectors(host, cards);
   }
 
+  // 卡状态的配色类。原来只在 renderPersonnelContent 里当局部变量用，
+  // 弹窗里也要同一套，提到模块级避免两处映射各自漂移。
+  const STATUS_TONE_MAP = {
+    '生效中': 'is-enable',
+    '已预约': 'is-booked',
+    '已核销': 'is-used',
+    '冻结': 'is-freeze',
+    '作废': 'is-invalid',
+  };
+
+  function getStatusToneClass(status) {
+    return STATUS_TONE_MAP[String(status || '')] || '';
+  }
+
+  function getCardNo(card) {
+    return String(card?.card_no || card?.cardNo || '').trim();
+  }
+
+  // ============================================================
+  // 5. 卡片明细弹窗（卡号 + 卡备注）
+  // ============================================================
+  // 交互：表格里点某个数量 → 这里列出对应的每张卡（卡号 / 卡类 / 状态 / 备注）；
+  // 再点某一行 → 就地展开这张卡的详情（卡号、备注全文、机构、订单、有效期、金额）。
+  // 备注是逐张单独查的，所以先秒开列表、再并发把备注填进去，不阻塞打开。
+  const cardModalState = { token: 0 };
+
+  function ensureCardModal() {
+    let modal = document.getElementById(IDS.cardModal);
+    if (modal) return modal;
+
+    modal = document.createElement('div');
+    modal.id = IDS.cardModal;
+    modal.className = 'hlj-card-modal';
+    modal.setAttribute('hidden', 'hidden');
+    modal.innerHTML = `
+      <div class="hlj-card-modal-panel" role="dialog" aria-modal="true">
+        <div class="hlj-card-modal-head">
+          <div class="hlj-card-modal-titles">
+            <div class="hlj-card-modal-title">卡片明细</div>
+            <div class="hlj-card-modal-sub"></div>
+          </div>
+          <button type="button" class="hlj-card-modal-close" title="关闭">×</button>
+        </div>
+        <div class="hlj-card-modal-body"></div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal || e.target.closest('.hlj-card-modal-close')) closeCardModal();
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !modal.hasAttribute('hidden')) closeCardModal();
+    });
+
+    return modal;
+  }
+
+  function closeCardModal() {
+    const modal = document.getElementById(IDS.cardModal);
+    if (modal) modal.setAttribute('hidden', 'hidden');
+    cardModalState.token += 1;
+  }
+
+  function formatAmountText(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '';
+    return `¥${num.toFixed(2)}`;
+  }
+
+  function renderCardModalDetailHtml(card, detail) {
+    const no = getCardNo(card);
+    const activity = String(card?.activity_name || '').trim();
+    const status = translateCardStatus(card);
+    const saleName = getCardSaleName(card);
+    const beginTs = Number(card?.begin_date || 0);
+    const endTs = Number(card?.end_date || 0);
+    const cardRange = beginTs && endTs
+      ? `${new Date(beginTs).toLocaleDateString('zh-CN')} ~ ${new Date(endTs).toLocaleDateString('zh-CN')}`
+      : '';
+
+    const remarkText = detail?.status === 'ok'
+      ? (detail.remark || '（无备注）')
+      : `获取失败：${escapeHtml(detail?.error || '未知错误')}`;
+
+    const infoRows = [
+      ['卡号', no],
+      ['卡类', activity || '未分类'],
+      ['领取人', saleName || '-'],
+      ['当前状态', status],
+      cardRange ? ['卡有效期', cardRange] : null,
+      detail?.corpName ? ['适用机构', detail.corpName] : null,
+      detail?.orderCode ? ['关联订单', detail.orderCode] : null,
+      detail?.orderBeginDate && detail?.orderEndDate
+        ? ['订单有效期', `${detail.orderBeginDate} ~ ${detail.orderEndDate}`]
+        : null,
+      formatAmountText(detail?.currentAmount) ? ['当前余额', formatAmountText(detail.currentAmount)] : null,
+      formatAmountText(detail?.saleAmount) ? ['销售金额', formatAmountText(detail.saleAmount)] : null,
+    ].filter(Boolean);
+
+    return `
+      <div class="hlj-card-detail-grid">
+        ${infoRows.map(([label, value]) => `
+          <div class="hlj-card-detail-cell">
+            <span class="hlj-card-detail-label">${escapeHtml(label)}</span>
+            <span class="hlj-card-detail-value">${escapeHtml(String(value))}</span>
+          </div>
+        `).join('')}
+      </div>
+
+      <div class="hlj-card-detail-remark">
+        <div class="hlj-card-detail-remark-title">卡备注</div>
+        <div class="hlj-card-detail-remark-body ${detail?.status === 'error' ? 'is-error' : ''}">
+          ${escapeHtml(remarkText)}
+        </div>
+      </div>
+    `;
+  }
+
+  function setCardRowRemark(row, detail) {
+    const cell = row.querySelector('.hlj-card-remark');
+    if (!cell) return;
+
+    cell.classList.remove('is-pending', 'is-error', 'is-empty', 'has-text');
+
+    if (detail?.status !== 'ok') {
+      cell.classList.add('is-error');
+      cell.textContent = '备注获取失败，点开重试';
+      return;
+    }
+
+    if (detail.remark) {
+      cell.classList.add('has-text');
+      cell.textContent = detail.remark;
+    } else {
+      cell.classList.add('is-empty');
+      cell.textContent = '（无备注）';
+    }
+  }
+
+  async function loadCardRowDetail(row, card, token, options) {
+    const no = getCardNo(card);
+    const detail = cardDetailCache.get(no) || (await fetchCardDetail(no));
+
+    // 弹窗已经被关掉 / 换成另一批卡了：别把旧结果写进新界面
+    if (token !== cardModalState.token) return detail;
+
+    setCardRowRemark(row, detail);
+
+    if (row.classList.contains('is-open')) {
+      const box = row.querySelector('.hlj-card-detail');
+      if (box) box.innerHTML = renderCardModalDetailHtml(card, detail);
+    }
+
+    if (options?.onProgress) options.onProgress();
+    return detail;
+  }
+
+  function openCardModal(options) {
+    const cards = (Array.isArray(options?.cards) ? options.cards : []).filter((card) => getCardNo(card));
+    if (!cards.length) return;
+
+    const modal = ensureCardModal();
+    const title = String(options?.title || '卡片明细');
+    const note = String(options?.note || '');
+
+    cardModalState.token += 1;
+    const token = cardModalState.token;
+
+    modal.querySelector('.hlj-card-modal-title').textContent = title;
+
+    const subEl = modal.querySelector('.hlj-card-modal-sub');
+    const body = modal.querySelector('.hlj-card-modal-body');
+    const head = `<div class="hlj-card-modal-sum">共 <b>${cards.length}</b> 张${note ? ` · ${escapeHtml(note)}` : ''}</div>`;
+
+    body.innerHTML = `
+      ${head}
+      <div class="hlj-card-list">
+        ${cards.map((card) => {
+          const no = getCardNo(card);
+          const status = translateCardStatus(card);
+          const activity = String(card?.activity_name || '').trim();
+          return `
+            <div class="hlj-card-item" data-card-no="${escapeHtml(no)}">
+              <div class="hlj-card-main" role="button" tabindex="0">
+                <span class="hlj-card-no">${escapeHtml(no)}</span>
+                <span class="hlj-card-act">${escapeHtml(activity || '未分类')}</span>
+                <span class="hlj-card-status ${getStatusToneClass(status)}">${escapeHtml(status)}</span>
+                <span class="hlj-card-remark is-pending">备注加载中…</span>
+                <span class="hlj-card-caret">›</span>
+              </div>
+              <div class="hlj-card-detail" hidden></div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    `;
+
+    modal.removeAttribute('hidden');
+
+    const rows = [...body.querySelectorAll('.hlj-card-item')];
+    const rowByCardNo = new Map(rows.map((row) => [row.getAttribute('data-card-no'), row]));
+    const cardByCardNo = new Map(cards.map((card) => [getCardNo(card), card]));
+
+    let done = 0;
+    const total = Math.min(rows.length, CARD_REMARK_AUTO_LIMIT);
+    if (total < rows.length) {
+      subEl.textContent = `前 ${total} 张自动查备注，其余点开单卡时再查`;
+    }
+
+    rows.forEach((row) => {
+      const no = row.getAttribute('data-card-no') || '';
+      const card = cardByCardNo.get(no);
+      const main = row.querySelector('.hlj-card-main');
+      if (!card || !main) return;
+
+      const toggle = async () => {
+        const willOpen = !row.classList.contains('is-open');
+        rows.forEach((other) => {
+          if (other !== row) {
+            other.classList.remove('is-open');
+            const box = other.querySelector('.hlj-card-detail');
+            if (box) box.hidden = true;
+          }
+        });
+
+        row.classList.toggle('is-open', willOpen);
+        const box = row.querySelector('.hlj-card-detail');
+        if (!box) return;
+        box.hidden = !willOpen;
+        if (!willOpen) return;
+
+        if (!box.dataset.filled) {
+          box.innerHTML = '<div class="hlj-card-detail-loading">正在获取卡详情…</div>';
+        }
+        const detail = await loadCardRowDetail(row, card, token, null);
+        if (token !== cardModalState.token) return;
+        box.dataset.filled = '1';
+        box.innerHTML = renderCardModalDetailHtml(card, detail);
+      };
+
+      main.addEventListener('click', toggle);
+      main.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggle();
+        }
+      });
+    });
+
+    // 批量补备注：限并发、逐条回填、进度写在副标题上
+    const autoRows = rows.slice(0, CARD_REMARK_AUTO_LIMIT);
+    const updateProgress = () => {
+      done += 1;
+      if (token !== cardModalState.token) return;
+      subEl.textContent = `备注加载中 ${Math.min(done, total)}/${total}${total < rows.length ? '（仅前段）' : ''}`;
+    };
+
+    if (autoRows.length) {
+      subEl.textContent = `备注加载中 0/${autoRows.length}`;
+    }
+
+    mapWithConcurrency(autoRows, CARD_REMARK_CONCURRENCY, async (row) => {
+      if (token !== cardModalState.token) return;
+      const no = row.getAttribute('data-card-no') || '';
+      const card = cardByCardNo.get(no);
+      if (!card) return;
+      await loadCardRowDetail(row, card, token, { onProgress: updateProgress });
+    }).then(() => {
+      if (token !== cardModalState.token) return;
+      subEl.textContent = total < rows.length
+        ? `共 ${cards.length} 张 · 已自动加载前 ${total} 张备注，其余点开单卡再查`
+        : `共 ${cards.length} 张 · 备注已加载`;
+    });
+  }
+
   function renderPersonnelContent(host, cards, department, personName) {
     const content = host.querySelector('[data-personnel-content="1"]');
     if (!content) return;
 
     const info = summarizePersonnel(cards, department, personName);
     const statusOrder = ['生效中', '已预约', '已核销', '冻结', '作废'];
-    const statusClassMap = {
-      '生效中': 'is-enable',
-      '已预约': 'is-booked',
-      '已核销': 'is-used',
-      '冻结': 'is-freeze',
-      '作废': 'is-invalid',
-    };
     const cardRows = Array.isArray(info.cardRows) ? info.cardRows : [];
+
+    // 表格里的每个数字都能点开对应的卡（数量格 = 该卡类全部状态；状态格 = 该卡类该状态）。
+    // 0 不挂点击（没卡可看），data 属性直接带卡种 + 状态，点击时按它过滤。
+    const renderCountCell = (category, status, value) => {
+      const count = Number(value || 0);
+      const attrs = count > 0
+        ? ` data-card-cell="1" data-card-category="${escapeHtml(category)}" data-card-status="${escapeHtml(status)}"`
+        : '';
+
+      // 「数量」列维持原来的粗体观感，只是多一层可点提示；
+      // 状态列沿用 .hlj-status-value 那套配色（跟表头一一对应）。
+      if (!status) {
+        return `
+          <td>
+            <b class="hlj-count-value ${count > 0 ? 'is-clickable' : ''}"${attrs}>${count}</b>
+          </td>
+        `;
+      }
+
+      return `
+        <td>
+          <span class="hlj-status-value ${getStatusToneClass(status)} ${count === 0 ? 'is-zero' : ''} ${count > 0 ? 'is-clickable' : ''}"${attrs}>
+            ${count}
+          </span>
+        </td>
+      `;
+    };
 
     const rowHtml = cardRows.map((row) => `
       <tr>
         <td>${escapeHtml(row.category)}</td>
-        <td><b>${Number(row.total || 0)}</b></td>
-        ${statusOrder.map((status) => {
-          const value = Number(row.statuses?.[status] || 0);
-          const toneClass = statusClassMap[status] || '';
-          return `
-            <td>
-              <span class="hlj-status-value ${toneClass} ${value === 0 ? 'is-zero' : ''}">
-                ${value}
-              </span>
-            </td>
-          `;
-        }).join('')}
+        ${renderCountCell(row.category, '', row.total)}
+        ${statusOrder.map((status) => renderCountCell(row.category, status, row.statuses?.[status])).join('')}
       </tr>
     `).join('');
+
+    // 选了具体部门、但人员停在「全部人员」时，补一张「本部门各人」的进度表。
+    // 结构与「各部门领取进度」完全一致，只是分组维度从部门换成个人 ——
+    // 这样两种视角下的行样式、数字口径都统一，不用再学一套新东西。
+    const showPersonOverview =
+      department !== '全部部门' &&
+      personName === '全部人员';
+
+    const personOverviewHtml = showPersonOverview
+      ? `
+        <div class="hlj-department-overview">
+          <div class="hlj-department-overview-title">
+            <span>${escapeHtml(department)} · 各人领取进度</span>
+            <span class="hlj-department-overview-sub">已办理 / 总数量</span>
+          </div>
+
+          ${buildProgressTableHtml(buildPersonProgress(cards, department), {
+            nameHead: '姓名',
+            getName: (item) => item.name,
+            jumpAttr: (item) => ` data-jump-department="${escapeHtml(item.department)}" data-jump-person="${escapeHtml(item.name)}"`,
+          })}
+        </div>
+      `
+      : '';
 
     const showDepartmentOverview =
       department === '全部部门' &&
@@ -2651,17 +4167,11 @@
             <span class="hlj-department-overview-sub">已办理 / 总数量</span>
           </div>
 
-          ${buildDepartmentProgress(cards).map((item) => `
-            <div class="hlj-department-row">
-              <div class="hlj-department-name">${escapeHtml(item.department)}</div>
-              <div class="hlj-department-stat">总数 <b>${Number(item.plan)}</b></div>
-              <div class="hlj-department-stat">已办 <b>${Number(item.current)}</b></div>
-              <div class="hlj-department-stat ${item.overPlan > 0 ? 'is-over' : 'is-remaining'}">
-                ${item.overPlan > 0 ? '超出' : '剩余'}
-                <b>${item.overPlan > 0 ? Number(item.overPlan) : Number(item.balance)}</b>
-              </div>
-            </div>
-          `).join('')}
+          ${buildProgressTableHtml(buildDepartmentProgress(cards), {
+            nameHead: '部门',
+            getName: (item) => item.department,
+            jumpAttr: (item) => ` data-jump-department="${escapeHtml(item.department)}" data-jump-person="全部人员"`,
+          })}
         </div>
       `
       : '';
@@ -2676,7 +4186,7 @@
           <div class="hlj-personnel-kpi-label">${Number(info.overPlan || 0) > 0 ? '已办理（超出）' : '已办理'}</div>
           <div class="hlj-personnel-kpi-value">${Number(info.current || 0)}</div>
         </div>
-        <div class="hlj-personnel-kpi ${Number(info.balance || 0) > 0 ? 'is-remaining' : (Number(info.overPlan || 0) > 0 ? 'is-over' : 'is-empty')}">
+        <div class="hlj-personnel-kpi ${Number(info.balance || 0) > 0 ? 'is-remaining' : (Number(info.overPlan || 0) > 0 ? 'is-over' : 'is-zero')}">
           <div class="hlj-personnel-kpi-label">还可申请</div>
           <div class="hlj-personnel-kpi-value">${Number(info.balance || 0)}</div>
         </div>
@@ -2713,7 +4223,65 @@
       </div>
 
       ${departmentOverviewHtml}
+      ${personOverviewHtml}
     `;
+
+    // 事件委托只绑一次，但每次重绘都要把「当前看的是谁」挂到容器上 ——
+    // 否则闭包里捕获的永远是第一次那份上下文，点出来的卡对不上号。
+    // cards 必须用 info.cards（当前选择范围内那批，跟表格里的数字同源），
+    // 不是外面传进来的全量卡池 —— 否则点「某人 · 贵宾 · 生效中」会把全公司的贵宾卡都列出来。
+    content.__hljCtx = {
+      cards: Array.isArray(info.cards) ? info.cards : [],
+      department,
+      personName,
+    };
+
+    if (!content.__hljInteractionBound) {
+      content.__hljInteractionBound = true;
+
+      content.addEventListener('click', (e) => {
+        const ctx = content.__hljCtx || {};
+
+        // 进度表里的人名 / 部门名 → 跳到对应的明细
+        const link = e.target.closest('.hlj-jump-link');
+        if (link) {
+          const dept = link.getAttribute('data-jump-department') || '全部部门';
+          const person = link.getAttribute('data-jump-person') || '全部人员';
+          if (typeof host.__hljJumpTo === 'function') host.__hljJumpTo(dept, person);
+          return;
+        }
+
+        // 卡类矩阵里的数量 / 状态数字 → 弹出这一格对应的卡
+        const cell = e.target.closest('[data-card-cell]');
+        if (!cell) return;
+
+        const category = cell.getAttribute('data-card-category') || '';
+        const status = cell.getAttribute('data-card-status') || '';
+        const list = (Array.isArray(ctx.cards) ? ctx.cards : []).filter((card) => {
+          if (getCardCategoryLabel(card?.activity_name) !== category) return false;
+          if (status && translateCardStatus(card) !== status) return false;
+          return true;
+        });
+        if (!list.length) return;
+
+        const who = ctx.personName && ctx.personName !== '全部人员'
+          ? ctx.personName
+          : (ctx.department || '全部部门');
+
+        openCardModal({
+          title: who + ' · ' + category + (status ? ' · ' + status : ''),
+          cards: list,
+        });
+      });
+
+      content.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const link = e.target.closest('.hlj-jump-link');
+        if (!link) return;
+        e.preventDefault();
+        link.click();
+      });
+    }
   }
 
   function bindPersonnelSelectors(host, cards) {
@@ -2738,14 +4306,50 @@
       };
     }
 
+    // 菜单是 position:fixed（为了躲开 .hlj-personnel-box 与 #body 的 overflow 裁剪），
+    // 所以它不会自动跟着按钮走，必须每次展开时按按钮的真实位置算一遍。
+    // 下方空间不够就向上翻转，左右也做一次收边，避免贴出视口。
+    function positionSmartMenu(container, anchorEl, menuEl) {
+      const btn = anchorEl || container.querySelector('.hlj-smart-select-btn');
+      const menu = menuEl || container.querySelector('.hlj-smart-menu');
+      if (!btn || !menu) return;
+
+      const rect = btn.getBoundingClientRect();
+      const width = menu.offsetWidth || 238;
+      const gap = 4;
+      const edge = 8;
+
+      let left = rect.left;
+      if (left + width > window.innerWidth - edge) left = window.innerWidth - width - edge;
+      if (left < edge) left = edge;
+
+      menu.style.maxHeight = '340px';
+      const naturalHeight = menu.offsetHeight || 0;
+      const spaceBelow = window.innerHeight - rect.bottom - gap - edge;
+      const spaceAbove = rect.top - gap - edge;
+      const openUp = naturalHeight > spaceBelow && spaceAbove > spaceBelow;
+
+      menu.style.left = `${Math.round(left)}px`;
+
+      if (openUp) {
+        menu.style.maxHeight = `${Math.max(120, Math.floor(spaceAbove))}px`;
+        menu.style.top = 'auto';
+        menu.style.bottom = `${Math.round(window.innerHeight - rect.top + gap)}px`;
+      } else {
+        menu.style.maxHeight = `${Math.max(120, Math.floor(spaceBelow))}px`;
+        menu.style.bottom = 'auto';
+        menu.style.top = `${Math.round(rect.bottom + gap)}px`;
+      }
+    }
+
     function renderSmartSelect(container, items, selectedName, onSelect) {
       const selected = items.find((item) => item.name === selectedName) || items[0];
 
       container.innerHTML = `
-        <button type="button" class="hlj-smart-select-btn">
+        <button type="button" class="hlj-smart-select-btn ${Number(selected?.over || 0) > 0 || Number(selected?.balance || 0) === 0 ? 'is-alert' : ''}">
           <span class="hlj-smart-name">${escapeHtml(selected?.name || '-')}</span>
           <span class="hlj-smart-progress">${Number(selected?.current || 0)}/${Number(selected?.plan || 0)}</span>
-          <span class="hlj-smart-balance ${Number(selected?.over || 0) > 0 ? 'is-over' : ''}">
+          <span class="hlj-smart-balance ${Number(selected?.over || 0) > 0 ? 'is-over' : (Number(selected?.balance || 0) > 0 ? '' : 'is-zero')}">
             ${Number(selected?.over || 0) > 0 ? `超${Number(selected.over)}` : `余${Number(selected?.balance || 0)}`}
           </span>
         </button>
@@ -2754,12 +4358,12 @@
           ${items.map((item) => `
             <button
               type="button"
-              class="hlj-smart-option ${item.name === selected?.name ? 'is-active' : ''}"
+              class="hlj-smart-option ${item.name === selected?.name ? 'is-active' : ''} ${Number(item.over || 0) > 0 || Number(item.balance || 0) === 0 ? 'is-alert' : ''}"
               data-smart-value="${escapeHtml(item.name)}"
             >
               <span class="hlj-smart-name">${escapeHtml(item.name)}</span>
               <span class="hlj-smart-progress">${Number(item.current || 0)}/${Number(item.plan || 0)}</span>
-              <span class="hlj-smart-balance ${Number(item.over || 0) > 0 ? 'is-over' : ''}">
+              <span class="hlj-smart-balance">
                 ${Number(item.over || 0) > 0 ? `超${Number(item.over)}` : `余${Number(item.balance || 0)}`}
               </span>
             </button>
@@ -2775,7 +4379,11 @@
           if (node !== container) node.classList.remove('is-open');
         });
 
+        const willOpen = !container.classList.contains('is-open');
         container.classList.toggle('is-open');
+
+        // 菜单此刻才 display:block，量得到尺寸，是唯一能定位的时机
+        if (willOpen) positionSmartMenu(container);
       });
 
       container.querySelectorAll('[data-smart-value]').forEach((option) => {
@@ -2851,14 +4459,152 @@
       );
     }
 
+    // ---------- 人名搜索框（下拉列表右侧）----------
+    // 与两个下拉**完全独立**：自己的 DOM、自己的菜单、自己的开关状态。
+    // 原有 .hlj-smart-select 的结构与行为一行没动 —— 搜索框只是往容器末尾追加一个节点。
+    const searchHost = host.querySelector('[data-person-search="1"]');
+    const searchInput = searchHost ? searchHost.querySelector('.hlj-person-search-input') : null;
+    const searchMenu = searchHost ? searchHost.querySelector('.hlj-person-search-menu') : null;
+
+    // 搜索索引一次建好：全量人员 + 各自当前办理数（跨部门，不受下拉选择影响）
+    const searchIndex = (() => {
+      const grouped = groupCardsBySaleName(cards);
+      return PERSONNEL_PLAN.map((item) => ({
+        department: item.department,
+        name: item.name,
+        current: (grouped.get(item.name) || []).length,
+        plan: Number(item.plan || 0),
+      }));
+    })();
+
+    // 关键字匹配：按空格拆词、全部命中才算 —— 支持「销售二部 张」这种组合筛选。
+    function matchSearchRow(keyword, row) {
+      const terms = String(keyword || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+      if (!terms.length) return false;
+      const hay = (row.name + ' ' + row.department).toLowerCase();
+      return terms.every((term) => hay.indexOf(term) !== -1);
+    }
+
+    function closePersonSearch() {
+      if (searchMenu) searchMenu.hidden = true;
+      searchHost?.classList.remove('is-open');
+    }
+
+    function renderPersonSearch() {
+      if (!searchInput || !searchMenu) return;
+
+      const keyword = String(searchInput.value || '').trim();
+      const rows = searchIndex.filter((row) => matchSearchRow(keyword, row)).slice(0, 40);
+
+      searchHost.classList.add('is-open');
+
+      if (!keyword) {
+        searchMenu.innerHTML = '<div class="hlj-person-search-empty">输入关键字搜人名，支持「部门 + 姓名」</div>';
+      } else if (!rows.length) {
+        searchMenu.innerHTML = '<div class="hlj-person-search-empty">没有匹配的人名</div>';
+      } else {
+        searchMenu.innerHTML = rows.map((row) => {
+          const balance = Math.max(0, row.plan - row.current);
+          const over = Math.max(0, row.current - row.plan);
+          return `
+            <button
+              type="button"
+              class="hlj-person-search-item ${over > 0 || balance === 0 ? 'is-alert' : ''}"
+              data-person-name="${escapeHtml(row.name)}"
+              data-person-department="${escapeHtml(row.department)}"
+            >
+              <span class="hlj-smart-name">${escapeHtml(row.name)}</span>
+              <span class="hlj-person-search-dept">${escapeHtml(row.department)}</span>
+              <span class="hlj-smart-progress">${row.current}/${row.plan}</span>
+              <span class="hlj-smart-balance ${over > 0 ? 'is-over' : (balance > 0 ? '' : 'is-zero')}">
+                ${over > 0 ? '超' + over : '余' + balance}
+              </span>
+            </button>
+          `;
+        }).join('');
+      }
+
+      // 先给菜单布局，再量尺寸 —— 顺序反了就量到 0
+      searchMenu.hidden = false;
+      positionSmartMenu(searchHost, searchInput, searchMenu);
+    }
+
+    // 进度表点部门名 / 人名、搜索框点结果，走的都是这里。
+    // 挂在 host 上是因为 renderPersonnelContent 是独立函数，拿不到这层的闭包状态。
+    function jumpTo(dept, person) {
+      selectedDepartment = dept || '全部部门';
+      selectedPerson = person || '全部人员';
+
+      redrawDepartment();
+      redrawPerson();
+      renderPersonnelContent(host, cards, selectedDepartment, selectedPerson);
+
+      if (searchInput) searchInput.value = '';
+      closePersonSearch();
+    }
+
+    host.__hljJumpTo = jumpTo;
+
+    if (searchHost && searchInput && searchMenu && !searchHost.__hljSearchBound) {
+      searchHost.__hljSearchBound = true;
+
+      // 无需回车 / 无确认按钮：输入即过滤
+      searchInput.addEventListener('input', renderPersonSearch);
+      searchInput.addEventListener('focus', () => {
+        if (String(searchInput.value || '').trim()) renderPersonSearch();
+      });
+
+      searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          searchInput.value = '';
+          closePersonSearch();
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          const first = searchMenu.querySelector('.hlj-person-search-item');
+          if (first) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+      });
+
+      searchMenu.addEventListener('click', (e) => {
+        const item = e.target.closest('.hlj-person-search-item');
+        if (!item) return;
+        e.stopPropagation();
+        jumpTo(
+          item.getAttribute('data-person-department') || '全部部门',
+          item.getAttribute('data-person-name') || '全部人员'
+        );
+      });
+    }
+
+    function closeAllSmartSelects() {
+      host.querySelectorAll('.hlj-smart-select.is-open').forEach((node) => {
+        node.classList.remove('is-open');
+      });
+    }
+
     if (!host.__hljSmartOutsideBound) {
       host.__hljSmartOutsideBound = true;
       host.addEventListener('click', (e) => {
-        if (!e.target.closest('.hlj-smart-select')) {
-          host.querySelectorAll('.hlj-smart-select.is-open').forEach(
-            (node) => node.classList.remove('is-open')
-          );
+        if (!e.target.closest('.hlj-smart-select') && !e.target.closest('.hlj-person-search')) {
+          closeAllSmartSelects();
+          closePersonSearch();
         }
+      });
+
+      // 菜单是 fixed 定位，不会跟着容器一起滚。滚动或改窗口大小时直接收起，
+      // 比跟着重算坐标省事，也不会出现菜单悬在旧位置上的错觉。
+      const bodyHost = document.getElementById(IDS.body);
+      bodyHost?.addEventListener('scroll', () => {
+        closeAllSmartSelects();
+        closePersonSearch();
+      }, { passive: true });
+      window.addEventListener('resize', () => {
+        closeAllSmartSelects();
+        closePersonSearch();
       });
     }
 
@@ -2883,9 +4629,30 @@
       `;
     }).join('');
 
+    const failedSegments = ranges.filter((x) => x && x.failed);
+
     const taskRows = ranges.map((x, idx) => {
       const expected = Number(x.whitelistCardCount || 0);
       const found = Number(x.matchedUniqueCards || 0);
+
+      if (x.failed) {
+        return `
+          <tr>
+            <td>${idx + 1}</td>
+            <td>${escapeHtml(x.queryStart || '-')}</td>
+            <td>${escapeHtml(x.queryEnd || '-')}</td>
+            <td>
+              <span class="hlj-range-result is-failed">未取到</span>
+              ${
+                withPool
+                  ? `<button class="hlj-recheck-btn" type="button" data-task-id="${escapeHtml(x.taskId || '')}">重查</button>`
+                  : ''
+              }
+            </td>
+          </tr>
+        `;
+      }
+
       const resultClass = !withPool || found === expected ? 'is-ok' : 'is-partial';
 
       return `
@@ -2936,6 +4703,14 @@
         ${
           warnings?.length
             ? `<div style="padding:7px 10px;background:#fff7e8;color:#8a5a00;font-size:10px;">⚠ ${escapeHtml(warnings.join('；'))}</div>`
+            : ''
+        }
+        ${
+          failedSegments.length
+            ? `<div style="padding:8px 10px;background:#fdecec;color:#a32d2d;font-size:10px;line-height:1.6;">
+                 ⚠ 本次有 ${failedSegments.length} 段未取到，以下汇总为<b>部分数据</b>。
+                 可点对应行的「重查」按钮单独补取，已成功获取的其他段不受影响。
+               </div>`
             : ''
         }
       </div>
