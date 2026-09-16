@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.6制卡管理查询
 // @namespace    https://tampermonkey.net/
-// @version      0.5.3
+// @version      0.5.5
 // @description  查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -55,7 +55,7 @@
   const PANEL_VIEWPORT_MARGIN = 40;
 
   // 版本号单一来源：改动时与文件头 @version 一并同步
-  const SCRIPT_VERSION = '0.5.3';
+  const SCRIPT_VERSION = '0.5.5';
 
   const PROCESS_API = '/soa-card/api/v1/bqcard/process/page';
   const POOL_API = '/soa-card/api/v1/card/business/pool/display';
@@ -1012,6 +1012,9 @@
     // 名字格做成可点跳转（部门视角跳到该部门、个人视角跳到该人）。
     // 具体挂什么 data 属性由调用方给 —— 这里只负责渲染，不猜跳转目标。
     const jumpAttr = typeof options?.jumpAttr === 'function' ? options.jumpAttr : null;
+    // 卡种列的数字也可点（点开「这一行覆盖的人 × 这个卡种」的卡片明细）。
+    // 与 jumpAttr 同口径：这里只往 td 上挂属性，覆盖范围和过滤口径由调用方给定。
+    const cellAttr = typeof options?.cellAttr === 'function' ? options.cellAttr : null;
 
     const headHtml = `
       <tr>
@@ -1039,7 +1042,9 @@
           <td class="hlj-col-name" title="${escapeHtml(nameText)}">${nameCell}</td>
           ${columns.map((category) => {
             const value = Number(counts[category] || 0);
-            return `<td class="hlj-col-cat${value === 0 ? ' is-zero' : ''}">${value}</td>`;
+            // 0 不挂点击 —— 没卡可看，别造出「可点的 0」这种误导。
+            const clickable = value > 0 && cellAttr;
+            return `<td class="hlj-col-cat${value === 0 ? ' is-zero' : ''}${clickable ? ' is-clickable' : ''}"${clickable ? cellAttr(item, category) : ''}>${value}</td>`;
           }).join('')}
           <td class="hlj-col-stat">${Number(item?.plan || 0)}</td>
           <td class="hlj-col-stat">${Number(item?.current || 0)}</td>
@@ -2051,10 +2056,12 @@
         border-bottom-color:#f87171 !important;
       }
 
+      /* 状态胶囊。v0.5.5：把原来散在下方那处只写 height:20px 的覆盖规则并回来 ——
+         同一选择器两处定义时，读的人必须翻两处才知道真实高度，改起来必错。 */
       #${IDS.panel} .hlj-status-value {
         display:inline-flex;
         min-width:24px;
-        height:22px;
+        height:20px;
         align-items:center;
         justify-content:center;
         padding:0 6px;
@@ -2264,26 +2271,39 @@
         outline:none;
       }
 
-      /* 卡类矩阵里的数字：数量格（粗体 b）与状态格（胶囊 span）都可点开对应卡片 */
+      /* 卡类矩阵里的数字：数量格是粗体 b，状态格是带状态色的胶囊 span（配色见上方） */
       #${IDS.panel} .hlj-count-value {
         color:#1f2937;
         font-weight:800;
         font-variant-numeric:tabular-nums;
       }
 
-      #${IDS.panel} .hlj-count-value.is-clickable,
-      #${IDS.panel} .hlj-status-value.is-clickable {
+      /* 「可点数字」的统一反馈（v0.5.5 收敛成一套）：
+         矩阵数量格 / 矩阵状态格 / 进度表卡种格，三处的可点属性都挂在 <td> 上，
+         hover 时整格浅蓝底 + 一圈淡蓝 inset 描边。平时一律不加装饰。
+
+         为什么不用常驻底色：这个面板的底色通道已被数据语义占满
+         （5 种状态色 + 余额告警行 + KPI 卡）。再铺一层「可点」色块，
+         要么把状态色挤掉，要么两者互相稀释 —— 「有底色」就不再是任何有效信号。
+         交互属性走光标 + hover 反馈这条通道，不去抢数据的颜色。
+
+         为什么挂在 td 而不是里面的数字：热区。挂在数字上时，1 位数字的热区
+         只有 7px 左右，基本点不中；挂 td 上就是整格。也顺带让反馈与热区一致 ——
+         不会出现「悬停到数字才变色、却整格都能点」的错位。
+
+         为什么用 inset 描边而不是外阴影：td 的外阴影会被相邻格盖掉。
+         ⚠️ 另外别想着给里面的数字加 padding/min-width 来「顺便做大热区」——
+         .hlj-card-matrix table 是 table-layout:auto，任何撑大内容盒的写法都会让
+         列宽重新分配（实测行高 29→31、列宽 89 与 94 对调）。 */
+      #${IDS.panel} .hlj-card-matrix td[data-card-cell],
+      #${IDS.panel} .hlj-progress-table td.hlj-col-cat.is-clickable {
         cursor:pointer;
       }
 
-      #${IDS.panel} .hlj-count-value.is-clickable:hover {
-        color:#1d4ed8;
-        text-decoration:underline;
-      }
-
-      #${IDS.panel} .hlj-status-value.is-clickable:hover {
-        box-shadow:0 0 0 2px rgba(29,78,216,.18);
+      #${IDS.panel} .hlj-card-matrix td[data-card-cell]:hover,
+      #${IDS.panel} .hlj-progress-table td.hlj-col-cat.is-clickable:hover {
         background:#eff6ff;
+        box-shadow:inset 0 0 0 1px rgba(29,78,216,.25);
       }
 
       #${IDS.panel} .hlj-card-matrix-title {
@@ -2793,10 +2813,6 @@
         padding:5px 8px;
         font-size:12px;
         line-height:1.2;
-      }
-
-      #${IDS.panel} .hlj-status-value {
-        height:20px;
       }
 
 
@@ -4114,25 +4130,29 @@
 
     // 表格里的每个数字都能点开对应的卡（数量格 = 该卡类全部状态；状态格 = 该卡类该状态）。
     // 0 不挂点击（没卡可看），data 属性直接带卡种 + 状态，点击时按它过滤。
+    // ⚠️ 可点属性挂在 <td> 上、不是里面的数字：热区才是整个格子。
+    // 挂在数字上时 1 位数字的热区只有 7px 左右，基本点不中；
+    // 而且 hover 反馈与热区会错位（悬停到数字才变色，却整格都能点）。
+    // 进度表卡种格也是同样的挂法，三处共用一套 hover 规则。
     const renderCountCell = (category, status, value) => {
       const count = Number(value || 0);
       const attrs = count > 0
         ? ` data-card-cell="1" data-card-category="${escapeHtml(category)}" data-card-status="${escapeHtml(status)}"`
         : '';
 
-      // 「数量」列维持原来的粗体观感，只是多一层可点提示；
+      // 「数量」列维持原来的粗体观感；
       // 状态列沿用 .hlj-status-value 那套配色（跟表头一一对应）。
       if (!status) {
         return `
-          <td>
-            <b class="hlj-count-value ${count > 0 ? 'is-clickable' : ''}"${attrs}>${count}</b>
+          <td${attrs}>
+            <b class="hlj-count-value">${count}</b>
           </td>
         `;
       }
 
       return `
-        <td>
-          <span class="hlj-status-value ${getStatusToneClass(status)} ${count === 0 ? 'is-zero' : ''} ${count > 0 ? 'is-clickable' : ''}"${attrs}>
+        <td${attrs}>
+          <span class="hlj-status-value ${getStatusToneClass(status)} ${count === 0 ? 'is-zero' : ''}">
             ${count}
           </span>
         </td>
@@ -4166,6 +4186,9 @@
             nameHead: '姓名',
             getName: (item) => item.name,
             jumpAttr: (item) => ` data-jump-department="${escapeHtml(item.department)}" data-jump-person="${escapeHtml(item.name)}"`,
+            // 个人行覆盖的就是本人一个名字。
+            cellAttr: (item, category) =>
+              ` data-progress-cat="${escapeHtml(category)}" data-progress-owner="${escapeHtml(item.name)}" data-progress-names="${escapeHtml(item.name)}"`,
           })}
         </div>
       `
@@ -4187,6 +4210,10 @@
             nameHead: '部门',
             getName: (item) => item.department,
             jumpAttr: (item) => ` data-jump-department="${escapeHtml(item.department)}" data-jump-person="全部人员"`,
+            // 部门行覆盖本部门全部人（item.people 是 buildDepartmentProgress 已经算好的那份），
+            // 直接摊成名单写进属性，点击时不用再回头查 PERSONNEL_PLAN。
+            cellAttr: (item, category) =>
+              ` data-progress-cat="${escapeHtml(category)}" data-progress-owner="${escapeHtml(item.department)}" data-progress-names="${escapeHtml((item.people || []).map((person) => person.name).join(','))}"`,
           })}
         </div>
       `
@@ -4264,6 +4291,30 @@
           const dept = link.getAttribute('data-jump-department') || '全部部门';
           const person = link.getAttribute('data-jump-person') || '全部人员';
           if (typeof host.__hljJumpTo === 'function') host.__hljJumpTo(dept, person);
+          return;
+        }
+
+        // 进度表卡种列的数字 → 弹出「这一行 × 这个卡种」的卡。
+        // 行的覆盖范围在渲染时就写进 data-progress-names（逗号分隔的人名）：
+        // 个人行是本人，部门行是本部门一串人，所以两种视角共用这一段，不用分叉。
+        const progressCell = e.target.closest('[data-progress-cat]');
+        if (progressCell) {
+          const category = progressCell.getAttribute('data-progress-cat') || '';
+          const owner = progressCell.getAttribute('data-progress-owner') || '';
+          const names = new Set(
+            String(progressCell.getAttribute('data-progress-names') || '')
+              .split(',')
+              .filter(Boolean)
+          );
+
+          const list = (Array.isArray(ctx.cards) ? ctx.cards : []).filter(
+            (card) =>
+              names.has(getCardSaleName(card)) &&
+              getCardCategoryLabel(card?.activity_name) === category
+          );
+          if (!list.length) return;
+
+          openCardModal({ title: owner + ' · ' + category, cards: list });
           return;
         }
 
