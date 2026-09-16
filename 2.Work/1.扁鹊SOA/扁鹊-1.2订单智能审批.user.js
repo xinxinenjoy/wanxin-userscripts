@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.9
+// @version      2.10
 // @description  SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -20,13 +20,18 @@
  * 功能：
  * - 识别订单流程阶段并执行已支持的自动处理。
  * - 支持审批备注、体检时间校验与报价确认阶段时间修正。
- * - 支持合同智能补全、合同/授权书共用文件绑定及按需上传。
+ * - 支持合同智能补全、合同/无合同证明文件/授权书共用文件绑定及按需上传。
  * - 支持内勤复核、合同补充、发起落单、落单审核及流程停止。
  * - 关键动作执行后动态验证页面真实状态；长时间未推进时显示当前卡点诊断。
  * - 自动流程完成“已落单”后，自动复制订单名称、订单编号、商机代码、健管顾问、落单时间。
  * - 面板支持显示开关、拖动、折叠、位置记忆和网页提示记录。
  *
  * 更新记录
+ *
+ * v2.10 -  2026-9-16
+ * - 合同补充阶段新增“无合同证明文件”上传项：与合同文件、授权书共用同一个已绑定文件，
+ *   仅在页面出现该上传模块时按需补传，模块不存在时完全跳过，不影响原有流程。
+ * - 完整度判断、卡点诊断、绑定文件权限预申请一并纳入该上传项。
  *
  * v2.9  -  2026-9-13
  * - 面板标题与控制台加载提示的版本号统一为实际发布版本（此前面板停留在 v2.5）。
@@ -1313,6 +1318,17 @@
     ) {
       issues.push(
         "授权书未确认"
+      );
+    }
+
+    if (
+      state.proofUpload
+        ?.moduleExists &&
+      !state.proofUpload
+        .hasFile
+    ) {
+      issues.push(
+        "无合同证明文件未确认"
       );
     }
 
@@ -4468,6 +4484,26 @@
     );
   }
 
+  /*
+   * 上传项类型与名称对照。
+   * contract：已盖章合同文件；auth：企业查看员工体检报告补充授权书；
+   * proof：无合同证明文件（仅部分订单会出现，不出现时整体跳过）。
+   */
+  const UPLOAD_KIND_LABELS = {
+    contract: "合同文件",
+    auth: "授权书",
+    proof: "无合同证明文件"
+  };
+
+  function getUploadKindLabel(
+    kind
+  ) {
+    return (
+      UPLOAD_KIND_LABELS[kind] ||
+      "上传文件"
+    );
+  }
+
   function getUploaderTitle(
     uploader
   ) {
@@ -4553,6 +4589,28 @@
               uploader.textContent
             ).includes(
               "上传授权书"
+            )
+        ) ||
+        null
+      );
+    }
+
+    if (kind === "proof") {
+      return (
+        uploaders.find(
+          uploader =>
+            getUploaderTitle(
+              uploader
+            ).includes(
+              "无合同证明文件"
+            )
+        ) ||
+        uploaders.find(
+          uploader =>
+            compactText(
+              uploader.textContent
+            ).includes(
+              "上传证明文件"
             )
         ) ||
         null
@@ -4743,7 +4801,7 @@
         "待选择文件";
 
       button.title =
-        "尚未选择共用合同/授权书文件，点击选择";
+        "尚未选择共用合同/授权书/无合同证明文件，点击选择";
 
       button.style.color =
         "#cf1322";
@@ -5031,6 +5089,11 @@
         "auth"
       );
 
+    const proof =
+      getUploaderFileState(
+        "proof"
+      );
+
     return Boolean(
       (
         contract.moduleExists &&
@@ -5039,6 +5102,10 @@
       (
         auth.moduleExists &&
         !auth.hasFile
+      ) ||
+      (
+        proof.moduleExists &&
+        !proof.hasFile
       )
     );
   }
@@ -5062,6 +5129,11 @@
         "auth"
       );
 
+    const proofUpload =
+      getUploaderFileState(
+        "proof"
+      );
+
     const uploadNeedsFile =
       Boolean(
         (
@@ -5071,6 +5143,10 @@
         (
           authUpload.moduleExists &&
           !authUpload.hasFile
+        ) ||
+        (
+          proofUpload.moduleExists &&
+          !proofUpload.hasFile
         )
       );
 
@@ -5079,6 +5155,7 @@
       formNeedsEdit,
       contractUpload,
       authUpload,
+      proofUpload,
       uploadNeedsFile,
       complete:
         !formNeedsEdit &&
@@ -5110,6 +5187,17 @@
     ) {
       issues.push(
         "授权书未确认"
+      );
+    }
+
+    if (
+      state.proofUpload
+        ?.moduleExists &&
+      !state.proofUpload
+        .hasFile
+    ) {
+      issues.push(
+        "无合同证明文件未确认"
       );
     }
 
@@ -5167,7 +5255,7 @@
         },
         {
           label:
-            `${kind === "contract" ? "合同文件" : "授权书"}上传结果`,
+            `${getUploadKindLabel(kind)}上传结果`,
           token,
           timeout:
             CONFIG.UPLOAD_CONFIRM_TIMEOUT,
@@ -8476,7 +8564,7 @@
       );
     } else {
       log(
-        "✓ 当前合同类型的合同文件/授权书已存在或模块不适用，不读取绑定文件。"
+        "✓ 当前合同类型的合同文件/无合同证明文件/授权书已存在或模块不适用，不读取绑定文件。"
       );
     }
 
@@ -8496,9 +8584,18 @@
         token
       );
 
+    const proofUploadResult =
+      await uploadOne(
+        "proof",
+        sharedFile,
+        "无合同证明文件",
+        token
+      );
+
     const uploadResults = [
       contractUploadResult,
-      authUploadResult
+      authUploadResult,
+      proofUploadResult
     ];
 
     const uploadedCount =
@@ -8948,7 +9045,7 @@
           min-width:0;
           font-size:15px;
         ">
-          智能审批 v2.9
+          智能审批 v2.10
         </strong>
 
         <button
@@ -10584,6 +10681,6 @@
   routeCheck();
 
   console.log(
-    "[SOA智能审批] v2.9 已加载"
+    "[SOA智能审批] v2.10 已加载"
   );
 })();
