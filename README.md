@@ -8,7 +8,7 @@
 
 GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动更新。
 
-当前正式发布 **14** 个脚本 · 最近修改 **2026-09-16 09:47**
+当前正式发布 **14** 个脚本 · 最近修改 **2026-09-16 20:47**
 
 </div>
 
@@ -60,7 +60,7 @@ GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动�
 | **扁鹊-1.3体检数据查询** | `1.7.7` | 2026-09-13 10:55 | SOA体检数据：自动读取落单数据、体检汇总及三类卡数量，并支持按制卡批次查询卡备注。注意：卡类查询需要账号对应权限 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-dingdandata.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-dingdandata.user.js) |
 | **扁鹊-1.4对账报表导出** | `1.9` | 2026-09-08 23:30 | SOA对账报表：支持自定义日期区间，突破3年的时间段限制，自动分段查询、导出。并自动对比报表与订单内的数据差异。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-duizhangbaobiao.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-duizhangbaobiao.user.js) |
 | **扁鹊-1.5业绩报表辅助** | `1.1.5` | 2026-09-13 10:55 | SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-baobiaodaochu.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-baobiaodaochu.user.js) |
-| **扁鹊-1.6制卡管理查询** | `0.5.3` | 2026-09-15 16:32 | 查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-zhikaguanli.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-zhikaguanli.user.js) |
+| **扁鹊-1.6制卡管理查询** | `0.5.5` | 2026-09-16 20:47 | 查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-zhikaguanli.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-zhikaguanli.user.js) |
 | **扁鹊-1.7订单特殊审批** | `2.2.0` | 2026-09-16 09:47 | SOA特殊审批开关：一键在「特殊审批 开」（业务员报价后不可修改订单=勾选 + 检中修改钉钉审批=不启用）与「特殊审批 关」（反之，已恢复正常）之间切换。直接发请求、不跳转页面、不弹确认框，切完自动回读校验。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-neiqinshenpi.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-neiqinshenpi.user.js) |
 | **蝶美-1.1单位信息填充** | `7.8.5` | 2026-09-13 10:55 | 蝶美自动填充单位信息：按输入字段自适应填写，支持重复运行跳过、缺失字段跳过、行业/经济末级匹配、地区、单位类型、社会信用代码、企业规模及人数等字段。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/diemei/diemei-danweixinxi.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/diemei/diemei-danweixinxi.user.js) |
 | **蝶美-1.2套餐危害核对** | `4.2.18` | 2026-09-13 10:55 | 蝶美套餐危害核对：提供自动化核对、批量处理、自动选择等功能。注意：套餐名称的标准格式应为：XX-危害1+危害2+危害3+岗中+男，不保证能识别其他格式。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/diemei/diemei-weihaihedui.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/diemei/diemei-weihaihedui.user.js) |
