@@ -8,7 +8,7 @@
 
 GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动更新。
 
-当前正式发布 **15** 个脚本 · 最近修改 **2026-09-19 15:06**
+当前正式发布 **15** 个脚本 · 最近修改 **2026-09-21 13:32**
 
 </div>
 
@@ -57,7 +57,7 @@ GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动�
 | **发票-1.2订单页面** | `1.6` | 2026-09-03 15:01 | 发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/fapiao/fapiao-dingdan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/fapiao/fapiao-dingdan.user.js) |
 | **扁鹊-1.1首页模块排序** | `4.7` | 2026-09-05 15:47 | SOA首页模块排序：支持网页原始顺序/脚本排序两种图标方案，并支持拖拽保存、列数、模块宽度及列间距设置。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-shouye.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-shouye.user.js) |
 | **扁鹊-1.2订单智能审批** | `2.10` | 2026-09-16 09:46 | SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-dingdanauto.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-dingdanauto.user.js) |
-| **扁鹊-1.3体检数据查询** | `1.7.7` | 2026-09-13 10:55 | SOA体检数据：自动读取落单数据、体检汇总及三类卡数量，并支持按制卡批次查询卡备注。注意：卡类查询需要账号对应权限 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-dingdandata.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-dingdandata.user.js) |
+| **扁鹊-1.3体检数据查询** | `1.11.5` | 2026-09-21 13:32 | SOA体检数据：自动读取落单数据、体检汇总与三类卡数量；卡类数量/状态左键看卡片明细（自动按制卡批次带出备注）、右键跳卡池。注意：卡类查询需要账号对应权限 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-dingdandata.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-dingdandata.user.js) |
 | **扁鹊-1.4对账报表导出** | `1.9` | 2026-09-08 23:30 | SOA对账报表：支持自定义日期区间，突破3年的时间段限制，自动分段查询、导出。并自动对比报表与订单内的数据差异。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-duizhangbaobiao.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-duizhangbaobiao.user.js) |
 | **扁鹊-1.5业绩报表辅助** | `1.1.5` | 2026-09-13 10:55 | SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-baobiaodaochu.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-baobiaodaochu.user.js) |
 | **扁鹊-1.6制卡管理查询** | `0.5.5` | 2026-09-16 20:47 | 查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-zhikaguanli.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-zhikaguanli.user.js) |
