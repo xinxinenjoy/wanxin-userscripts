@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.14
+// @version      6.19
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -17,6 +17,19 @@
 /*
  * 更新记录
  *
+ * v6.19  -  2026-9-21
+ * - 「当前状态」文案过长时按省略号裁掉（不再撑宽表格），鼠标悬浮在该格上时，在格子上方弹气泡
+ *   显示完整文案。
+ * - 销方公司「改完不刷新」修复（今日反复迭代后的最终做法）：站点那格是自绘截断组件，
+ *   数据变化时【只更新 title、不重画可见文本】，而脚本当初又把简称覆盖进 title ⇒ 真值被抹掉 +
+ *   页面不重画 ⇒ 永远停在旧简称（点「查 询」也没用，只有 F5）。现在：
+ *     ① 旁听发票接口响应取真值（applyCode → contractCompanyName，不额外发请求）；
+ *     ② 写接口完成后主动补查一次「详情」接口拿真值（订单页保存后页面自己不带真值）；
+ *     ③ 真值优先于 DOM 的 title；④ 不再用简称覆盖那一格由站点维护的 title；
+ *     ⑤ 真值不在替换表里时按原文显示；⑥ 不拿 DOM 读值当写回基准（会自激写入）。
+ * - 不做「切回本页自动点查询」（红领巾 2026-09-21 明确不要，改为自己手动查询 / 刷新）。
+ *
+
  * v6.13  -  2026-8-29
  * - 更新：测试版本
  *
@@ -69,6 +82,19 @@ const COLUMN_LAYOUT = [
   const WIDTH_STEP = 60;
   const TABLE_MARKER = "data-tm-invoice-table";
   const TABLE_SELECTOR = `.ant-table[${TABLE_MARKER}="1"]`;
+  const LIST_CONTAINER_SELECTOR = ".mergeinvoice_container";
+
+  /* 状态列：文案过长时按省略号裁掉（列宽保持配置值，不撑宽表格），
+     hover 时用悬浮气泡显示完整文案，位置在单元格上方 */
+  const STATUS_TIP_ID = "tm-invoice-status-tip";
+
+  /* 旁听发票接口响应、捞销方公司真值时的最大递归深度 */
+  const TRUTH_SCAN_DEPTH = 6;
+  /* 写接口完成后，用「详情」接口主动补一次真值（页面点「详情」就是这么拿的） */
+  const TRUTH_DETAIL_URL = "/soa/api/v1/invoice/query/detail";
+  const SOA_CLIENT_ID = "MN_SOA3";
+  const TRUTH_REFRESH_MAX_ROWS = 6;
+  const TRUTH_REFRESH_GAP_MS = 800;
 
   /******************** 2) 状态 ********************/
   let enabled = false;
@@ -87,6 +113,14 @@ const COLUMN_LAYOUT = [
 
   let scheduled = false;
   let pendingForceStyle = false;
+
+  let statusTip = null;
+  let statusTipCell = null;
+
+  const sellerTruth = new Map(); // applyCode → 站点真值（销方公司全称）
+  let truthHookInstalled = false;
+  let soaRegionCode = "XX";
+  let lastTruthRefreshAt = 0;
 
   /******************** 3) 表格与基础工具 ********************/
   const normText = (value) => (value || "").replace(/\s+/g, " ").trim();
@@ -269,7 +303,7 @@ const COLUMN_LAYOUT = [
   }
 
   // 只改已有文本节点的 nodeValue，不使用 innerHTML/textContent 删除 React 管理的子节点。
-  function setCellTextKeepStructure(td, newText) {
+  function setCellTextKeepStructure(td, newText, options = {}) {
     const textNodes = getMeaningfulTextNodes(td);
     if (!textNodes.length) return false;
 
@@ -278,10 +312,13 @@ const COLUMN_LAYOUT = [
       textNodes[index].nodeValue = "";
     }
 
-    if (td.hasAttribute("title")) td.setAttribute("title", newText);
-    const titled = td.querySelector("[title]");
-    if (titled && titled.getAttribute("title")) {
-      titled.setAttribute("title", newText);
+    // keepTitle：留给「销方公司」这类由站点维护 title 真值的格子，不能覆盖。
+    if (!options.keepTitle) {
+      if (td.hasAttribute("title")) td.setAttribute("title", newText);
+      const titled = td.querySelector("[title]");
+      if (titled && titled.getAttribute("title")) {
+        titled.setAttribute("title", newText);
+      }
     }
 
     return true;
@@ -480,6 +517,19 @@ const COLUMN_LAYOUT = [
       `;
     });
 
+    // 状态文案过长时按省略号裁掉（列宽不变），完整文案由悬浮气泡给出（见 11.6 节）。
+    css += `
+      ${scope} td[data-tm-status="1"] {
+        overflow: hidden !important;
+      }
+      ${scope} td[data-tm-status="1"] > div {
+        max-width: 100%;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+      }
+    `;
+
     return css;
   }
 
@@ -508,10 +558,28 @@ const COLUMN_LAYOUT = [
   }
 
   /******************** 7) 行处理 ********************/
-  function signatureForRow(tr, statusIdx, amountIdx) {
+  // 销方公司格的「真值指纹」：站点在数据变化时会更新这一格的 title（含内层 span 的 title），
+  // 但不会重画可见文本 —— 把它纳入签名，title 一变就重算简称。
+  function sellerSourceSignature(tr, sellerIdx) {
+    if (sellerIdx === undefined) return "";
+    const cell = tr.children[sellerIdx];
+    if (!cell) return "";
+
+    const parts = [cell.getAttribute("title") || ""];
+    cell.querySelectorAll("[title]").forEach((node) => {
+      parts.push(node.getAttribute("title") || "");
+    });
+
+    return parts.join("~");
+  }
+
+  function signatureForRow(tr, statusIdx, amountIdx, sellerIdx, sellerTruthValue) {
     const statusReady = statusIdx !== undefined ? "S1" : "S0";
     const amountReady = amountIdx !== undefined ? "A1" : "A0";
-    return `${tr.innerText || ""}|${statusReady}|${amountReady}`;
+    return `${tr.innerText || ""}|${statusReady}|${amountReady}|${sellerSourceSignature(
+      tr,
+      sellerIdx
+    )}|${sellerTruthValue || ""}`;
   }
 
   function processRow(tr, columnIndexes) {
@@ -519,7 +587,16 @@ const COLUMN_LAYOUT = [
 
     const statusIdx = columnIndexes.get("当前状态");
     const amountIdx = columnIndexes.get("发票金额");
-    const signature = signatureForRow(tr, statusIdx, amountIdx);
+    const sellerIdx = columnIndexes.get("销方公司");
+    const applyCode = getApplyCode(tr, statusIdx);
+    const sellerTruthValue = sellerTruth.get(applyCode) || "";
+    const signature = signatureForRow(
+      tr,
+      statusIdx,
+      amountIdx,
+      sellerIdx,
+      sellerTruthValue
+    );
     if (rowSig.get(tr) === signature) return;
     rowSig.set(tr, signature);
 
@@ -544,13 +621,36 @@ const COLUMN_LAYOUT = [
     }
 
     // 跳过操作链接和按钮，避免破坏操作列。
-    for (const cell of cells) {
+    for (let index = 0; index < cells.length; index += 1) {
+      const cell = cells[index];
       if (!cell || cell.querySelector("a,button")) continue;
 
       const rawFull = getCellFullText(cell);
       if (!rawFull) continue;
 
       const replaced = safeReplaceText(rawFull);
+
+      if (index === sellerIdx) {
+        // 销方公司格：
+        // ① 首选旁听到的接口真值（最可靠，站点不重画那一格也拦不住我们）；
+        // ② 没有真值时才退而求其次，且必须「替换真的生效」才写。
+        // ⚠️ 不能拿 DOM 读回来的值当比较基准 —— 站点那套自绘截断组件的读值可能只是片段，
+        //    会造成反复写入把格子写爆（2026-09-21 实测踩到过）。
+        const truth = sellerTruth.get(applyCode) || "";
+        const source = truth || rawFull;
+        const target = safeReplaceText(source);
+
+        const shouldWrite = truth
+          ? normText(cell.innerText) !== normText(target)
+          : target !== rawFull;
+
+        if (shouldWrite) {
+          setCellTextKeepStructure(cell, target, { keepTitle: true });
+        }
+
+        continue;
+      }
+
       if (replaced !== rawFull) setCellTextKeepStructure(cell, replaced);
     }
 
@@ -567,6 +667,8 @@ const COLUMN_LAYOUT = [
     }
 
     if (statusIdx === undefined || !cells[statusIdx]) return;
+
+    cells[statusIdx].setAttribute("data-tm-status", "1");
 
     tr.classList.remove("tm-row-fail", "tm-row-refund");
     const statusText = normText(cells[statusIdx].innerText);
@@ -840,6 +942,10 @@ const COLUMN_LAYOUT = [
       childList: true,
       characterData: true,
       subtree: true,
+      // 站点那套「自适应截断」的单元格在数据变化时只更新 title、不重画可见文本，
+      // 所以必须盯着 title 属性，否则改了数据这一格永远是旧简称（实测：点「查 询」该格 0 条 DOM 变化）。
+      attributes: true,
+      attributeFilter: ["title"],
     });
 
     return true;
@@ -918,9 +1024,342 @@ const COLUMN_LAYOUT = [
         applyOrUpdateStyle(headerSignature);
       }
 
+      if (statusTipCell && !statusTipCell.isConnected) hideStatusTip();
+
       ensureUiButton();
       processRowsIncremental(observedTableRoot);
     });
+  }
+
+  /******************** 11.6) 状态列：hover 悬浮气泡显示完整文案 ********************/
+  /* 列宽保持配置值不动（不撑宽表格）；文案被裁掉时，鼠标悬浮在单元格上，
+     在它上方弹一个气泡给出完整文案。用 position:fixed 挂到 body —— 表格祖先有
+     overflow，绝对定位的气泡会被直接裁掉。 */
+  const STATUS_TIP_OFFSET = 8;
+
+  function ensureStatusTip() {
+    if (statusTip && statusTip.isConnected) return statusTip;
+
+    statusTip = document.createElement("div");
+    statusTip.id = STATUS_TIP_ID;
+    Object.assign(statusTip.style, {
+      position: "fixed",
+      left: "0",
+      top: "0",
+      zIndex: "2147483000",
+      maxWidth: "min(560px, calc(100vw - 32px))",
+      padding: "8px 12px",
+      borderRadius: "8px",
+      background: "rgba(0, 0, 0, 0.85)",
+      color: "#fff",
+      font: "13px/20px -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif",
+      boxShadow: "0 6px 16px rgba(0, 0, 0, 0.2)",
+      whiteSpace: "normal",
+      wordBreak: "break-word",
+      pointerEvents: "none",
+      display: "none",
+    });
+
+    document.body.appendChild(statusTip);
+    return statusTip;
+  }
+
+  function hideStatusTip() {
+    if (statusTip) statusTip.style.display = "none";
+    statusTipCell = null;
+  }
+
+  function removeStatusTip() {
+    if (statusTip) {
+      statusTip.remove();
+      statusTip = null;
+    }
+    statusTipCell = null;
+  }
+
+  function showStatusTip(cell) {
+    const text = normText(cell.innerText);
+    if (!text) return;
+
+    const tip = ensureStatusTip();
+    tip.textContent = text;
+    tip.style.display = "block";
+
+    const cellRect = cell.getBoundingClientRect();
+    let top = cellRect.top - tip.offsetHeight - STATUS_TIP_OFFSET;
+    if (top < 4) top = cellRect.bottom + STATUS_TIP_OFFSET;   // 上方放不下就翻到下方
+
+    let left = cellRect.left;
+    const maxLeft = window.innerWidth - tip.offsetWidth - 8;
+    if (left > maxLeft) left = maxLeft;
+
+    tip.style.left = `${Math.round(Math.max(8, left))}px`;
+    tip.style.top = `${Math.round(Math.max(4, top))}px`;
+    statusTipCell = cell;
+  }
+
+  function handleStatusHover(event) {
+    if (!enabled) return;
+
+    const cell = event.target?.closest?.("td[data-tm-status='1']") || null;
+
+    if (!cell) {
+      if (statusTipCell) hideStatusTip();
+      return;
+    }
+
+    if (cell === statusTipCell) return;
+
+    // 没被裁就不用弹气泡
+    const inner = cell.firstElementChild || cell;
+    if (inner.scrollWidth <= inner.clientWidth) {
+      hideStatusTip();
+      return;
+    }
+
+    showStatusTip(cell);
+  }
+
+  document.addEventListener("mouseover", handleStatusHover, true);
+  document.addEventListener("mouseout", (event) => {
+    if (!statusTipCell) return;
+    const to = event.relatedTarget;
+    if (to && statusTipCell.contains(to)) return;
+    hideStatusTip();
+  }, true);
+  window.addEventListener("scroll", () => {
+    if (statusTipCell) hideStatusTip();
+  }, true);
+  window.addEventListener("resize", () => {
+    if (statusTipCell) hideStatusTip();
+  });
+
+  /******************** 11.7) 销方公司真值：旁听接口响应 ********************/
+  /* 页面自己拉数据（合并列表 / 按订单查 / 详情）时，响应里都带着 contractCompanyName —— 旁听下来
+     当真值用，最可靠：既不依赖站点会不会重画那一格，也不用额外发请求。 */
+  function recordSellerTruth(value, depth) {
+    if (!value || typeof value !== "object" || depth > TRUTH_SCAN_DEPTH) return false;
+
+    let changed = false;
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (recordSellerTruth(item, depth + 1)) changed = true;
+      }
+      return changed;
+    }
+
+    const code = value.applyCode;
+    const name = value.contractCompanyName;
+
+    if (typeof code === "string" && code && typeof name === "string" && name) {
+      if (sellerTruth.get(code) !== name) {
+        sellerTruth.set(code, name);
+        changed = true;
+      }
+    }
+
+    for (const key of Object.keys(value)) {
+      const child = value[key];
+      if (child && typeof child === "object" && recordSellerTruth(child, depth + 1)) {
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
+  function readSellerTruthFromText(text) {
+    if (!text || text.length < 10 || text.length > 2000000) return false;
+    if (text.indexOf("contractCompanyName") === -1) return false;
+
+    try {
+      return recordSellerTruth(JSON.parse(text), 0);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function pickStringField(value, keys, depth) {
+    if (!value || typeof value !== "object" || depth > 4) return "";
+
+    for (const key of keys) {
+      if (typeof value[key] === "string" && value[key]) return value[key];
+    }
+
+    for (const key of Object.keys(value)) {
+      const child = value[key];
+      if (child && typeof child === "object") {
+        const hit = pickStringField(child, keys, depth + 1);
+        if (hit) return hit;
+      }
+    }
+
+    return "";
+  }
+
+  function parseJsonBody(bodyText) {
+    if (!bodyText || typeof bodyText !== "string") return null;
+    if (bodyText.length > 200000) return null;
+
+    try {
+      return JSON.parse(bodyText);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  // 记住页面自己在用的 regionCode，主动补真值时照抄，避免猜
+  function rememberRequestMeta(url, method, bodyText) {
+    if (!String(url || "").includes("/invoice/")) return;
+
+    const json = parseJsonBody(bodyText);
+    if (!json) return;
+
+    const regionCode = pickStringField(json, ["regionCode"], 0);
+    if (regionCode && regionCode.length <= 8) soaRegionCode = regionCode;
+  }
+
+  // 写接口：非 GET，且不是那几个查询/统计端点
+  function isInvoiceWriteRequest(url, method) {
+    if (!url || !url.includes("/invoice/")) return false;
+    if (String(method || "GET").toUpperCase() === "GET") return false;
+
+    return !/\/(query|list|detail|page|statistics|total|count|type|goods|org|company|template)/i.test(
+      url
+    );
+  }
+
+  function getVisibleApplyCodes() {
+    if (!observedTableRoot) return [];
+
+    const statusIdx = getHeaderIndexMap(observedTableRoot).get("当前状态");
+    if (statusIdx === undefined) return [];
+
+    return getBodyRows(observedTableRoot)
+      .map((tr) => getApplyCode(tr, statusIdx))
+      .filter(Boolean);
+  }
+
+  /* 保存后页面自己的重拉不一定把销方公司带回来（实测订单页就没有），
+     所以照着「详情」那条接口主动补一次真值 —— 拿到就立刻纠正显示。 */
+  function refreshSellerTruth(applyCodes) {
+    const codes = [
+      ...new Set((applyCodes || []).filter(Boolean)),
+    ].slice(0, TRUTH_REFRESH_MAX_ROWS);
+
+    const target = codes.length ? codes : getVisibleApplyCodes().slice(0, TRUTH_REFRESH_MAX_ROWS);
+    if (!target.length) return;
+
+    const now = Date.now();
+    if (now - lastTruthRefreshAt < TRUTH_REFRESH_GAP_MS) return;
+    lastTruthRefreshAt = now;
+
+    target.forEach((applyCode) => {
+      try {
+        fetch(TRUTH_DETAIL_URL, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            mnClientId: SOA_CLIENT_ID,
+          },
+          body: JSON.stringify({
+            applyCode: applyCode,
+            regionCode: soaRegionCode,
+          }),
+        })
+          .then((response) => response.text())
+          .then((text) => {
+            if (readSellerTruthFromText(text)) scheduleWork(false);
+          })
+          .catch(() => {});
+      } catch (error) {}
+    });
+  }
+
+  // 只旁听，不改动任何请求 / 响应本身；另外写接口一完成就主动补一次真值。
+  function installTruthHook() {
+    if (truthHookInstalled) return;
+    truthHookInstalled = true;
+
+    const originalFetch = window.fetch;
+
+    if (typeof originalFetch === "function") {
+      window.fetch = function () {
+        const result = originalFetch.apply(this, arguments);
+        const options = arguments[1] || {};
+        const url =
+          typeof arguments[0] === "string"
+            ? arguments[0]
+            : arguments[0]?.url || "";
+        const method = options.method || (arguments[0] && arguments[0].method) || "GET";
+        const bodyText = typeof options.body === "string" ? options.body : "";
+
+        rememberRequestMeta(url, method, bodyText);
+
+        if (url.includes("/invoice/") && result && typeof result.then === "function") {
+          result
+            .then((response) => {
+              if (isInvoiceWriteRequest(url, method)) {
+                const hint = pickStringField(parseJsonBody(bodyText), ["applyCode", "invoiceApplyCode"], 0);
+                refreshSellerTruth(hint ? [hint] : []);
+              }
+
+              response
+                .clone()
+                .text()
+                .then((text) => {
+                  if (readSellerTruthFromText(text)) scheduleWork(false);
+                })
+                .catch(() => {});
+            })
+            .catch(() => {});
+        }
+
+        return result;
+      };
+    }
+
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.tmRequestUrl = url;
+      this.tmRequestMethod = method;
+      return originalOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function (body) {
+      const url = String(this.tmRequestUrl || "");
+      const method = this.tmRequestMethod || "GET";
+      const bodyText = typeof body === "string" ? body : "";
+
+      rememberRequestMeta(url, method, bodyText);
+
+      if (url.includes("/invoice/")) {
+        this.addEventListener("load", () => {
+          try {
+            if (isInvoiceWriteRequest(url, method)) {
+              const hint = pickStringField(parseJsonBody(bodyText), ["applyCode", "invoiceApplyCode"], 0);
+              refreshSellerTruth(hint ? [hint] : []);
+            }
+
+            if (readSellerTruthFromText(this.responseText)) scheduleWork(false);
+          } catch (error) {}
+        });
+      }
+
+      return originalSend.apply(this, arguments);
+    };
+  }
+
+  // 这一行的申请单号：状态格里那个 div#applyCode-xxx
+  function getApplyCode(tr, statusIdx) {
+    if (statusIdx === undefined) return "";
+
+    const holder = tr.children[statusIdx]?.querySelector('[id^="applyCode-"]');
+    return holder ? holder.id.slice("applyCode-".length) : "";
   }
 
   /******************** 12) 启用/禁用 ********************/
@@ -932,6 +1371,8 @@ const COLUMN_LAYOUT = [
     lastPageKey = null;
     lastHeaderSignature = "";
     pendingForceStyle = false;
+
+    installTruthHook();
 
     connectRootObserverIfNeeded();
     connectTableObserver();
@@ -950,6 +1391,7 @@ const COLUMN_LAYOUT = [
     disconnectRootObserver();
     removeStyle();
     removeUiButton();
+    removeStatusTip();
 
     customerWidthDelta = 0;
     lastPageKey = null;
