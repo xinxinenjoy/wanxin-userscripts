@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.7.7
-// @description  SOA体检数据：自动读取落单数据、体检汇总及三类卡数量，并支持按制卡批次查询卡备注。注意：卡类查询需要账号对应权限
+// @version      1.11.5
+// @description  SOA体检数据：自动读取落单数据、体检汇总与三类卡数量；卡类数量/状态左键看卡片明细（自动按制卡批次带出备注）、右键跳卡池。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        none
@@ -15,139 +15,107 @@
 // ==/UserScript==
 
 /*
- * SOA.3.2体检数据
+ * SOA.3.2体检数据（扁鹊-1.3）
  *
- * 功能：
- * - 已落单订单按需读取落单时间记录并支持复制为表格行。
- * - 读取体检总人数、已检/未检人数、到检/挂账/自费金额。
- * - 同时查询套餐卡、储值卡、电商卡数量，15秒内复用同订单查询结果。
- * - 卡数量大于0时可新建标签页打开对应卡池，自动填写单位代码并查询。
- * - 可在有数据的套餐卡/储值卡内手动查询备注：按卡号后5位识别制卡批次区间，再读取详情中的 remark。
- * - 每次从未覆盖卡号中取1张查询制卡区间，区间内同类卡自动排除；仍有区间外卡号时继续查询下一批次。
- * - 与SOA.3.1智能审批完全解耦，不修改订单业务数据。
+ * 功能
+ *
+ * 【落单数据】已落单订单按需读取落单时间记录，支持复制为表格行。
+ *
+ * 【体检汇总】读取体检总人数、已检/未检人数、到检/挂账/自费金额。
+ *
+ * 【卡类数量】套餐卡 / 储值卡 / 电商卡三类固定显示（0 张也占位，避免 UI 跳动）。
+ *   每类按 status 统计成状态明细（生效中 / 已核销 / 已预约 / 冻结 / 作废）：
+ *   「数量」左键 → 卡片明细弹窗（列全部）；「状态明细」整条是可点色块，
+ *   左键 → 同一个弹窗但只列该状态；两者的右键都是跳对应卡池（新标签页打开并自动填单位代码查询）。
+ *   打开面板即自动查询，同订单 15 秒内复用结果。
+ *
+ * 【卡片明细弹窗】列表为 卡号 / 卡类 / 状态 / 备注，数据全部来自已查到的卡池 items，不发请求；
+ *   点某一行就地展开该卡详情（含所属制卡批次的卡号区间 / 办卡日期 / 卡数 / 备注）。
+ *   备注列随批次读取结果自动回填。
+ *
+ * 【卡备注 · 制卡批次】打开明细弹窗即自动读取该卡类的制卡审批：
+ *   1) 卡池卡号按「同前缀 + 序号连续」切成连续段（跳号处断开）；
+ *   2) 段内取靠近中点的卡作代表，查制卡审批 process/page；
+ *   3) 按审批返回区间细分：完整覆盖当前子区间 → 整段同批；只压住一侧 → 区间外左右两侧递归；
+ *      该卡查不到记录 → 换段内另一张再试，全试完才放弃这一段；
+ *   4) 判区间的同时顺带取 process/detail，把备注一并拿回（每个批次 1 次请求）；
+ *   5) 可疑批次（区间长度与审批卡数不符 / 归属单位不符 / 与其它区间重叠）不参与剪枝，
+ *      改为只针对这一条加密核对：重叠段逐段复核；长度不符则按卡池卡号每 10 张取一点
+ *      （步长 CARD_REMARK_SUSPECT_PROBE_STEP）。干净批次零额外请求。
+ *   批次区块**默认折叠**，标题行右侧「展开批次」按钮高亮；标题行始终可见（含批次数量与待确认提示）。
+ *   备注结果只存在当前标签页内存，刷新数据 / 切换订单 / 切换单位代码时清空。
+ *
+ * 【卡号规则】17 位 = 年份2 + 标识3 + 活动码6 + 序号6；区间比较必须「同组前缀 + 序号落在区间内」。
+ *   制卡审批**只能按卡号查**：订单名称会重复，且 orderCode / soaOrderNo / corpCode / cardCorpCode
+ *   这几个过滤条件实测都被服务端忽略（一律返回全量），不存在“按订单一次拉全部审批”的接口。
+ *
+ * 【口径基线】卡类数据以「按 cardCorpCode 查到的卡池」为准 —— 卡是活的（归属订单会被调整），
+ *   审批是历史记录。所以池内张数少于审批声明张数属正常，不按审批反查补全（会把已调走的卡拉回来）。
+ *
+ * 【其它】卡池返回的 card_pwd（卡密）统一剔除，弹窗只按白名单取字段；
+ *   与 SOA.3.1 智能审批完全解耦，不修改订单业务数据。卡类查询需要账号对应权限。
  *
  * 更新记录
  *
+ * v1.11.5  -  2026-9-21   ⬅ 当前版本（本日整轮改造的收尾）
+ * - 「制卡批次」区块改为默认折叠：标题行右侧「展开批次 ▾」按钮（折叠态实底蓝高亮，展开后弱化为描边）；
+ *   折叠只切该区块显示、不重渲染，每次打开弹窗回到折叠态。
+ * - 去掉批次区块的「放大查看」按钮及背后的整个宽表大窗（批次区块已把区间 / 日期 / 卡数 / 备注看全）。
+ * - 状态明细整条改为可点色块（左键按状态筛选卡片明细），配色对齐「扁鹊-1.6」面板那套；已核销用灰。
+ * - 「左键明细 · 右键卡池」提示移到「卡类数量」标题行右侧；面板标题版本号改读 SCRIPT_VERSION；
+ *   删除面板底部那段冗余说明。
+ *
+ * v1.11.0  -  2026-9-21
+ * - 备注不再需要单独操作：打开卡片明细弹窗即自动读取制卡审批，判区间时顺带把 process/detail 的备注
+ *   一并拿回；撤掉卡片上的「查询备注 / 查看备注」与页脚按钮（含已成死代码的两个渲染 / 绑定函数）。
+ * - 备注主循环重写为「先切段、再细分」（见上方【卡备注 · 制卡批次】1)~3)）。
+ * - 新增可疑批次机制：可疑批次不参与剪枝，只针对该条加密核对；批次区块显示
+ *   「本单卡池 N 张 / 审批声明 K 张」等口径数字，差额附注正常口径差异说明。
+ *
+ * v1.8.0  -  2026-9-21
+ * - 卡号区间判断改用结构化规则（年份2 + 标识3 + 活动码6 + 序号6 = 17 位），删除「后 5 位」比较，
+ *   修掉跨 10 万进位时的区间错并 / 漏查；跨组或解析失败的区间不自动拆分，退回按单卡处理。
+ * - 备注仍按「同一批次 2 次请求」（process/page → process/detail），抽出统一取数入口避免两处漂移。
+ * - 卡类数字新增左键入口（卡片明细弹窗，0 请求）；右键保留跳卡池并自动填单位代码；
+ *   卡池返回的 card_pwd（卡密）统一剔除。
+ *
  * v1.7.5  -  2026-9-9
- * - 卡片内不再直接展开备注内容，避免备注较多时撑高主面板。
- * - 卡数量大于0时显示“查询备注”；查询完成后同一按钮自动变为“查看备注”。
- * - 点击“查看备注”直接打开现有放大详情窗口，集中查看卡号区间、办卡日期、数量和备注。
- * - 卡数量为0时仍不显示备注按钮；原制卡批次识别与备注查询逻辑保持不变。
+ * - 卡片内不再直接展开备注：数量大于 0 时显示「查询备注」，完成后变「查看备注」，打开放大详情窗
+ *   （显示卡号区间、办卡日期、数量、备注）。备注入口自 v1.11.0 起改为自动读取。
  *
- * v1.7.4  -  2026-9-9
- * - 缩小卡备注放大详情窗口宽度，减少横向空白。
- * - “数量”从右侧移到办卡日期右侧，日期与数量在同一行更紧凑展示。
- * - 放大详情中的办卡日期、数量、备注字号整体调大，提高可读性。
+ * v1.7.0 ~ v1.7.4  -  2026-9-9
+ * - 卡备注功能成形：按卡类型独立查询；page 取批次 id → detail 取 remark，同批次详情只读一次；
+ *   同一区间内的卡号自动排除，滚动覆盖其余批次；放大详情按制卡区间逐条列出。
+ *   ⚠️ 该阶段的区间比较用的是「卡号后 5 位」，v1.8.0 已整体删除。
  *
- * v1.7.3  -  2026-9-9
- * - 优化卡备注放大详情布局：不再显示“批次1/批次2”，改为按实际制卡区间逐条编号展示。
- * - 每条记录直接显示卡号区间、办卡日期、卡数量和备注内容，减少层级与留白。
- * - 卡数量优先读取制卡详情 cardNum；缺失时根据卡号后5位 beginNo/endNo 自动计算。
+ * v1.6.0 ~ v1.6.4  -  2026-9-7
+ * - v1.6.0 新增电商卡分类；v1.6.1 三类卡固定显示（0 张占位）+ 状态字段兼容扩展；
+ *   v1.6.2 状态展示顺序固定为 生效中 → 已核销 → 已冻结 → 作废 → 其他；
+ *   v1.6.3 卡分类 UI 收紧信息密度；v1.6.4 大卡池分页请求节奏优化（分页间隔 + 批次停顿）。
  *
- * v1.7.2  -  2026-9-9
- * - 卡片内继续保留紧凑备注显示，并新增“放大查看”入口；备注较长时不再强行撑宽卡片。
- * - 放大详情按备注分组展示完整内容，并列出对应制卡批次的完整卡号区间及办卡日期。
- * - 办卡日期优先读取 detail.beginDate，缺失时依次回退 bindTime、internalProcessTime、financeProcessTime 等制卡时间字段。
- * - 同一备注对应多个制卡批次时，在放大详情中逐批次列出；查询和批次识别逻辑保持不变。
+ * v1.5.0 ~ v1.5.2  -  2026-9-7
+ * - v1.5.0 卡池改为 page_size=100 完整分页 + 状态统计；v1.5.1 / v1.5.2 状态色标改为左右对齐明细色。
  *
- * v1.7.1  -  2026-9-9
- * - 卡备注查询改为按卡类型独立处理，仅数量大于0的套餐卡/储值卡显示“查询备注”按钮，不再单独占用备注面板。
- * - 同类型卡批次判断只比较卡号最后5位：先查询1张卡，读取 beginNo/endNo 后排除该区间内全部卡号，区间外仍有卡时再继续查询下一张。
- * - 同一个制卡批次的 detail 只读取一次；不同批次重复 remark 自动去重。
- * - 备注结果仅简洁显示“备注内容：1.AAA 2.BBB …”，不再展示抽样数量、批次数等辅助统计。
- * - 保留制卡 page → detail 的查询方式及随机短延迟；刷新数据或切换订单时自动清空备注结果。
+ * v1.4.0 ~ v1.4.3  -  2026-9-5 / 9-6
+ * - v1.4.0 增加手动刷新；v1.4.1 修复刷新与关闭按钮 ID 冲突；v1.4.2 数据分区显示；
+ *   v1.4.3 缓存绑定当前订单页面（不持久化，切换订单自动失效，避免串单）。
  *
- * v1.7.0  -  2026-9-9
- * - 新增“卡备注抽查”：复用当前已查询到的套餐卡/储值卡列表，不额外重新拉取完整卡池。
- * - 每轮最多分散随机抽查5张代表卡号，先请求制卡记录 page 接口获取批次 id，再请求 detail 接口提取 remark。
- * - 已识别的 beginNo~endNo 制卡区间自动跳过，避免在同一批次内重复请求；同一批次详情只读取一次。
- * - 查询结果按制卡批次和备注去重展示；发现多种 remark 时突出提示，便于识别同订单多次办卡。
- * - 再次点击“继续抽查”会优先抽取尚未检查、且不属于已识别批次区间的卡号，提高抽样覆盖。
- * - 制卡查询请求全部串行执行，并加入随机短等待，避免瞬间集中请求。
- *
- * v1.6.4  -  2026-9-7
- * - 优化大卡池分页请求节奏：10页以内每次请求后随机等待50-100ms，10页以上随机等待100-200ms。
- * - 每连续完成7-10次分页请求后，额外随机停顿800-1200ms；每轮停顿阈值重新随机生成。
- * - 第一页计入连续请求次数；最后一页完成后不再执行无意义等待。
- * - 仅调整卡池分页请求节奏，查询接口、page_size=100、完整分页、缓存、状态识别、UI和三类卡跳转逻辑均保持不变。
- *
- * v1.6.3  -  2026-9-7
- * - 仅优化卡分类UI：三类卡继续固定显示，但0值卡自动收缩，不再被有状态明细的卡片强制撑高。
- * - 有数据卡适度强化边框和总数；0值卡降低视觉权重，仍明确显示“0”。
- * - 状态名称字号提升至12px、数量提升至14px并加粗；缩小行间距，保持左侧状态、右侧数量严格对齐。
- * - 状态区分隔线与上下留白同步收紧，提高信息密度和可读性；查询、分页、缓存、状态识别和跳转逻辑不变。
- *
- * v1.6.2  -  2026-9-7
- * - 仅调整卡状态展示顺序，固定为：生效中 → 已核销 → 已冻结 → 作废 → 其他。
- * - 数量为0的状态仍不显示；查询、分页、缓存、状态识别及三类卡跳转逻辑均保持不变。
- *
- * v1.6.1  -  2026-9-7
- * - 三类卡固定显示：套餐卡、储值卡、电商卡始终三列并排，0张也保留卡位，避免UI跳动。
- * - 修正卡状态识别：兼容status、status_business、card_status、cardStatus、use_status、state等字段；未知主状态不会遮蔽有效备用状态。
- * - 扩展常见状态别名；真正未知状态仍归入“其他”，并在控制台记录原始值，便于后续补充映射。
- * - 电商卡总数量支持点击后打开卡池页，自动定位电商卡页签、填写单位代码并查询。
- * - 三类卡统一使用page_size=100及完整分页逻辑；其他体检、落单、缓存、刷新功能不变。
- *
- * v1.6.0  -  2026-9-7
- * - 新增“电商卡”分类，实时查询 /soa-card/api/v1/platform/card/pool/display。
- * - 电商卡沿用卡池完整分页逻辑，page_size固定100，并按status统计生效中、已核销、已冻结、作废及其他状态。
- * - 电商卡总数为0时默认隐藏；有数据时与套餐卡、储值卡三列并排显示；查询失败时保留错误提示，避免误判为无数据。
- * - 电商卡当前仅展示统计，不新增卡池跳转；套餐卡、储值卡原有点击跳转逻辑保持不变。
- *
- * v1.5.2  -  2026-9-7
- * - 仅优化卡分类UI：取消状态行灰色/彩色底块，改为简洁的左右对齐明细。
- * - 状态名称左对齐、数量右对齐并加粗；去掉“张”字，适当放大字号。
- * - 生效中用绿色、已核销用灰色、已冻结用橙色、作废用红色、其他用蓝色。
- *
- * v1.5.1  -  2026-9-7
- * - 优化卡状态展示：按状态颜色标签显示，提高卡信息可读性。
- *
- * v1.5.0  -  2026-9-7
- * - 卡池查询优化：单次请求改为100条，并自动分页获取完整数据。
- * - 增加卡状态统计：生效中、已核销、冻结、作废及其他。
- * - 卡状态数量按实际存在情况显示，空状态自动隐藏。
- * - 增加大卡池查询过程提示。
- *
- * v1.4.3  -  2026-9-6
- * - 优化页面级缓存机制：缓存绑定当前订单页面，不使用持久化缓存。
- * - 同一订单页面关闭/重新打开模块时复用当前页面数据，避免重复请求。
- * - 切换不同订单时自动失效缓存并重新读取，避免数据串单。
- * - 点击“刷新数据”时清除当前页面缓存并强制重新查询。
- *
- * v1.4.2  -  2026-9-5
- * - 优化体检数据窗体文字可读性：提高关键标签字号、字重和对比度，数值显示更清晰。
- * - 将落单记录、体检汇总、卡类数量拆分为独立视觉区块，增加间距、浅色背景和区块标题，避免数据区域挤在一起。
- * - 仅调整UI展示，不修改落单、体检、卡池查询、权限校验及刷新逻辑。
- *
- * v1.4.1  -  2026-9-5
- * - 修复“刷新”按钮与关闭按钮缺少独立ID导致事件绑定到同一按钮的问题；刷新数据时不再关闭工具窗体。
- * - 刷新按钮更名为“刷新数据”，调整为青绿色轻量按钮样式，并增加刷新中禁用状态。
- * - 刷新仅清理当前数据缓存并在原窗口内重新查询，不调用关闭窗体逻辑；其余v1.4逻辑保持不变。
- *
- * v1.4  -  2026-9-5
- * - 增加手动刷新按钮。
- * - 打开模块仍自动读取数据，但后续不再自动重复刷新。
- * - 刷新时重新请求当前订单数据，避免页面切换造成旧缓存影响。
- *
- * v1.3  -  2026-9-5
- * - 商机编号读取增加老订单兼容：优先读取“商机编号”，缺失或无有效数字时改用“单位代码”。
- * - 卡池查询、落单数据复制统一使用同一套商机编号/单位代码兜底规则，不扫描页面其他数字。
- *
- * v1.2  -  2026-9-1
- * - 内置公共“红领巾的工具箱”框体样式，单独启用本模块时也可正常显示。
- * - 工具箱边框改用伪元素向外绘制，不改变按钮原有布局高度；增加淡色背景并放大工具箱标识。
- *
- * v1.1  -  2026-9-1
- * - 模块正式更名为SOA.3.2体检数据，顶部入口改为“查询体检数据 / 关闭体检数据”。
- * - 打开模块后自动加载落单数据、体检汇总及卡类数量，取消面板内二次查询按钮。
- * - 同订单15秒内重复打开复用已加载结果，避免频繁请求；顶部入口固定为工具组第2位。
- *
- * v1.0  -  2026-9-1
- * - 从SOA.2.5 v1.32迁移落单数据、体检数据、卡类查询及卡池跳转功能。
+ * v1.0 ~ v1.3  -  2026-9-1 / 9-5
+ * - v1.0 从 SOA.2.5 v1.32 迁移落单数据 / 体检数据 / 卡类查询与卡池跳转；
+ *   v1.1 更名 SOA.3.2 体检数据、打开即自动加载、同订单 15 秒内复用；
+ *   v1.2 内置公共工具箱框体样式；v1.3 商机编号增加老订单兼容（缺失时回退单位代码）。
  */
 
 (() => {
   "use strict";
+
+  /*
+   * ⚠️ 版本号（单一来源）
+   * 面板标题显示的就是这个常量，**必须与文件头的 `@version` 完全一致**；
+   * 改版本时两处一起改（`@grant none` 读不到元数据，没法自动同步）。
+   * 2026-09-21 红领巾提醒：面板标题里原来是硬编码的 v1.7.7，早就和 @version 脱节了。
+   */
+  const SCRIPT_VERSION = "1.11.5";
 
   const ORDER_ROUTE_PREFIX =
     "#/order/";
@@ -212,6 +180,31 @@
     "作废",
     "其他"
   ];
+
+  /*
+   * 可疑批次加密核对的步长：审批区间被判定可疑（长度与声明张数不符 /
+   * 归属单位不符 / 与其它批次重叠）时，按卡池卡号每 N 张取一个探测点复核，
+   * 用来发现"区间声明覆盖整段、中间却嵌着另一条审批"的情况。
+   * ⚠️ 只对可疑批次生效 —— 干净批次零额外请求。
+   */
+  const CARD_REMARK_SUSPECT_PROBE_STEP = 10;
+
+  /*
+   * 卡号结构（与「扁鹊-1.6制卡管理查询」共用同一套规则）：
+   *   年份(2) + 标识(3) + 活动码(6) + 序号(6) = 17 位
+   *
+   * ⚠️ 不要再用「卡号后5位」当区间比较键（v1.7.x 及更早的做法）：
+   *   序号本身是 6 位，取后5位等于把最高位丢掉 —— 只有在同一 10 万区间内
+   *   巧合成立；一旦批次跨 `…xxx999 → …yyy005` 这种第 6 位进位，区间就会误判
+   *   （误判后果：漏查某批备注，或把别批的卡错并进已知区间而跳过）。
+   */
+  const CARD_HEAD_LEN = 5;
+  const ACTIVITY_LEN = 6;
+  const SERIAL_LEN = 6;
+  const CARD_NO_LEN =
+    CARD_HEAD_LEN +
+    ACTIVITY_LEN +
+    SERIAL_LEN;
 
   const CONFIG = {
     REACTIVE_POLL_INTERVAL: 400,
@@ -290,10 +283,8 @@
       "__soa_data_physical_grid_v10",
     CARD_POOL_DATA_GRID_ID:
       "__soa_data_card_grid_v10",
-    CARD_REMARK_MODAL_ID:
-      "__soa_data_card_remark_modal_v172",
-    CARD_REMARK_MODAL_CLOSE_ID:
-      "__soa_data_card_remark_modal_close_v172",
+    CARD_LIST_MODAL_ID:
+      "__soa_data_card_list_modal_v180",
     POSITION_KEY:
       "__soa_data_panel_position_v10"
   };
@@ -2658,6 +2649,24 @@
       requestsSinceBreak++;
     }
 
+    /*
+     * 卡密一律不留在内存里：三个卡池接口都会返回 card_pwd / cardPwd，
+     * 面板与卡片明细弹窗都不需要它。删掉可以避免任何后续渲染把它带出来
+     * （弹窗只按白名单取字段，这里是第二道保险）。
+     */
+    items.forEach(
+      item => {
+        if (
+          item &&
+          typeof item ===
+            "object"
+        ) {
+          delete item.card_pwd;
+          delete item.cardPwd;
+        }
+      }
+    );
+
     return {
       totalNum,
       items
@@ -2749,8 +2758,6 @@
   }
 
   function resetCardRemarkDiscovery() {
-    closeCardRemarkDetailModal();
-
     cardRemarkDiscovery = {
       orderCode: "",
       cardCorpCode: "",
@@ -2947,7 +2954,11 @@
     return "";
   }
 
-  function getCardNoLastFive(
+  /*
+   * 结构化解析卡号。长度或分段不符合 17 位规则的一律返回 null
+   * （旧版纯数字卡不在本脚本的批次识别范围内，直接跳过即可）。
+   */
+  function splitCardNo(
     value
   ) {
     const text =
@@ -2959,25 +2970,77 @@
           ""
         );
 
-    const match =
-      text.match(
-        /(\d{5})$/
-      );
-
-    if (!match) {
+    if (
+      text.length !==
+      CARD_NO_LEN
+    ) {
       return null;
     }
 
-    const number =
-      Number(
-        match[1]
+    const head =
+      text.slice(
+        0,
+        CARD_HEAD_LEN
       );
 
-    return Number.isFinite(
-      number
-    )
-      ? number
-      : null;
+    const activity =
+      text.slice(
+        CARD_HEAD_LEN,
+        CARD_HEAD_LEN +
+          ACTIVITY_LEN
+      );
+
+    const serialText =
+      text.slice(
+        -SERIAL_LEN
+      );
+
+    if (
+      !/^\d{2}[A-Za-z0-9]{3}$/.test(
+        head
+      )
+    ) {
+      return null;
+    }
+
+    if (
+      !/^\d+$/.test(
+        activity
+      ) ||
+      !/^\d+$/.test(
+        serialText
+      )
+    ) {
+      return null;
+    }
+
+    return {
+      cardNo:
+        text,
+      head,
+      activity,
+      // 分组键：年份 + 标识 + 活动码，同一个活动的卡才比序号
+      prefix:
+        head +
+        activity,
+      serial:
+        Number(
+          serialText
+        ),
+      serialText
+    };
+  }
+
+  function isSameCardGroup(
+    a,
+    b
+  ) {
+    return Boolean(
+      a &&
+      b &&
+      a.prefix ===
+        b.prefix
+    );
   }
 
   function collectCardRemarkCandidatesForType(
@@ -3005,15 +3068,18 @@
           item
         );
 
-      const suffix =
-        getCardNoLastFive(
+      const parsed =
+        splitCardNo(
           cardNo
         );
 
+      /*
+       * 卡号不符合 17 位结构（旧版纯数字卡等）直接跳过：
+       * 既参与不了批次区间比较，也不该拖慢制卡查询。
+       */
       if (
         !cardNo ||
-        suffix ===
-          null
+        !parsed
       ) {
         continue;
       }
@@ -3045,7 +3111,10 @@
           cardNo,
           {
             cardNo,
-            suffix,
+            prefix:
+              parsed.prefix,
+            serial:
+              parsed.serial,
             itemOrderCode,
             item
           }
@@ -3053,12 +3122,21 @@
       }
     }
 
+    /*
+     * 先按卡号分组（年份+标识+活动码），组内再按序号升序。
+     * 这样每轮取到的「最小未覆盖卡」天然落在同一活动内，
+     * 制卡记录返回的 beginNo~endNo 也才可能同组、可用于区间复用。
+     */
     return Array.from(
       unique.values()
     ).sort(
       (a, b) =>
-        a.suffix -
-          b.suffix ||
+        a.prefix.localeCompare(
+          b.prefix,
+          "en"
+        ) ||
+        a.serial -
+          b.serial ||
         a.cardNo.localeCompare(
           b.cardNo,
           "en"
@@ -3066,93 +3144,83 @@
     );
   }
 
-  function normalizeBatchSuffixRange(
+  /*
+   * 把制卡详情返回的 beginNo ~ endNo 折成「同组前缀 + 序号区间」。
+   *
+   * 与 1.6 制卡脚本同一口径：
+   * - 起止都解析成功且**同组**（年份+标识+活动码一致）→ 得到真正的区间；
+   * - 起止跨组 / 任一解析失败 → 不自动拆分，退回「只认这一张卡」；
+   *   宁可按单卡算，也不能把两个活动的号段错并成一个区间。
+   */
+  function normalizeBatchSerialRange(
     beginNo,
     endNo,
-    fallbackSuffix
+    fallbackCardNo
   ) {
     const begin =
-      getCardNoLastFive(
+      splitCardNo(
         beginNo
       );
 
     const end =
-      getCardNoLastFive(
+      splitCardNo(
         endNo
       );
 
     if (
-      begin !==
-        null &&
-      end !==
-        null &&
-      begin <=
+      isSameCardGroup(
+        begin,
         end
+      )
     ) {
       return {
-        start:
-          begin,
-        end
+        prefix:
+          begin.prefix,
+        startSerial:
+          Math.min(
+            begin.serial,
+            end.serial
+          ),
+        endSerial:
+          Math.max(
+            begin.serial,
+            end.serial
+          ),
+        // 起止倒置由 min/max 吸收，这里只记一笔供诊断
+        inverted:
+          begin.serial >
+          end.serial
+      };
+    }
+
+    const fallback =
+      splitCardNo(
+        fallbackCardNo
+      );
+
+    if (fallback) {
+      return {
+        prefix:
+          fallback.prefix,
+        startSerial:
+          fallback.serial,
+        endSerial:
+          fallback.serial,
+        inverted:
+          false
       };
     }
 
     return {
-      start:
-        fallbackSuffix,
-      end:
-        fallbackSuffix
+      prefix:
+        "",
+      startSerial:
+        null,
+      endSerial:
+        null,
+      inverted:
+        false
     };
-  }
-
-  function isSuffixInKnownBatch(
-    suffix,
-    state
-  ) {
-    if (
-      suffix ===
-      null ||
-      !state
-    ) {
-      return false;
-    }
-
-    for (
-      const batch of
-      state.batches.values()
-    ) {
-      if (
-        Number.isFinite(
-          batch.startSuffix
-        ) &&
-        Number.isFinite(
-          batch.endSuffix
-        ) &&
-        suffix >=
-          batch.startSuffix &&
-        suffix <=
-          batch.endSuffix
-      ) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  function getUncoveredCardCandidates(
-    candidates,
-    state
-  ) {
-    return candidates.filter(
-      candidate =>
-        !state.checkedCards.has(
-          candidate.cardNo
-        ) &&
-        !isSuffixInKnownBatch(
-          candidate.suffix,
-          state
-        )
-    );
   }
 
   function getCardProcessBackendError(
@@ -3303,6 +3371,99 @@
     return payload.data;
   }
 
+  /*
+   * 同一张卡可能落在多条制卡审批里（同一号段被反复申请：跳号作废后重新提交、
+   * 号码被复用）。所以命中多条时不能只取第一条，要按下面的顺序**再判定一次**：
+   *   ① 未作废的优先（ACCESS 优于 INVALID）
+   *   ② 区间更窄的优先（更具体的审批才是这张卡真正所属的那条）
+   *   ③ 申请/绑定时间更新的优先（号码重用时以最后生效的为准）
+   * 找不到任何区间命中时，才退回「同订单里第一条有 id 的记录」。
+   */
+  function getProcessRecordSpan(
+    item
+  ) {
+    const begin =
+      splitCardNo(
+        item?.beginNo
+      );
+
+    const end =
+      splitCardNo(
+        item?.endNo
+      );
+
+    if (
+      !isSameCardGroup(
+        begin,
+        end
+      )
+    ) {
+      return Number.MAX_SAFE_INTEGER;
+    }
+
+    return (
+      Math.abs(
+        end.serial -
+        begin.serial
+      ) +
+      1
+    );
+  }
+
+  function getProcessRecordTime(
+    item
+  ) {
+    const text =
+      cleanText(
+        item?.bindTime
+      ) ||
+      cleanText(
+        item?.financeProcessTime
+      ) ||
+      cleanText(
+        item?.internalProcessTime
+      ) ||
+      cleanText(
+        item?.orderTime
+      );
+
+    const match =
+      text.match(
+        /\d{4}-\d{1,2}-\d{1,2}(?:[ T]\d{1,2}:\d{1,2}:\d{1,2})?/
+      );
+
+    if (!match) {
+      return 0;
+    }
+
+    const parsed =
+      Date.parse(
+        match[0].replace(
+          " ",
+          "T"
+        )
+      );
+
+    return Number.isFinite(
+      parsed
+    )
+      ? parsed
+      : 0;
+  }
+
+  function isProcessRecordInvalid(
+    item
+  ) {
+    return /INVALID|作废/i.test(
+      cleanText(
+        item?.processStatus
+      ) +
+      cleanText(
+        item?.processReason
+      )
+    );
+  }
+
   function findProcessRecordForCard(
     records,
     cardNo,
@@ -3317,8 +3478,8 @@
       return null;
     }
 
-    const cardSuffix =
-      getCardNoLastFive(
+    const parsedCard =
+      splitCardNo(
         cardNo
       );
 
@@ -3340,38 +3501,108 @@
         ? sameOrder
         : records;
 
-    const matched =
-      pool.find(
-        item => {
-          const begin =
-            getCardNoLastFive(
-              item?.beginNo
-            );
+    const covering =
+      parsedCard
+        ? pool
+            .filter(
+              item => {
+                const begin =
+                  splitCardNo(
+                    item?.beginNo
+                  );
 
-          const end =
-            getCardNoLastFive(
-              item?.endNo
-            );
+                const end =
+                  splitCardNo(
+                    item?.endNo
+                  );
 
-          return (
-            cardSuffix !==
-              null &&
-            begin !==
-              null &&
-            end !==
-              null &&
-            begin <=
-              end &&
-            cardSuffix >=
-              begin &&
-            cardSuffix <=
-              end
-          );
-        }
-      );
+                /*
+                 * 必须同组（年份+标识+活动码一致）才比序号，
+                 * 跨组区间不认 —— 否则会把别的活动的号段也算进来。
+                 */
+                if (
+                  !isSameCardGroup(
+                    parsedCard,
+                    begin
+                  ) ||
+                  !isSameCardGroup(
+                    parsedCard,
+                    end
+                  )
+                ) {
+                  return false;
+                }
+
+                const start =
+                  Math.min(
+                    begin.serial,
+                    end.serial
+                  );
+
+                const stop =
+                  Math.max(
+                    begin.serial,
+                    end.serial
+                  );
+
+                return (
+                  parsedCard.serial >=
+                    start &&
+                  parsedCard.serial <=
+                    stop
+                );
+              }
+            )
+            .sort(
+              (a, b) => {
+                const invalidDiff =
+                  Number(
+                    isProcessRecordInvalid(
+                      a
+                    )
+                  ) -
+                  Number(
+                    isProcessRecordInvalid(
+                      b
+                    )
+                  );
+
+                if (
+                  invalidDiff !==
+                  0
+                ) {
+                  return invalidDiff;
+                }
+
+                const spanDiff =
+                  getProcessRecordSpan(
+                    a
+                  ) -
+                  getProcessRecordSpan(
+                    b
+                  );
+
+                if (
+                  spanDiff !==
+                  0
+                ) {
+                  return spanDiff;
+                }
+
+                return (
+                  getProcessRecordTime(
+                    b
+                  ) -
+                  getProcessRecordTime(
+                    a
+                  )
+                );
+              }
+            )
+        : [];
 
     return (
-      matched ||
+      covering[0] ||
       pool.find(
         item =>
           item?.id !==
@@ -3477,12 +3708,16 @@
         }
 
         return (
+          a.prefix.localeCompare(
+            b.prefix,
+            "en"
+          ) ||
           Number(
-            a.startSuffix || 0
+            a.startSerial || 0
           ) -
-          Number(
-            b.startSuffix || 0
-          )
+            Number(
+              b.startSerial || 0
+            )
         );
       }
     );
@@ -3507,12 +3742,12 @@
 
     const start =
       Number(
-        batch?.startSuffix
+        batch?.startSerial
       );
 
     const end =
       Number(
-        batch?.endSuffix
+        batch?.endSerial
       );
 
     if (
@@ -3535,48 +3770,477 @@
     return 0;
   }
 
-  function closeCardRemarkDetailModal() {
-    document
-      .getElementById(
-        UI.CARD_REMARK_MODAL_ID
-      )
-      ?.remove();
+  // ============================================================
+  // 卡片明细弹窗（面板数字「左键」入口）
+  // ============================================================
+  // 数据全部来自本地，**不发任何请求**：
+  //   卡号 / 卡类 / 状态 / 有效期 / 领取人 → 已查到的卡池 items
+  //   备注 → 卡备注查询结果，按 prefix + 序号区间命中批次
+  // 点某一行就地展开这张卡的完整信息（含所属制卡批次的区间 / 办卡日期 / 卡数 / 备注）。
+  //
+  // ⚠️ 卡池 item 里带 card_pwd（卡密）：这里只按白名单取字段，
+  //    绝不把整个 item 铺进 DOM，也不做 JSON 透传。
+  const cardListModalState = {
+    cardType: "",
+    cardCorpCode: "",
+    cardPool: null,
+    result: null,
+    // 空串 = 不过滤（「数量」入口）；填状态名 = 只列该状态（状态数字入口）
+    statusFilter: "",
+    /*
+     * 制卡批次区块默认折叠（红领巾 2026-09-21 要求）：
+     * 这个区块是补充信息，默认收起、需要时再展开，把位置让给卡片列表。
+     */
+    batchCollapsed: true
+  };
+
+  function pickPoolItemText(
+    item,
+    keys
+  ) {
+    if (
+      !item ||
+      typeof item !==
+        "object"
+    ) {
+      return "";
+    }
+
+    for (
+      const key of keys
+    ) {
+      const text =
+        cleanText(
+          item[key]
+        );
+
+      if (text) {
+        return text;
+      }
+    }
+
+    return "";
   }
 
-  function openCardRemarkDetailModal(
-    cardType,
-    cardCorpCode
+  /*
+   * 三个卡池的字段命名并不统一：
+   *   套餐卡 / 电商卡 → snake_case（activity_name / card_sale_name）
+   *   储值卡         → camelCase（activityName / cardSaleName）
+   * 统一在这里收敛，渲染层不要再各写一套取值。
+   */
+  function getPoolItemActivityName(
+    item
   ) {
-    const orderCode =
-      getCurrentOrderCode();
+    return pickPoolItemText(
+      item,
+      [
+        "activity_name",
+        "activityName",
+        "card_type",
+        "cardType"
+      ]
+    );
+  }
+
+  function getPoolItemSaleName(
+    item
+  ) {
+    return pickPoolItemText(
+      item,
+      [
+        "card_sale_name",
+        "cardSaleName",
+        "sale_name",
+        "saleName",
+        "nick_name"
+      ]
+    );
+  }
+
+  /*
+   * 卡池里的日期有两种形态：
+   *   套餐卡 / 电商卡 → 毫秒时间戳（begin_date / end_date）
+   *   储值卡         → "YYYY-MM-DD" 字符串（beginDay / endDay）
+   * 统一转成页面惯用的 YYYY-MM-DD 再展示。
+   */
+  function formatPoolItemDate(
+    value
+  ) {
+    const text =
+      cleanText(
+        value
+      );
+
+    if (!text) {
+      return "";
+    }
+
+    if (/^\d{13}$/.test(text)) {
+      const date =
+        new Date(
+          Number(text)
+        );
+
+      return Number.isFinite(
+        date.getTime()
+      )
+        ? date.toLocaleDateString(
+            "zh-CN"
+          )
+        : text;
+    }
+
+    const match =
+      text.match(
+        /\d{4}-\d{1,2}-\d{1,2}/
+      );
+
+    return (
+      match?.[0] ||
+      text
+    );
+  }
+
+  function getPoolItemDateRange(
+    item
+  ) {
+    const begin =
+      formatPoolItemDate(
+        pickPoolItemText(
+          item,
+          [
+            "begin_date",
+            "beginDay",
+            "beginDate",
+            "create_at",
+            "createAt"
+          ]
+        )
+      );
+
+    const end =
+      formatPoolItemDate(
+        pickPoolItemText(
+          item,
+          [
+            "end_date",
+            "endDay",
+            "endDate",
+            "init_end_date"
+          ]
+        )
+      );
+
+    if (
+      begin &&
+      end &&
+      begin !== end
+    ) {
+      return `${begin} ~ ${end}`;
+    }
+
+    return (
+      begin ||
+      end
+    );
+  }
+
+  /*
+   * 金额只取一个，并标明它是什么钱：
+   *   储值卡 → currentAmount（当前余额）
+   *   其余   → 卡金额（initAmount / saleAmount / sale_price / price）
+   * 不做单位换算、不猜语义：取不到就不显示这一行。
+   */
+  function getPoolItemAmountInfo(
+    item
+  ) {
+    const current =
+      Number(
+        item?.currentAmount
+      );
+
+    if (
+      Number.isFinite(
+        current
+      )
+    ) {
+      return {
+        label:
+          "当前余额",
+        text:
+          `¥${current.toFixed(2)}`
+      };
+    }
+
+    const matched =
+      [
+        ["initAmount", "卡金额"],
+        ["saleAmount", "卡金额"],
+        ["sale_price", "卡金额"],
+        ["price", "卡金额"]
+      ].find(
+        ([key]) =>
+          Number.isFinite(
+            Number(
+              item?.[key]
+            )
+          )
+      );
+
+    if (!matched) {
+      return null;
+    }
+
+    return {
+      label:
+        matched[1],
+      text:
+        `¥${Number(item[matched[0]]).toFixed(2)}`
+    };
+  }
+
+  /*
+   * 状态色板：与「扁鹊-1.6制卡管理查询」的卡片状态色块同一套
+   *（.hlj-card-status / is-enable / is-booked / is-used / is-freeze / is-invalid），
+   * 保持两个脚本的视觉语言一致。
+   */
+  const CARD_STATUS_TONE = {
+    生效中: {
+      bg: "#ecfdf5",
+      fg: "#15803d"
+    },
+    已预约: {
+      bg: "#eff6ff",
+      fg: "#1d4ed8"
+    },
+    /*
+     * 已核销用灰（与「扁鹊-1.6」面板 .hlj-status-value.is-used 的 #f1f5f9 / #475569 一致）：
+     * 1.6 的卡片弹窗胶囊把它画成紫色，两处本就不统一，这里以面板那套为准。
+     */
+    已核销: {
+      bg: "#f1f5f9",
+      fg: "#475569"
+    },
+    冻结: {
+      bg: "#fff7ed",
+      fg: "#c2410c"
+    },
+    作废: {
+      bg: "#fef2f2",
+      fg: "#b91c1c"
+    },
+    其他: {
+      bg: "#f1f5f9",
+      fg: "#475569"
+    }
+  };
+
+  function getCardStatusTone(
+    statusKey
+  ) {
+    return (
+      CARD_STATUS_TONE[
+        cleanText(
+          statusKey
+        )
+      ] ||
+      CARD_STATUS_TONE.其他
+    );
+  }
+
+  function getCardStatusColor(
+    label
+  ) {
+    if (label === "生效中") {
+      return "#389e0d";
+    }
+
+    if (label === "已核销") {
+      return "#7a8599";
+    }
+
+    if (label === "冻结") {
+      return "#d46b08";
+    }
+
+    if (label === "作废") {
+      return "#cf1322";
+    }
+
+    return "#1677ff";
+  }
+
+  /*
+   * 在卡备注结果里反查这张卡属于哪个制卡批次。
+   * 命中条件与探测口径**必须一致**：同前缀 + 序号落区间；
+   * 多条命中时（号段被复用/嵌套）取**区间最窄**的那条 —— 越窄越具体，
+   * 并列时取后入库的（Map 迭代按插入顺序，后探测到的更贴合实际归属）。
+   */
+  function findCardRemarkBatchForCardNo(
+    cardNo,
+    state
+  ) {
+    const parsed =
+      splitCardNo(
+        cardNo
+      );
+
+    if (
+      !parsed ||
+      !state
+    ) {
+      return null;
+    }
+
+    let best =
+      null;
+
+    let bestSpan =
+      Infinity;
+
+    for (
+      const batch of
+      state.batches.values()
+    ) {
+      if (
+        batch.prefix !==
+        parsed.prefix
+      ) {
+        continue;
+      }
+
+      if (
+        !Number.isFinite(
+          batch.startSerial
+        ) ||
+        !Number.isFinite(
+          batch.endSerial
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        parsed.serial <
+          batch.startSerial ||
+        parsed.serial >
+          batch.endSerial
+      ) {
+        continue;
+      }
+
+      const span =
+        batch.endSerial -
+        batch.startSerial +
+        1;
+
+      if (
+        span <=
+        bestSpan
+      ) {
+        best =
+          batch;
+
+        bestSpan =
+          span;
+      }
+    }
+
+    return best;
+  }
+
+  function getCardRemarkCellText(
+    cardNo
+  ) {
+    const cardType =
+      cardListModalState.cardType;
+
+    if (
+      cardType !==
+        "general" &&
+      cardType !==
+        "storage"
+    ) {
+      return {
+        text:
+          "—",
+        color:
+          "#c3cad4"
+      };
+    }
 
     const state =
       getCardRemarkTypeState(
         cardType,
-        orderCode,
-        cardCorpCode
+        getCurrentOrderCode(),
+        cardListModalState.cardCorpCode
       );
 
-    const batches =
-      getCardRemarkBatchList(
+    const batch =
+      findCardRemarkBatchForCardNo(
+        cardNo,
         state
       );
 
-    if (!batches.length) {
-      updatePanelStatus(
-        "当前还没有可放大查看的备注数据。"
-      );
-
-      return;
+    if (!batch) {
+      return {
+        text:
+          state.complete
+            ? "未识别批次"
+            : "未查询",
+        color:
+          "#c3cad4"
+      };
     }
 
-    closeCardRemarkDetailModal();
+    const remark =
+      cleanText(
+        batch.remark
+      );
 
-    const label =
-      cardType ===
-        "storage"
-        ? "储值卡"
-        : "套餐卡";
+    return {
+      text:
+        remark ||
+        "（无备注）",
+      color:
+        remark
+          ? "#253247"
+          : "#8a94a3"
+    };
+  }
+
+  function closeCardListModal() {
+    document
+      .getElementById(
+        UI.CARD_LIST_MODAL_ID
+      )
+      ?.remove();
+
+    cardListModalState.cardType =
+      "";
+
+    cardListModalState.cardCorpCode =
+      "";
+
+    cardListModalState.cardPool =
+      null;
+
+    cardListModalState.result =
+      null;
+
+    cardListModalState.statusFilter =
+      "";
+  }
+
+  function ensureCardListModal() {
+    const existing =
+      document.getElementById(
+        UI.CARD_LIST_MODAL_ID
+      );
+
+    if (existing) {
+      return existing;
+    }
 
     const overlay =
       document.createElement(
@@ -3584,13 +4248,13 @@
       );
 
     overlay.id =
-      UI.CARD_REMARK_MODAL_ID;
+      UI.CARD_LIST_MODAL_ID;
 
     overlay.style.cssText = [
       "position:fixed",
       "inset:0",
-      "z-index:100002",
-      "display:flex",
+      "z-index:100003",
+      "display:none",
       "align-items:center",
       "justify-content:center",
       "padding:24px 16px",
@@ -3599,306 +4263,722 @@
       "backdrop-filter:blur(1px)"
     ].join(";");
 
-    const bodyHtml =
-      batches
-        .map(
-          (
-            batch,
-            index
-          ) => {
-            const beginNo =
-              cleanText(
-                batch.beginNo
-              );
-
-            const endNo =
-              cleanText(
-                batch.endNo
-              );
-
-            const rangeText =
-              beginNo &&
-              endNo &&
-              beginNo !==
-                endNo
-                ? `${beginNo} - ${endNo}`
-                : (
-                    beginNo ||
-                    endNo ||
-                    "未返回"
-                  );
-
-            const cardDate =
-              cleanText(
-                batch.cardDate
-              ) ||
-              "未返回";
-
-            const cardCount =
-              getCardRemarkBatchCount(
-                batch
-              );
-
-            const remark =
-              cleanText(
-                batch.remark
-              ) ||
-              "（无备注）";
-
-            return `
-              <section style="
-                padding:10px 11px;
-                border:1px solid #e2e7ee;
-                border-radius:8px;
-                background:#fff;
-              ">
-                <div style="
-                  display:flex;
-                  align-items:flex-start;
-                  gap:6px;
-                  color:#253247;
-                  font-size:13px;
-                  font-weight:750;
-                  line-height:1.55;
-                ">
-                  <span style="
-                    flex:0 0 auto;
-                    color:#1677ff;
-                    font-weight:800;
-                  ">${index + 1}.</span>
-
-                  <div style="
-                    min-width:0;
-                    word-break:break-all;
-                    user-select:text;
-                  ">
-                    卡号 ${escapeHtml(rangeText)}
-                  </div>
-                </div>
-
-                <div style="
-                  display:flex;
-                  align-items:center;
-                  flex-wrap:wrap;
-                  gap:8px 26px;
-                  margin-top:7px;
-                  padding-left:20px;
-                  color:#596579;
-                  font-size:12px;
-                  line-height:1.55;
-                ">
-                  <div style="
-                    display:flex;
-                    align-items:center;
-                    gap:6px;
-                    white-space:nowrap;
-                  ">
-                    <span style="font-weight:700;">办卡日期</span>
-                    <span style="
-                      color:#344054;
-                      font-weight:700;
-                      user-select:text;
-                    ">${escapeHtml(cardDate)}</span>
-                  </div>
-
-                  <div style="
-                    display:flex;
-                    align-items:center;
-                    gap:5px;
-                    white-space:nowrap;
-                  ">
-                    <span style="font-weight:700;">数量：</span>
-                    <span style="
-                      color:#344054;
-                      font-size:12px;
-                      font-weight:800;
-                    ">${
-                      cardCount > 0
-                        ? `${cardCount}张`
-                        : "未返回"
-                    }</span>
-                  </div>
-                </div>
-
-                <div style="
-                  margin-top:8px;
-                  padding-left:20px;
-                  color:#596579;
-                  font-size:16px;
-                  line-height:1.6;
-                ">
-                  <span style="
-                    font-weight:700;
-                  ">备注：</span>
-                  <span style="
-                    color:#344054;
-                    font-weight:800;
-                    word-break:break-all;
-                    user-select:text;
-                  ">${escapeHtml(remark)}</span>
-                </div>
-              </section>
-            `;
-          }
-        )
-        .join("");
-
     overlay.innerHTML = `
-      <div
-        role="dialog"
-        aria-modal="true"
-        style="
-          width:min(520px,calc(100vw - 32px));
-          max-height:calc(100vh - 48px);
+      <section style="
+        display:flex;
+        flex-direction:column;
+        width:min(880px, 100%);
+        max-height:min(78vh, 720px);
+        border:1px solid #e2e7ee;
+        border-radius:10px;
+        background:#fff;
+        box-shadow:0 12px 32px rgba(15,23,42,.18);
+        overflow:hidden;
+      ">
+        <header style="
           display:flex;
-          flex-direction:column;
-          overflow:hidden;
-          border:1px solid #dfe5ec;
-          border-radius:11px;
-          background:#fff;
-          box-shadow:0 18px 50px rgba(15,23,42,.24);
-          font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;
-        "
-      >
-        <div style="
-          display:flex;
-          align-items:center;
+          align-items:flex-start;
           justify-content:space-between;
           gap:12px;
-          padding:12px 14px;
-          border-bottom:1px solid #edf0f4;
-          background:#f8fbff;
+          padding:11px 13px;
+          border-bottom:1px solid #eef1f5;
+          background:#fbfcfe;
         ">
-          <div>
-            <div style="
-              color:#263548;
-              font-size:15px;
+          <div style="min-width:0;">
+            <div data-soa-card-list-title style="
+              color:#1f2a3d;
+              font-size:14px;
               font-weight:750;
               line-height:1.35;
-            ">${label}备注详情</div>
-            <div style="
-              margin-top:2px;
-              color:#8390a2;
-              font-size:10px;
-              line-height:1.35;
-            ">按制卡区间展示 · 卡号 · 日期 · 数量 · 备注</div>
+            ">卡片明细</div>
+            <div data-soa-card-list-sub style="
+              margin-top:3px;
+              color:#6a7686;
+              font-size:12px;
+              line-height:1.4;
+            "></div>
           </div>
+          <button type="button" data-soa-card-list-close title="关闭" style="
+            flex:0 0 auto;
+            width:26px;
+            height:26px;
+            border:1px solid #dbe2ea;
+            border-radius:6px;
+            background:#fff;
+            color:#596579;
+            font-size:15px;
+            line-height:1;
+            cursor:pointer;
+          ">×</button>
+        </header>
 
-          <button
-            id="${UI.CARD_REMARK_MODAL_CLOSE_ID}"
-            type="button"
-            title="关闭"
-            style="
-              width:28px;
-              height:28px;
-              border:0;
-              border-radius:7px;
-              background:#eef2f6;
-              color:#667085;
-              font-size:16px;
-              line-height:28px;
-              cursor:pointer;
-            "
-          >×</button>
-        </div>
-
-        <div style="
+        <div data-soa-card-list-body style="
+          flex:1 1 auto;
           min-height:0;
+          padding:9px 11px 11px;
           overflow:auto;
-          padding:11px 13px 13px;
-          background:#f8fafc;
-        ">
-          <div style="
-            display:flex;
-            flex-direction:column;
-            gap:8px;
-          ">
-            ${bodyHtml}
-          </div>
-        </div>
-      </div>
+        "></div>
+
+        <footer data-soa-card-list-foot style="
+          flex:0 0 auto;
+          display:flex;
+          align-items:center;
+          gap:10px;
+          padding:8px 11px;
+          border-top:1px solid #eef1f5;
+          background:#fbfcfe;
+        "></footer>
+      </section>
     `;
 
     document.body.appendChild(
       overlay
     );
 
-    const close =
-      () => {
-        closeCardRemarkDetailModal();
-      };
-
-    overlay
-      .querySelector(
-        `#${UI.CARD_REMARK_MODAL_CLOSE_ID}`
-      )
-      ?.addEventListener(
-        "click",
-        close
-      );
-
     overlay.addEventListener(
-      "mousedown",
+      "click",
       event => {
         if (
           event.target ===
-          overlay
+            overlay ||
+          event.target.closest(
+            "[data-soa-card-list-close]"
+          )
         ) {
-          close();
+          closeCardListModal();
         }
       }
     );
 
-    const onKeyDown =
-      event => {
-        if (
-          event.key !==
-          "Escape"
-        ) {
-          return;
-        }
-
-        document.removeEventListener(
-          "keydown",
-          onKeyDown,
-          true
-        );
-
-        close();
-      };
-
     document.addEventListener(
       "keydown",
-      onKeyDown,
-      true
+      event => {
+        if (
+          event.key ===
+            "Escape" &&
+          document.getElementById(
+            UI.CARD_LIST_MODAL_ID
+          )
+        ) {
+          closeCardListModal();
+        }
+      }
     );
+
+    return overlay;
   }
 
-  function buildInlineRemarkHtml(
-    cardType,
-    result,
-    cardCorpCode
+  /*
+   * 找「已识别批次」里与本区间重叠的部分。
+   * 重叠＝同一号段被两条审批同时声明（跳号作废后重新提交、号码复用），
+   * 属于需要人工确认的情况，所以在批次上标出来而不是静默合并。
+   */
+  function findOverlappingBatches(
+    prefix,
+    startSerial,
+    endSerial,
+    state
   ) {
-    const total =
-      Number(
-        result?.totalNum
+    const overlapped = [];
+
+    if (
+      !prefix ||
+      !Number.isFinite(
+        startSerial
+      ) ||
+      !Number.isFinite(
+        endSerial
+      ) ||
+      !state
+    ) {
+      return overlapped;
+    }
+
+    for (
+      const batch of
+      state.batches.values()
+    ) {
+      if (
+        batch.prefix !==
+        prefix
+      ) {
+        continue;
+      }
+
+      if (
+        !Number.isFinite(
+          batch.startSerial
+        ) ||
+        !Number.isFinite(
+          batch.endSerial
+        )
+      ) {
+        continue;
+      }
+
+      const from =
+        Math.max(
+          startSerial,
+          batch.startSerial
+        );
+
+      const to =
+        Math.min(
+          endSerial,
+          batch.endSerial
+        );
+
+      if (
+        from <= to
+      ) {
+        overlapped.push({
+          id:
+            batch.id,
+          from,
+          to,
+          remark:
+            cleanText(
+              batch.remark
+            )
+        });
+      }
+    }
+
+    return overlapped;
+  }
+
+  /*
+   * 「卡号 → 制卡批次」的唯一取数入口：
+   *   process/page 拿批次记录 → process/detail 拿备注与卡号区间 → 存进 state.batches。
+   * 全量扫（queryCardRemarksByType 主循环）与弹窗按需查单张，共用这一份，
+   * 避免两处各写一遍导致区间口径漂移。
+   */
+  async function fetchAndStoreCardRemarkBatch(
+    cardNo,
+    state,
+    orderCode,
+    options
+  ) {
+    const records =
+      await fetchCardProcessPageByCardNo(
+        cardNo
+      );
+
+    const record =
+      findProcessRecordForCard(
+        records,
+        cardNo,
+        orderCode
       );
 
     if (
-      !result?.ok ||
-      !Number.isFinite(
-        total
-      ) ||
-      total <= 0 ||
-      ![
-        "general",
-        "storage"
-      ].includes(
-        cardType
+      !record ||
+      record.id ===
+        undefined ||
+      record.id ===
+        null
+    ) {
+      return {
+        ok: false,
+        reason:
+          "no-record"
+      };
+    }
+
+    const batchId =
+      String(
+        record.id
+      );
+
+    /*
+     * 同一批次只读一次详情：命中缓存直接返回。
+     * 这也是「弹窗里连点同批次多张卡 = 0 请求」的原因。
+     */
+    if (
+      state.batches.has(
+        batchId
       )
     ) {
-      return "";
+      return {
+        ok: true,
+        batchId,
+        batch:
+          state.batches.get(
+            batchId
+          ),
+        reason:
+          "cached"
+      };
     }
+
+    await sleep(
+      randomInt(
+        CARD_REMARK_DETAIL_DELAY[0],
+        CARD_REMARK_DETAIL_DELAY[1]
+      )
+    );
+
+    const detail =
+      await fetchCardProcessDetail(
+        record.id
+      );
+
+    if (
+      getCurrentOrderCode() !==
+        orderCode
+    ) {
+      throw new FlowCancelledError(
+        "订单已切换，已停止卡备注查询"
+      );
+    }
+
+    const detailOrderCode =
+      cleanText(
+        detail?.orderCode
+      );
+
+    if (
+      detailOrderCode &&
+      detailOrderCode !==
+        orderCode
+    ) {
+      return {
+        ok: false,
+        reason:
+          "order-mismatch"
+      };
+    }
+
+    const range =
+      normalizeBatchSerialRange(
+        detail?.beginNo ||
+        record?.beginNo,
+        detail?.endNo ||
+        record?.endNo,
+        cardNo
+      );
+
+    const reportCardNum =
+      Number(
+        detail?.cardNum ||
+        record?.cardNum ||
+        0
+      );
+
+    const spanLength =
+      Number.isFinite(
+        range.startSerial
+      ) &&
+      Number.isFinite(
+        range.endSerial
+      )
+        ? range.endSerial -
+          range.startSerial +
+          1
+        : 0;
+
+    /*
+     * 「再判定区间」：区间是审批自己声明的，但**同一个号段可能被反复申请**
+     * （跳号作废后重新提交、号码复用），也可能「卡号在卡池里连着、制卡时却分属
+     * 多条审批」。所以入库前用「0 请求的本地校验」把可疑情形逐条标出来 ——
+     * 只标记、不阻断、不误杀，交给界面提示人工确认。
+     */
+    const suspects = [];
+
+    if (range.inverted) {
+      suspects.push(
+        "区间起止倒置（已按 min/max 修正）"
+      );
+    }
+
+    if (
+      !range.prefix ||
+      range.startSerial ===
+        null
+    ) {
+      suspects.push(
+        "区间无法解析，已按单卡处理"
+      );
+    }
+
+    if (
+      reportCardNum > 0 &&
+      spanLength > 0 &&
+      reportCardNum !==
+        spanLength
+    ) {
+      suspects.push(
+        `区间长度 ${spanLength} 与审批卡数 ${reportCardNum} 不一致`
+      );
+    }
+
+    const detailCorpCode =
+      cleanText(
+        detail?.corpCode ||
+        record?.corpCode
+      );
+
+    const expectCorpCode =
+      cleanText(
+        options?.cardCorpCode
+      );
+
+    if (
+      detailCorpCode &&
+      expectCorpCode &&
+      detailCorpCode !==
+        expectCorpCode
+    ) {
+      suspects.push(
+        `审批归属单位 ${detailCorpCode} 与当前单位代码 ${expectCorpCode} 不一致`
+      );
+    }
+
+    const overlaps =
+      findOverlappingBatches(
+        range.prefix,
+        range.startSerial,
+        range.endSerial,
+        state
+      );
+
+    if (overlaps.length) {
+      suspects.push(
+        `与已识别批次重叠：${overlaps
+          .map(
+            item =>
+              `${item.from}~${item.to}`
+          )
+          .join("、")}`
+      );
+    }
+
+    if (suspects.length) {
+      console.warn(
+        "[SOA订单数据] 制卡区间可疑，已标记待确认：",
+        {
+          cardNo,
+          beginNo:
+            detail?.beginNo ||
+            record?.beginNo,
+          endNo:
+            detail?.endNo ||
+            record?.endNo,
+          suspects
+        }
+      );
+    }
+
+    const batch = {
+      id:
+        batchId,
+      remark:
+        cleanText(
+          detail?.remark
+        ),
+      prefix:
+        range.prefix,
+      startSerial:
+        range.startSerial,
+      endSerial:
+        range.endSerial,
+      beginNo:
+        cleanText(
+          detail?.beginNo ||
+          record?.beginNo
+        ),
+      endNo:
+        cleanText(
+          detail?.endNo ||
+          record?.endNo
+        ),
+      cardDate:
+        extractCardRemarkDate(
+          detail,
+          record
+        ),
+      cardNum:
+        reportCardNum,
+      // 区间自检结果（空串 = 一切正常）
+      suspect:
+        suspects.join(
+          "；"
+        ),
+      overlaps,
+      corpName:
+        cleanText(
+          detail?.corpName ||
+          record?.corpName
+        ),
+      orderName:
+        cleanText(
+          detail?.orderName ||
+          record?.orderName
+        )
+    };
+
+    state.batches.set(
+      batchId,
+      batch
+    );
+
+    return {
+      ok: true,
+      batchId,
+      batch,
+      reason:
+        "loaded"
+    };
+  }
+
+  /*
+   * 弹窗里点开某张卡时按需补这个批次（2 请求 / 批次）。
+   * 已有缓存 / 已判定过无记录 / 全量扫正在跑 → 一律不发请求。
+   */
+  async function loadCardRemarkBatchForCard(
+    cardNo
+  ) {
+    const cardType =
+      cardListModalState.cardType;
+
+    if (
+      cardType !==
+        "general" &&
+      cardType !==
+        "storage"
+    ) {
+      return {
+        status:
+          "unsupported"
+      };
+    }
+
+    const orderCode =
+      getCurrentOrderCode();
+
+    const cardCorpCode =
+      cardListModalState.cardCorpCode;
+
+    if (
+      !orderCode ||
+      !cardCorpCode
+    ) {
+      return {
+        status:
+          "blocked"
+      };
+    }
+
+    const state =
+      getCardRemarkTypeState(
+        cardType,
+        orderCode,
+        cardCorpCode
+      );
+
+    if (
+      findCardRemarkBatchForCardNo(
+        cardNo,
+        state
+      )
+    ) {
+      return {
+        status:
+          "ready"
+      };
+    }
+
+    if (
+      state.checkedCards.has(
+        cardNo
+      ) ||
+      cardRemarkQueryRunning
+    ) {
+      return {
+        status:
+          "idle"
+      };
+    }
+
+    cardRemarkQueryRunning =
+      cardType;
+
+    state.checkedCards.add(
+      cardNo
+    );
+
+    try {
+      updatePanelStatus(
+        `正在查询该卡批次备注：${cardNo}`,
+        "normal",
+        {
+          persistent:
+            true
+        }
+      );
+
+      const outcome =
+        await fetchAndStoreCardRemarkBatch(
+          cardNo,
+          state,
+          orderCode,
+          {
+            cardCorpCode
+          }
+        );
+
+      if (outcome.ok) {
+        updatePanelStatus(
+          "✓ 已读取该卡所在批次的备注。",
+          "success"
+        );
+
+        return {
+          status:
+            "ready"
+        };
+      }
+
+      if (
+        outcome.reason ===
+        "order-mismatch"
+      ) {
+        updatePanelStatus(
+          "该卡的制卡记录不属于当前订单。",
+          "error"
+        );
+
+        return {
+          status:
+            "none"
+        };
+      }
+
+      updatePanelStatus(
+        "这张卡未找到对应的制卡记录。",
+        "error"
+      );
+
+      return {
+        status:
+          "none"
+      };
+    } catch (error) {
+      if (
+        error instanceof
+        FlowCancelledError
+      ) {
+        throw error;
+      }
+
+      updatePanelStatus(
+        error?.message ||
+        String(error),
+        "error"
+      );
+
+      return {
+        status:
+          "error"
+      };
+    } finally {
+      cardRemarkQueryRunning =
+        "";
+    }
+  }
+
+  function buildCardListItemRowHtml(
+    item
+  ) {
+    const cardNo =
+      extractCardNoFromPoolItem(
+        item
+      );
+
+    const activity =
+      getPoolItemActivityName(
+        item
+      );
+
+    const status =
+      resolveCardStatus(
+        item
+      ).label;
+
+    const remark =
+      getCardRemarkCellText(
+        cardNo
+      );
+
+    return `
+      <div data-soa-card-list-item="${escapeHtml(cardNo)}" style="
+        border-bottom:1px solid #f1f4f8;
+      ">
+        <div data-soa-card-list-main="1" role="button" tabindex="0" title="点开看这张卡的详情" style="
+          display:grid;
+          grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) 62px minmax(0,1.1fr) 12px;
+          align-items:center;
+          gap:8px;
+          padding:7px 8px;
+          border-radius:6px;
+          cursor:pointer;
+        ">
+          <span style="
+            overflow:hidden;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+            color:#1f2a3d;
+            font-family:ui-monospace, Menlo, Consolas, monospace;
+            font-size:12.5px;
+            font-weight:650;
+          ">${escapeHtml(cardNo || "-")}</span>
+          <span style="
+            overflow:hidden;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+            color:#44546a;
+            font-size:12px;
+          ">${escapeHtml(activity || "未分类")}</span>
+          <span style="
+            color:${getCardStatusColor(status)};
+            font-size:12px;
+            font-weight:650;
+            white-space:nowrap;
+          ">${escapeHtml(status)}</span>
+          <span data-soa-card-list-remark="1" style="
+            overflow:hidden;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+            color:${remark.color};
+            font-size:12px;
+          ">${escapeHtml(remark.text)}</span>
+          <span style="
+            color:#b4bdc9;
+            font-size:13px;
+            line-height:1;
+          ">›</span>
+        </div>
+
+        <div data-soa-card-list-detail="1" hidden style="
+          padding:0 8px 9px;
+        "></div>
+      </div>
+    `;
+  }
+
+  function buildCardItemDetailHtml(
+    item
+  ) {
+    const cardNo =
+      extractCardNoFromPoolItem(
+        item
+      );
+
+    const cardType =
+      cardListModalState.cardType;
+
+    const cardCorpCode =
+      cardListModalState.cardCorpCode;
 
     const orderCode =
       getCurrentOrderCode();
@@ -3910,83 +4990,1675 @@
         cardCorpCode
       );
 
-    const running =
-      Boolean(
-        cardRemarkQueryRunning
+    const batch =
+      findCardRemarkBatchForCardNo(
+        cardNo,
+        state
       );
 
-    const thisRunning =
-      cardRemarkQueryRunning ===
-        cardType;
+    const amount =
+      getPoolItemAmountInfo(
+        item
+      );
 
-    const hasResult =
-      state.complete &&
-      state.batches.size >
-        0;
+    const beginNo =
+      cleanText(
+        batch?.beginNo
+      );
 
-    const buttonText =
-      thisRunning
-        ? "查询中..."
-        : hasResult
-          ? "查看备注"
-          : "查询备注";
+    const endNo =
+      cleanText(
+        batch?.endNo
+      );
 
-    const action =
-      hasResult
-        ? "view"
-        : "query";
+    const rangeText =
+      beginNo &&
+      endNo &&
+      beginNo !== endNo
+        ? `${beginNo} ~ ${endNo}`
+        : (
+            beginNo ||
+            endNo
+          );
 
-    const disabled =
-      running;
+    let remarkText =
+      "";
+
+    if (batch) {
+      remarkText =
+        cleanText(
+          batch.remark
+        ) ||
+        "（无备注）";
+    } else if (
+      cardType ===
+      "ecommerce"
+    ) {
+      remarkText =
+        "（电商卡无卡备注）";
+    } else if (
+      state.checkedCards.has(
+        cardNo
+      )
+    ) {
+      remarkText =
+        "（这张卡未匹配到制卡记录）";
+    } else {
+      remarkText =
+        "（尚未查询这张卡所在批次）";
+    }
+
+    const rows = [
+      [
+        "卡号",
+        cardNo
+      ],
+      [
+        "卡类",
+        getPoolItemActivityName(
+          item
+        ) || "未分类"
+      ],
+      [
+        "当前状态",
+        resolveCardStatus(
+          item
+        ).label
+      ],
+      [
+        "领取人/销售",
+        getPoolItemSaleName(
+          item
+        ) || "-"
+      ],
+      [
+        "卡有效期",
+        getPoolItemDateRange(
+          item
+        ) || "-"
+      ],
+      amount
+        ? [
+            amount.label,
+            amount.text
+          ]
+        : null,
+      rangeText
+        ? [
+            "所属制卡批次",
+            rangeText
+          ]
+        : null,
+      batch?.cardDate
+        ? [
+            "办卡日期",
+            cleanText(
+              batch.cardDate
+            )
+          ]
+        : null,
+      batch
+        ? [
+            "该批次卡数",
+            String(
+              getCardRemarkBatchCount(
+                batch
+              )
+            )
+          ]
+        : null
+    ].filter(Boolean);
 
     return `
       <div style="
-        margin-top:6px;
-        padding-top:5px;
-        border-top:1px solid rgba(56,142,60,.12);
+        padding:8px 9px;
+        border:1px solid #e6ebf1;
+        border-radius:7px;
+        background:#fbfcfe;
       ">
-        <button
-          type="button"
-          data-soa-card-remark-type="${cardType}"
-          data-soa-card-remark-action="${action}"
-          ${disabled ? "disabled" : ""}
-          style="
-            width:100%;
-            height:24px;
-            padding:0 5px;
-            border:1px solid ${
-              disabled
-                ? "#d9d9d9"
-                : hasResult
-                  ? "#91caff"
-                  : "#91caff"
-            };
-            border-radius:5px;
-            background:${
-              disabled
-                ? "#f5f5f5"
-                : hasResult
-                  ? "#e6f4ff"
-                  : "#e6f4ff"
-            };
-            color:${
-              disabled
-                ? "#999"
-                : "#1677ff"
-            };
-            font-size:10px;
-            font-weight:650;
-            line-height:22px;
-            cursor:${
-              disabled
-                ? "not-allowed"
-                : "pointer"
-            };
-            white-space:nowrap;
-          "
-        >${buttonText}</button>
+        <div style="
+          display:grid;
+          grid-template-columns:repeat(2, minmax(0, 1fr));
+          gap:5px 12px;
+        ">
+          ${rows
+            .map(
+              ([label, value]) => `
+            <div style="
+              display:flex;
+              gap:6px;
+              min-width:0;
+              font-size:12px;
+              line-height:1.5;
+            ">
+              <span style="
+                flex:0 0 auto;
+                min-width:62px;
+                color:#7a8599;
+              ">${escapeHtml(label)}</span>
+              <span style="
+                min-width:0;
+                color:#253247;
+                font-weight:650;
+                word-break:break-all;
+              ">${escapeHtml(String(value))}</span>
+            </div>
+          `
+            )
+            .join("")}
+        </div>
+
+        <div style="
+          margin-top:7px;
+          padding-top:6px;
+          border-top:1px solid #eaeff5;
+        ">
+          <div style="
+            color:#7a8599;
+            font-size:12px;
+            line-height:1.5;
+          ">卡备注</div>
+          <div style="
+            margin-top:2px;
+            color:#253247;
+            font-size:12.5px;
+            line-height:1.6;
+            white-space:pre-wrap;
+            word-break:break-all;
+          ">${escapeHtml(remarkText)}</div>
+        </div>
       </div>
     `;
+  }
+
+  /*
+   * 备注列回填：一个批次读回来后，同批次的每一行都要跟着变，
+   * 所以按「整列重算」处理，而不是只改被点的那一行。
+   */
+  function refreshCardListModalRemarkCells() {
+    const modal =
+      document.getElementById(
+        UI.CARD_LIST_MODAL_ID
+      );
+
+    if (!modal) {
+      return;
+    }
+
+    modal
+      .querySelectorAll(
+        "[data-soa-card-list-item]"
+      )
+      .forEach(
+        row => {
+          const cell =
+            row.querySelector(
+              "[data-soa-card-list-remark]"
+            );
+
+          if (!cell) {
+            return;
+          }
+
+          const remark =
+            getCardRemarkCellText(
+              row.getAttribute(
+                "data-soa-card-list-item"
+              ) || ""
+            );
+
+          cell.textContent =
+            remark.text;
+
+          cell.style.color =
+            remark.color;
+        }
+      );
+  }
+
+  /*
+   * 弹窗里的「制卡批次」区块：把原本独立大窗的批次数据整合进明细，
+   * 一眼能看出「哪些号码是一批、那批的备注是什么」。
+   * 区间自检异常（长度与审批卡数不符 / 归属单位不符 / 与其它批次重叠）会标 ⚠，
+   * 提示人工确认，而不是静默采信。
+   */
+  /*
+   * 这条审批区间里，本订单卡池实际有多少张卡。
+   * 与审批声明的 cardNum / 区间长度一起看，就能判断「号段有没有被复用、
+   * 有没有别的审批夹在里面」—— 这是「再判定区间」的人工确认依据。
+   */
+  function countPoolCardsInBatch(
+    batch
+  ) {
+    const items =
+      Array.isArray(
+        cardListModalState.result?.items
+      )
+        ? cardListModalState.result.items
+        : [];
+
+    if (
+      !batch?.prefix ||
+      !Number.isFinite(
+        batch.startSerial
+      ) ||
+      !Number.isFinite(
+        batch.endSerial
+      )
+    ) {
+      return 0;
+    }
+
+    let count =
+      0;
+
+    for (
+      const item of
+      items
+    ) {
+      const parsed =
+        splitCardNo(
+          extractCardNoFromPoolItem(
+            item
+          )
+        );
+
+      if (
+        !parsed ||
+        parsed.prefix !==
+          batch.prefix
+      ) {
+        continue;
+      }
+
+      if (
+        parsed.serial >=
+          batch.startSerial &&
+        parsed.serial <=
+          batch.endSerial
+      ) {
+        count +=
+          1;
+      }
+    }
+
+    return count;
+  }
+
+  /*
+   * 批次区块「展开 / 收起」按钮的样式。
+   * 折叠态用**实底蓝**高亮 —— 红领巾要求「展开按钮要抢眼，免得有人看不见」；
+   * 展开后弱化成描边样式：已经打开了就不再需要抢注意力。
+   */
+  function getCardBatchToggleStyle(
+    collapsed
+  ) {
+    if (collapsed) {
+      return [
+        "flex:0 0 auto",
+        "padding:2px 9px",
+        "border:1px solid #1d4ed8",
+        "border-radius:5px",
+        "background:#1d4ed8",
+        "color:#ffffff",
+        "font-size:11px",
+        "font-weight:700",
+        "line-height:17px",
+        "white-space:nowrap",
+        "cursor:pointer"
+      ].join(";");
+    }
+
+    return [
+      "flex:0 0 auto",
+      "padding:2px 9px",
+      "border:1px solid #dbe2ea",
+      "border-radius:5px",
+      "background:#ffffff",
+      "color:#596579",
+      "font-size:11px",
+      "font-weight:600",
+      "line-height:17px",
+      "white-space:nowrap",
+      "cursor:pointer"
+    ].join(";");
+  }
+
+  function buildCardBatchSectionHtml() {
+    const collapsed =
+      cardListModalState.batchCollapsed !==
+      false;
+
+    const cardType =
+      cardListModalState.cardType;
+
+    const cardCorpCode =
+      cardListModalState.cardCorpCode;
+
+    const state =
+      getCardRemarkTypeState(
+        cardType,
+        getCurrentOrderCode(),
+        cardCorpCode
+      );
+
+    const batches =
+      getCardRemarkBatchList(
+        state
+      );
+
+    if (
+      cardType ===
+      "ecommerce"
+    ) {
+      return `
+        <div style="
+          margin-bottom:8px;
+          padding:7px 9px;
+          border:1px solid #eef1f5;
+          border-radius:7px;
+          background:#fbfcfe;
+          color:#8a94a3;
+          font-size:12px;
+          line-height:1.5;
+        ">电商卡没有制卡审批记录，也就没有卡备注可供读取。</div>
+      `;
+    }
+
+    if (!batches.length) {
+      return `
+        <div style="
+          margin-bottom:8px;
+          padding:7px 9px;
+          border:1px solid #eef1f5;
+          border-radius:7px;
+          background:#fbfcfe;
+          color:#8a94a3;
+          font-size:12px;
+          line-height:1.5;
+        ">制卡批次：尚未识别 · 点开任意一张卡会读取它所在批次${state?.complete ? "（上次扫描未识别到批次）" : ""}</div>
+      `;
+    }
+
+    const suspectCount =
+      batches.filter(
+        batch =>
+          cleanText(
+            batch.suspect
+          )
+      ).length;
+
+    /*
+     * 覆盖张数按「卡池实际张数」算（不是审批声明的 cardNum），
+     * 这样数字与左边的卡片总数对得上。
+     */
+    const totalCards =
+      batches.reduce(
+        (
+          sum,
+          batch
+        ) =>
+          sum +
+          countPoolCardsInBatch(
+            batch
+          ),
+        0
+      );
+
+    return `
+      <div style="
+        margin-bottom:8px;
+        border:1px solid #e6ebf1;
+        border-radius:7px;
+        background:#fbfcfe;
+        overflow:hidden;
+      ">
+        <div style="
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:8px;
+          padding:7px 9px;
+          border-bottom:1px solid #eef1f5;
+        ">
+          <div style="
+            min-width:0;
+            color:#253247;
+            font-size:12px;
+            font-weight:650;
+            line-height:1.4;
+          ">制卡批次 ${batches.length} 个 · 覆盖 ${totalCards} 张${suspectCount ? ` · ⚠ ${suspectCount} 个待确认` : ""}</div>
+
+          <button
+            type="button"
+            data-soa-card-batch-toggle="1"
+            style="${getCardBatchToggleStyle(collapsed)}"
+          >${collapsed ? "展开批次 ▾" : "收起批次 ▴"}</button>
+        </div>
+
+        <div
+          data-soa-card-batch-body="1"
+          ${collapsed ? `style="display:none;"` : ""}
+        >
+        ${batches
+          .map(
+            (
+              batch,
+              index
+            ) => {
+              const beginNo =
+                cleanText(
+                  batch.beginNo
+                );
+
+              const endNo =
+                cleanText(
+                  batch.endNo
+                );
+
+              const rangeText =
+                beginNo &&
+                endNo &&
+                beginNo !==
+                  endNo
+                  ? `${beginNo} ~ ${endNo}`
+                  : (
+                      beginNo ||
+                      endNo ||
+                      "未返回"
+                    );
+
+              const remark =
+                cleanText(
+                  batch.remark
+                );
+
+              const suspect =
+                cleanText(
+                  batch.suspect
+                );
+
+              const spanLength =
+                Number.isFinite(
+                  batch.startSerial
+                ) &&
+                Number.isFinite(
+                  batch.endSerial
+                )
+                  ? batch.endSerial -
+                    batch.startSerial +
+                    1
+                  : 0;
+
+              const poolCount =
+                countPoolCardsInBatch(
+                  batch
+                );
+
+              /*
+               * 张数说明：
+               * ⚠️ 卡池是按**单位代码**过滤的，个别卡因**归属订单被调整**（实测 25X7A212025013541）
+               * 已不属本单，于是不会出现在本单卡池里 —— 这类差额属正常口径差异，
+               * **不代表审批区间异常**，所以这里只做中性说明，不并入 ⚠ 可疑。
+               */
+              const countParts = [
+                `本单卡池 ${poolCount} 张`
+              ];
+
+              if (
+                batch.cardNum &&
+                batch.cardNum !==
+                  poolCount
+              ) {
+                countParts.push(
+                  `审批声明 ${batch.cardNum} 张`
+                );
+              }
+
+              const hasGap =
+                (
+                  spanLength &&
+                  spanLength !==
+                    poolCount
+                ) ||
+                (
+                  batch.cardNum &&
+                  batch.cardNum !==
+                    poolCount
+                );
+
+              return `
+                <div style="
+                  padding:6px 9px;
+                  border-top:1px solid #f4f7fa;
+                  ${index === 0 ? "border-top:0;" : ""}
+                ">
+                  <div style="
+                    color:#253247;
+                    font-size:12px;
+                    font-weight:650;
+                    line-height:1.45;
+                    word-break:break-all;
+                  ">${index + 1}. ${escapeHtml(rangeText)}</div>
+                  <div style="
+                    margin-top:2px;
+                    color:#6a7686;
+                    font-size:11.5px;
+                    line-height:1.5;
+                  ">办卡日期 ${escapeHtml(cleanText(batch.cardDate) || "未返回")} · ${countParts.join(" / ")}</div>
+                  ${
+                    hasGap
+                      ? `<div style="
+                          margin-top:2px;
+                          color:#9aa5b4;
+                          font-size:11px;
+                          line-height:1.5;
+                        ">注：差额通常是这张卡的归属订单被调整过 —— 卡池按单位代码过滤，已不属本单的卡不计入（非区间异常）</div>`
+                      : ""
+                  }
+                  <div style="
+                    margin-top:2px;
+                    color:${remark ? "#253247" : "#8a94a3"};
+                    font-size:12px;
+                    line-height:1.55;
+                    white-space:pre-wrap;
+                    word-break:break-all;
+                  ">备注：${escapeHtml(remark || "（无备注）")}</div>
+                  ${
+                    suspect
+                      ? `<div style="
+                          margin-top:3px;
+                          padding:3px 6px;
+                          border:1px solid #ffe0b2;
+                          border-radius:5px;
+                          background:#fff8ee;
+                          color:#ad4e00;
+                          font-size:11.5px;
+                          line-height:1.5;
+                          word-break:break-all;
+                        ">⚠ 区间待确认：${escapeHtml(suspect)}</div>`
+                      : ""
+                  }
+                </div>
+              `;
+            }
+          )
+          .join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCardListModalContent() {
+    const modal =
+      document.getElementById(
+        UI.CARD_LIST_MODAL_ID
+      );
+
+    if (!modal) {
+      return;
+    }
+
+    const cardType =
+      cardListModalState.cardType;
+
+    const cardCorpCode =
+      cardListModalState.cardCorpCode;
+
+    const result =
+      cardListModalState.result;
+
+    const allItems =
+      Array.isArray(
+        result?.items
+      )
+        ? result.items
+        : [];
+
+    const statusFilter =
+      cleanText(
+        cardListModalState.statusFilter
+      );
+
+    /*
+     * 状态过滤走本地：数据还是那份卡池 items，只是列表收窄。
+     * （批次区块始终用全量 allItems 统计，不受过滤影响。）
+     */
+    const items =
+      statusFilter
+        ? allItems.filter(
+            item =>
+              resolveCardStatus(
+                item
+              ).label ===
+              statusFilter
+          )
+        : allItems;
+
+    const label =
+      cardType ===
+        "storage"
+        ? "储值卡"
+        : cardType ===
+            "ecommerce"
+          ? "电商卡"
+          : "套餐卡";
+
+    const state =
+      getCardRemarkTypeState(
+        cardType,
+        getCurrentOrderCode(),
+        cardCorpCode
+      );
+
+    const title =
+      modal.querySelector(
+        "[data-soa-card-list-title]"
+      );
+
+    const sub =
+      modal.querySelector(
+        "[data-soa-card-list-sub]"
+      );
+
+    const body =
+      modal.querySelector(
+        "[data-soa-card-list-body]"
+      );
+
+    const foot =
+      modal.querySelector(
+        "[data-soa-card-list-foot]"
+      );
+
+    if (title) {
+      title.textContent =
+        statusFilter
+          ? `${label}卡片明细 · ${statusFilter}`
+          : `${label}卡片明细`;
+    }
+
+    if (sub) {
+      const batchCount =
+        state?.batches?.size ||
+        0;
+
+      const parts = [
+        statusFilter
+          ? `共 ${items.length} 张（${statusFilter}）· 该卡类 ${allItems.length} 张`
+          : `共 ${items.length} 张`,
+        `单位代码 ${cardCorpCode || "未识别"}`
+      ];
+
+      if (
+        cardType ===
+        "ecommerce"
+      ) {
+        parts.push(
+          "电商卡无卡备注"
+        );
+      } else if (batchCount) {
+        parts.push(
+          `备注已按批次加载（${batchCount} 个批次）`
+        );
+      } else if (
+        state?.complete
+      ) {
+        parts.push(
+          "备注查询完成，未识别到批次"
+        );
+      } else {
+        parts.push(
+          "正在读取制卡审批…"
+        );
+      }
+
+      sub.textContent =
+        parts.join(" · ");
+    }
+
+    if (body) {
+      body.innerHTML =
+        items.length
+          ? `
+            ${buildCardBatchSectionHtml()}
+            <div style="
+              display:grid;
+              grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) 62px minmax(0,1.1fr) 12px;
+              gap:8px;
+              padding:0 8px 5px;
+              border-bottom:1px solid #e6ebf1;
+              color:#8a94a3;
+              font-size:11px;
+              font-weight:700;
+            ">
+              <span>卡号</span>
+              <span>卡类</span>
+              <span>状态</span>
+              <span>备注</span>
+              <span></span>
+            </div>
+            ${items
+              .map(
+                buildCardListItemRowHtml
+              )
+              .join("")}
+          `
+          : `
+            <div style="
+              padding:10px;
+              color:#8a94a3;
+              font-size:12px;
+            ">${statusFilter ? `该卡类没有「${escapeHtml(statusFilter)}」的卡。` : "该卡类暂无卡片。"}</div>
+          `;
+
+    }
+
+    /*
+     * 批次区块折叠：只切换这一块的显示与按钮外观，**不整块重渲染** ——
+     * 免得把已经展开的卡片行一起弹回去。
+     */
+    const batchBody =
+      body.querySelector(
+        "[data-soa-card-batch-body]"
+      );
+
+    const batchToggle =
+      body.querySelector(
+        "[data-soa-card-batch-toggle]"
+      );
+
+    batchToggle?.addEventListener(
+      "click",
+      event => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const wasCollapsed =
+          cardListModalState.batchCollapsed !==
+          false;
+
+        const nextCollapsed =
+          !wasCollapsed;
+
+        cardListModalState.batchCollapsed =
+          nextCollapsed;
+
+        if (batchBody) {
+          batchBody.style.display =
+            nextCollapsed
+              ? "none"
+              : "";
+        }
+
+        batchToggle.style.cssText =
+          getCardBatchToggleStyle(
+            nextCollapsed
+          );
+
+        batchToggle.textContent =
+          nextCollapsed
+            ? "展开批次 ▾"
+            : "收起批次 ▴";
+      }
+    );
+
+    if (foot) {
+      /*
+       * 页脚只留说明与进度：备注随制卡审批自动读取，不再需要手动按钮
+       *（打开弹窗即触发，批次与备注一起补齐）。
+       */
+      const batchCount =
+        state?.batches?.size ||
+        0;
+
+      let progress =
+        "";
+
+      if (
+        cardType ===
+        "ecommerce"
+      ) {
+        progress =
+          " · 电商卡无卡备注";
+      } else if (cardRemarkQueryRunning) {
+        progress =
+          " · 正在读取制卡审批…";
+      } else if (batchCount) {
+        progress =
+          ` · 已识别 ${batchCount} 个制卡批次`;
+      } else if (state?.complete) {
+        progress =
+          " · 未识别到制卡批次";
+      }
+
+      foot.innerHTML = `
+        <div style="
+          flex:1 1 auto;
+          min-width:0;
+          color:#8a94a3;
+          font-size:11.5px;
+          line-height:1.5;
+        ">点卡号那一行看这张卡的详情（含所属批次备注）· 面板上的数字：左键看列表、右键去卡池${progress}</div>
+      `;
+    }
+
+    /*
+     * 行交互：点一行就地展开这张卡的信息。
+     * 若它所在批次还没查过，展开时按需补一次（2 请求 / 批次，
+     * 同批次的卡再点直接复用，不发请求）。
+     */
+    body
+      ?.querySelectorAll(
+        "[data-soa-card-list-item]"
+      )
+      .forEach(
+        row => {
+          const cardNo =
+            row.getAttribute(
+              "data-soa-card-list-item"
+            ) || "";
+
+          const main =
+            row.querySelector(
+              "[data-soa-card-list-main]"
+            );
+
+          const detailBox =
+            row.querySelector(
+              "[data-soa-card-list-detail]"
+            );
+
+          if (
+            !main ||
+            !detailBox
+          ) {
+            return;
+          }
+
+          const item =
+            items.find(
+              candidate =>
+                extractCardNoFromPoolItem(
+                  candidate
+                ) ===
+                cardNo
+            );
+
+          if (!item) {
+            return;
+          }
+
+          const toggle =
+            async() => {
+              const willOpen =
+                detailBox.hidden;
+
+              detailBox.hidden =
+                !willOpen;
+
+              if (!willOpen) {
+                return;
+              }
+
+              detailBox.innerHTML =
+                buildCardItemDetailHtml(
+                  item
+                );
+
+              const alreadyKnown =
+                findCardRemarkBatchForCardNo(
+                  cardNo,
+                  getCardRemarkTypeState(
+                    cardListModalState.cardType,
+                    getCurrentOrderCode(),
+                    cardListModalState.cardCorpCode
+                  )
+                );
+
+              if (alreadyKnown) {
+                return;
+              }
+
+              const outcome =
+                await loadCardRemarkBatchForCard(
+                  cardNo
+                );
+
+              if (
+                detailBox.hidden
+              ) {
+                return;
+              }
+
+              detailBox.innerHTML =
+                buildCardItemDetailHtml(
+                  item
+                );
+
+              if (
+                outcome.status ===
+                "ready"
+              ) {
+                refreshCardListModalRemarkCells();
+              }
+            };
+
+          main.addEventListener(
+            "click",
+            toggle
+          );
+
+          main.addEventListener(
+            "keydown",
+            event => {
+              if (
+                event.key === "Enter" ||
+                event.key === " "
+              ) {
+                event.preventDefault();
+
+                toggle();
+              }
+            }
+          );
+
+          row.addEventListener(
+            "mouseenter",
+            () => {
+              main.style.background =
+                "#f6f9fd";
+            }
+          );
+
+          row.addEventListener(
+            "mouseleave",
+            () => {
+              main.style.background =
+                "transparent";
+            }
+          );
+        }
+      );
+  }
+
+  /*
+   * 打开弹窗后**自动**把该卡类的制卡审批读全：
+   * 判区间的同时顺带 process/detail 把备注一并拿回来。
+   * 一个订单下的审批条目不会太多，所以不再要求用户额外点一次「查询备注」。
+   */
+  function autoLoadCardRemarksForModal() {
+    const cardType =
+      cardListModalState.cardType;
+
+    const cardCorpCode =
+      cardListModalState.cardCorpCode;
+
+    const result =
+      cardListModalState.result;
+
+    if (
+      cardType !==
+        "general" &&
+      cardType !==
+        "storage"
+    ) {
+      return;
+    }
+
+    if (
+      !result?.ok ||
+      !cardCorpCode ||
+      cardRemarkQueryRunning
+    ) {
+      return;
+    }
+
+    const state =
+      getCardRemarkTypeState(
+        cardType,
+        getCurrentOrderCode(),
+        cardCorpCode
+      );
+
+    if (state.complete) {
+      return;
+    }
+
+    queryCardRemarksByType(
+      cardType,
+      result,
+      cardListModalState.cardPool,
+      cardCorpCode
+    ).catch(
+      error => {
+        updatePanelStatus(
+          error?.message ||
+          String(error),
+          "error"
+        );
+      }
+    );
+  }
+
+  function openCardListModal(
+    cardType,
+    result,
+    cardPool,
+    cardCorpCode,
+    options
+  ) {
+    if (
+      !result?.ok ||
+      !Array.isArray(
+        result.items
+      ) ||
+      !result.items.length
+    ) {
+      updatePanelStatus(
+        "当前卡类没有可展示的卡片。"
+      );
+
+      return;
+    }
+
+    cardListModalState.cardType =
+      cardType;
+
+    cardListModalState.cardPool =
+      cardPool;
+
+    cardListModalState.cardCorpCode =
+      cardCorpCode;
+
+    cardListModalState.result =
+      result;
+
+    /*
+     * 状态过滤：从「状态行数字」进来时只列该状态的卡；
+     * 从「数量」进来则清空过滤（列全部）。
+     */
+    cardListModalState.statusFilter =
+      cleanText(
+        options?.status
+      );
+
+    /* 每次打开都回到「折叠」状态，默认把位置留给卡片列表。 */
+    cardListModalState.batchCollapsed =
+      true;
+
+    const modal =
+      ensureCardListModal();
+
+    renderCardListModalContent();
+
+    modal.style.display =
+      "flex";
+
+    autoLoadCardRemarksForModal();
+  }
+
+  /*
+   * 备注（全量扫或按需补）完成后，弹窗还开着就同步刷新它，
+   * 否则备注列会停在「未查询」上。
+   */
+  function refreshCardListModalIfOpen() {
+    const modal =
+      document.getElementById(
+        UI.CARD_LIST_MODAL_ID
+      );
+
+    if (
+      !modal ||
+      modal.style.display ===
+        "none"
+    ) {
+      return;
+    }
+
+    renderCardListModalContent();
+  }
+
+  /*
+   * 把已排序的候选卡号整理成「连续段」。
+   *
+   * 为什么必须先切段：卡池里看到的「号码连着」只是视觉连续，制卡时可能分属
+   * 多条审批（跳号作废后重新提交、号码复用）。所以先在本地按「同前缀 + 序号
+   * 相邻差 1」切段、跳号处断开，再拿每段的代表卡去制卡审批里问区间 ——
+   * 而不是拿整池去猜。
+   *
+   * ⚠️ 制卡审批只能按**卡号**查：订单名称会重复，orderCode 过滤实测被服务端忽略
+   *（传了 orderCode / cardCorpCode 都返回全量 4278 条），所以查询入口只能是卡号。
+   */
+  function buildContinuousCardSegments(
+    candidates
+  ) {
+    const segments = [];
+
+    let current =
+      null;
+
+    for (
+      const candidate of
+      candidates
+    ) {
+      if (
+        current &&
+        current.prefix ===
+          candidate.prefix &&
+        candidate.serial ===
+          current.endSerial +
+            1
+      ) {
+        current.endSerial =
+          candidate.serial;
+
+        current.cardNos.push(
+          candidate.cardNo
+        );
+
+        continue;
+      }
+
+      current = {
+        prefix:
+          candidate.prefix,
+        startSerial:
+          candidate.serial,
+        endSerial:
+          candidate.serial,
+        cardNos: [
+          candidate.cardNo
+        ]
+      };
+
+      segments.push(
+        current
+      );
+    }
+
+    return segments;
+  }
+
+  function groupCandidatesByPrefix(
+    candidates
+  ) {
+    const grouped =
+      new Map();
+
+    for (
+      const candidate of
+      candidates
+    ) {
+      if (
+        !grouped.has(
+          candidate.prefix
+        )
+      ) {
+        grouped.set(
+          candidate.prefix,
+          []
+        );
+      }
+
+      grouped
+        .get(
+          candidate.prefix
+        )
+        .push(
+          candidate
+        );
+    }
+
+    return grouped;
+  }
+
+  /*
+   * 当前子区间是否已被**单条干净**的已知审批区间完整覆盖。
+   * 只用于剪枝（能整段跳过的就别再探测）；覆盖不全就继续细分。
+   *
+   * ⚠️ 可疑批次（区间长度与审批卡数不符 / 归属单位不符 / 与其它批次重叠）
+   * **不参与剪枝** —— 卡池里已经有全部卡号，这类重叠/缺口在本地就能看出来，
+   * 一旦可疑就继续收窄核对，而不是让一条可疑区间把整段吞掉。
+   */
+  function isSerialRangeCovered(
+    prefix,
+    fromSerial,
+    toSerial,
+    state
+  ) {
+    if (
+      !state ||
+      !prefix ||
+      !Number.isFinite(
+        fromSerial
+      ) ||
+      !Number.isFinite(
+        toSerial
+      )
+    ) {
+      return false;
+    }
+
+    for (
+      const batch of
+      state.batches.values()
+    ) {
+      if (
+        batch.prefix !==
+        prefix
+      ) {
+        continue;
+      }
+
+      if (
+        cleanText(
+          batch.suspect
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !Number.isFinite(
+          batch.startSerial
+        ) ||
+        !Number.isFinite(
+          batch.endSerial
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        batch.startSerial <=
+          fromSerial &&
+        batch.endSerial >=
+          toSerial
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /*
+   * 从区间 [fromSerial, toSerial] 里挑一张「代表卡」去探测。
+   * 取靠近**中点**的卡：相比取开头，中点更容易碰到审批边界，
+   * 因而更容易发现「一段里夹着多条审批」；已探测过的卡跳过。
+   */
+  function pickSegmentProbeCandidate(
+    prefix,
+    fromSerial,
+    toSerial,
+    ctx
+  ) {
+    const list =
+      ctx.byPrefix.get(
+        prefix
+      ) ||
+      [];
+
+    const middle =
+      (
+        fromSerial +
+        toSerial
+      ) /
+      2;
+
+    let best =
+      null;
+
+    let bestDistance =
+      Infinity;
+
+    for (
+      const candidate of
+      list
+    ) {
+      if (
+        candidate.serial <
+          fromSerial ||
+        candidate.serial >
+          toSerial
+      ) {
+        continue;
+      }
+
+      if (
+        ctx.state.checkedCards.has(
+          candidate.cardNo
+        )
+      ) {
+        continue;
+      }
+
+      const distance =
+        Math.abs(
+          candidate.serial -
+          middle
+        );
+
+      if (
+        distance <
+        bestDistance
+      ) {
+        best =
+          candidate;
+
+        bestDistance =
+          distance;
+      }
+    }
+
+    return best;
+  }
+
+  /*
+   * 处理一个「卡池连续段」：段内取点 → 查审批区间 → 按审批区间把段再细分。
+   *
+   * 判定规则（「再判定区间」的核心）：
+   *   审批区间完整覆盖当前子区间          → 该子区间整段同批，结束
+   *   审批区间只压住一侧 / 比子区间窄      → 区间外的左右两侧继续细分递归
+   *   该卡查不到审批记录                  → 换段内另一张卡再试，全试完则放弃这一段
+   */
+  async function resolveCardRemarkSegment(
+    segment,
+    ctx
+  ) {
+    const pending = [
+      [
+        segment.startSerial,
+        segment.endSerial
+      ]
+    ];
+
+    // 防呆：正常情况每个子区间最多探测「段内卡数」次
+    let steps =
+      0;
+
+    const maxSteps =
+      segment.cardNos.length *
+        2 +
+      4;
+
+    while (
+      pending.length &&
+      steps <
+        maxSteps
+    ) {
+      steps +=
+        1;
+
+      const range =
+        pending.pop();
+
+      const fromSerial =
+        range[0];
+
+      const toSerial =
+        range[1];
+
+      if (
+        fromSerial >
+        toSerial
+      ) {
+        continue;
+      }
+
+      if (
+        isSerialRangeCovered(
+          segment.prefix,
+          fromSerial,
+          toSerial,
+          ctx.state
+        )
+      ) {
+        continue;
+      }
+
+      const candidate =
+        pickSegmentProbeCandidate(
+          segment.prefix,
+          fromSerial,
+          toSerial,
+          ctx
+        );
+
+      if (!candidate) {
+        continue;
+      }
+
+      ctx.state.checkedCards.add(
+        candidate.cardNo
+      );
+
+      updatePanelStatus(
+        `正在查询${ctx.label}备注：${candidate.cardNo}`,
+        "normal",
+        {
+          persistent:
+            true
+        }
+      );
+
+      let outcome =
+        null;
+
+      try {
+        outcome =
+          await fetchAndStoreCardRemarkBatch(
+            candidate.cardNo,
+            ctx.state,
+            ctx.orderCode,
+            {
+              cardCorpCode:
+                ctx.cardCorpCode
+            }
+          );
+      } catch (error) {
+        if (
+          error instanceof
+          FlowCancelledError
+        ) {
+          throw error;
+        }
+
+        console.warn(
+          "[SOA订单数据] 卡备注查询失败：",
+          {
+            cardType:
+              ctx.cardType,
+            cardNo:
+              candidate.cardNo,
+            error
+          }
+        );
+      }
+
+      if (
+        !outcome ||
+        !outcome.ok
+      ) {
+        if (
+          outcome?.reason ===
+          "no-record"
+        ) {
+          console.warn(
+            "[SOA订单数据] 未找到对应制卡记录：",
+            candidate.cardNo
+          );
+        }
+
+        /*
+         * 这张卡没有可用的审批记录：把同一区间放回队列，
+         * 让 pickSegmentProbeCandidate 换段内另一张卡再试。
+         */
+        pending.push([
+          fromSerial,
+          toSerial
+        ]);
+
+        continue;
+      }
+
+      const batch =
+        outcome.batch;
+
+      if (
+        !batch ||
+        batch.prefix !==
+          segment.prefix ||
+        !Number.isFinite(
+          batch.startSerial
+        ) ||
+        !Number.isFinite(
+          batch.endSerial
+        )
+      ) {
+        continue;
+      }
+
+      // 审批区间之外的部分（左、右）继续细分
+      if (
+        batch.startSerial >
+        fromSerial
+      ) {
+        pending.push([
+          fromSerial,
+          Math.min(
+            batch.startSerial -
+              1,
+            toSerial
+          )
+        ]);
+      }
+
+      if (
+        batch.endSerial <
+        toSerial
+      ) {
+        pending.push([
+          Math.max(
+            batch.endSerial +
+              1,
+            fromSerial
+          ),
+          toSerial
+        ]);
+      }
+
+      /*
+       * 可疑批次 ⇒ 只在这一条上增加校验点（"碰到可疑才加密核对"的落点）：
+       *   · 有重叠段 → 逐段复核重叠区（这段到底属于哪条审批，以再次探测返回为准）
+       *   · 无重叠（长度与声明张数不符等）→ 按卡池卡号**每 N 张取一个点**核对
+       * 干净的批次不付出任何额外请求。
+       *
+       * ⚠️ 只在批次**首次入库**（reason === "loaded"）时入队一次 ——
+       * 否则后续每次探到同一条审批都会把采样点再推一遍，探测点会指数级膨胀。
+       */
+      if (
+        cleanText(
+          batch.suspect
+        ) &&
+        outcome.reason ===
+          "loaded"
+      ) {
+        const extraRanges = [];
+
+        if (
+          Array.isArray(
+            batch.overlaps
+          )
+        ) {
+          for (
+            const overlap of
+            batch.overlaps
+          ) {
+            if (
+              Number.isFinite(
+                overlap.from
+              ) &&
+              Number.isFinite(
+                overlap.to
+              )
+            ) {
+              extraRanges.push([
+                overlap.from,
+                overlap.to
+              ]);
+            }
+          }
+        }
+
+        if (
+          !extraRanges.length &&
+          Number.isFinite(
+            batch.startSerial
+          ) &&
+          Number.isFinite(
+            batch.endSerial
+          ) &&
+          batch.endSerial >
+            batch.startSerial
+        ) {
+          for (
+            let startSerial =
+              batch.startSerial;
+            startSerial <=
+              batch.endSerial;
+            startSerial +=
+              CARD_REMARK_SUSPECT_PROBE_STEP
+          ) {
+            extraRanges.push([
+              startSerial,
+              Math.min(
+                startSerial +
+                  CARD_REMARK_SUSPECT_PROBE_STEP -
+                  1,
+                batch.endSerial
+              )
+            ]);
+          }
+        }
+
+        for (
+          const extra of
+          extraRanges
+        ) {
+          const lo =
+            Math.max(
+              extra[0],
+              segment.startSerial
+            );
+
+          const hi =
+            Math.min(
+              extra[1],
+              segment.endSerial
+            );
+
+          if (
+            lo <= hi
+          ) {
+            pending.push([
+              lo,
+              hi
+            ]);
+          }
+        }
+      }
+
+      if (pending.length) {
+        await sleep(
+          randomInt(
+            CARD_REMARK_PAGE_DELAY[0],
+            CARD_REMARK_PAGE_DELAY[1]
+          )
+        );
+      }
+    }
   }
 
   async function queryCardRemarksByType(
@@ -4064,8 +6736,32 @@
         ? "储值卡"
         : "套餐卡";
 
+    /*
+     * 先把卡池卡号在本地切成「连续段」，再逐段去制卡审批里问区间、按审批区间细分。
+     * 不按订单名称查 —— 订单名称会重复，只有卡号能唯一确定一条审批。
+     */
+    const segments =
+      buildContinuousCardSegments(
+        candidates
+      );
+
+    const ctx = {
+      state,
+      orderCode,
+      cardCorpCode,
+      cardType,
+      label,
+      byPrefix:
+        groupCandidatesByPrefix(
+          candidates
+        )
+    };
+
     try {
-      while (true) {
+      for (
+        const segment of
+        segments
+      ) {
         if (
           getCurrentOrderCode() !==
           orderCode
@@ -4075,210 +6771,14 @@
           );
         }
 
-        const uncovered =
-          getUncoveredCardCandidates(
-            candidates,
-            state
-          );
-
-        if (!uncovered.length) {
-          state.complete =
-            true;
-
-          break;
-        }
-
-        /*
-         * 每次只从当前未覆盖区间里取1张。
-         * 卡号已经按后5位从小到大排序，因此优先查询最小的未覆盖卡号。
-         * page 返回 beginNo/endNo 后，区间内其他同类型卡会立即自动排除。
-         */
-        const candidate =
-          uncovered[0];
-
-        state.checkedCards.add(
-          candidate.cardNo
+        await resolveCardRemarkSegment(
+          segment,
+          ctx
         );
-
-        updatePanelStatus(
-          `正在查询${label}备注：${candidate.cardNo}`,
-          "normal",
-          {
-            persistent:
-              true
-          }
-        );
-
-        try {
-          const records =
-            await fetchCardProcessPageByCardNo(
-              candidate.cardNo
-            );
-
-          const record =
-            findProcessRecordForCard(
-              records,
-              candidate.cardNo,
-              orderCode
-            );
-
-          if (
-            !record ||
-            record.id ===
-              undefined ||
-            record.id ===
-              null
-          ) {
-            console.warn(
-              "[SOA订单数据] 未找到对应制卡记录：",
-              candidate.cardNo
-            );
-
-            continue;
-          }
-
-          const batchId =
-            String(
-              record.id
-            );
-
-          if (
-            state.batches.has(
-              batchId
-            )
-          ) {
-            continue;
-          }
-
-          await sleep(
-            randomInt(
-              CARD_REMARK_DETAIL_DELAY[0],
-              CARD_REMARK_DETAIL_DELAY[1]
-            )
-          );
-
-          const detail =
-            await fetchCardProcessDetail(
-              record.id
-            );
-
-          if (
-            getCurrentOrderCode() !==
-            orderCode
-          ) {
-            throw new FlowCancelledError(
-              "订单已切换，已停止卡备注查询"
-            );
-          }
-
-          const detailOrderCode =
-            cleanText(
-              detail?.orderCode
-            );
-
-          if (
-            detailOrderCode &&
-            detailOrderCode !==
-              orderCode
-          ) {
-            console.warn(
-              "[SOA订单数据] 制卡详情订单不匹配，已跳过：",
-              {
-                cardNo:
-                  candidate.cardNo,
-                detailOrderCode,
-                currentOrderCode:
-                  orderCode
-              }
-            );
-
-            continue;
-          }
-
-          const range =
-            normalizeBatchSuffixRange(
-              detail?.beginNo ||
-              record?.beginNo,
-              detail?.endNo ||
-              record?.endNo,
-              candidate.suffix
-            );
-
-          state.batches.set(
-            batchId,
-            {
-              id:
-                batchId,
-              remark:
-                cleanText(
-                  detail?.remark
-                ),
-              startSuffix:
-                range.start,
-              endSuffix:
-                range.end,
-              beginNo:
-                cleanText(
-                  detail?.beginNo ||
-                  record?.beginNo
-                ),
-              endNo:
-                cleanText(
-                  detail?.endNo ||
-                  record?.endNo
-                ),
-              cardDate:
-                extractCardRemarkDate(
-                  detail,
-                  record
-                ),
-              cardNum:
-                Number(
-                  detail?.cardNum ||
-                  record?.cardNum ||
-                  0
-                )
-            }
-          );
-
-          /*
-           * 不需要手工逐张删除。
-           * 下一轮 getUncoveredCardCandidates 会依据后5位批次区间，
-           * 自动排除该 beginNo~endNo 范围内的全部同类型卡号。
-           */
-        } catch (error) {
-          if (
-            error instanceof
-            FlowCancelledError
-          ) {
-            throw error;
-          }
-
-          console.warn(
-            "[SOA订单数据] 卡备注查询失败：",
-            {
-              cardType,
-              cardNo:
-                candidate.cardNo,
-              error
-            }
-          );
-        }
-
-        if (
-          getUncoveredCardCandidates(
-            candidates,
-            state
-          ).length
-        ) {
-          await sleep(
-            randomInt(
-              CARD_REMARK_PAGE_DELAY[0],
-              CARD_REMARK_PAGE_DELAY[1]
-            )
-          );
-        }
       }
+
+      state.complete =
+        true;
 
       updatePanelStatus(
         `✓ ${label}备注查询完成。`,
@@ -4292,6 +6792,11 @@
         cardPool,
         cardCorpCode
       );
+
+      /*
+       * 弹窗如果开着，把备注列一起刷新 —— 否则它会停在「未查询」。
+       */
+      refreshCardListModalIfOpen();
     }
   }
 
@@ -5171,13 +7676,24 @@
     grid.innerHTML = `
       <div style="
         grid-column:1 / -1;
+        display:flex;
+        align-items:baseline;
+        justify-content:space-between;
+        gap:8px;
         margin-bottom:1px;
-        color:#44546a;
-        font-size:11px;
-        font-weight:700;
         line-height:1.35;
       ">
-        卡类数量
+        <span style="
+          color:#44546a;
+          font-size:11px;
+          font-weight:700;
+        ">卡类数量</span>
+        <span style="
+          color:#9aa5b4;
+          font-size:10px;
+          font-weight:500;
+          white-space:nowrap;
+        ">左键明细 · 右键卡池</span>
       </div>
       ${items
         .map(
@@ -5244,17 +7760,24 @@
             const canOpenCardPool =
               clickable;
 
+            /*
+             * 同一个数字上挂两种入口：
+             *   data-soa-card-list-open → 左键开卡片明细弹窗
+             *   data-soa-card-type/code → 右键开卡池查询
+             * 两者共用一组属性，靠事件类型区分。
+             */
             const clickAttrs =
               canOpenCardPool
-                ? `data-soa-card-type="${cardType}" data-soa-card-code="${cardCorpCode}"`
+                ? `data-soa-card-list-open="1" data-soa-card-type="${cardType}" data-soa-card-code="${cardCorpCode}"`
                 : "";
 
+            /*
+             * 卡片上不再挂「查询备注 / 查看备注」按钮：
+             * 点卡号打开明细就能看到该卡所在批次的备注（按需查），
+             * 想看全部批次则在弹窗里操作 —— 少一个必须走的步骤。
+             */
             const remarkHtml =
-              buildInlineRemarkHtml(
-                cardType,
-                result,
-                cardCorpCode
-              );
+              "";
 
             return `
               <div style="
@@ -5331,7 +7854,7 @@
                   "
                   title="${
                     canOpenCardPool
-                      ? `点击新建标签页打开${label}卡池并查询单位代码 ${cardCorpCode}`
+                      ? `左键：查看${label}卡片明细（弹出列表，不发请求）\n右键：新建标签页打开${label}卡池并查询单位代码 ${cardCorpCode}`
                       : safeValue
                   }"
                 >${safeValue}</div>
@@ -5359,60 +7882,49 @@
                           let statusLabel =
                             k;
 
-                          let color =
-                            "#1677ff";
-
-                          let numberColor =
-                            "#344054";
-
-                          if (k === "生效中") {
-                            color =
-                              "#389e0d";
-                            numberColor =
-                              "#237804";
-                          } else if (k === "已核销") {
-                            color =
-                              "#7a8599";
-                            numberColor =
-                              "#475467";
-                          } else if (k === "冻结") {
+                          if (k === "冻结") {
                             statusLabel =
                               "已冻结";
-                            color =
-                              "#d46b08";
-                            numberColor =
-                              "#ad4e00";
-                          } else if (k === "作废") {
-                            color =
-                              "#cf1322";
-                            numberColor =
-                              "#a8071a";
                           }
 
-                          return `<div style="
-                            display:flex;
-                            align-items:center;
-                            justify-content:space-between;
-                            gap:5px;
-                            min-height:19px;
-                            padding:0 2px;
-                            font-size:12px;
-                            line-height:1.32;
-                          ">
+                          const tone =
+                            getCardStatusTone(
+                              k
+                            );
+
+                          /*
+                           * 整条状态做成**可点色块**（文字 + 数字都能点）：
+                           * 左键 → 弹窗只列该状态的卡（本地过滤，0 请求）。
+                           * 色块样式对齐 1.6 的状态胶囊。
+                           */
+                          return `<div
+                            data-soa-card-status-open="${k}"
+                            data-soa-card-type="${cardType}"
+                            data-soa-card-code="${cardCorpCode}"
+                            title="左键查看「${statusLabel}」的卡片明细"
+                            style="
+                              display:flex;
+                              align-items:center;
+                              justify-content:space-between;
+                              gap:6px;
+                              margin-top:3px;
+                              padding:2px 7px;
+                              border-radius:999px;
+                              background:${tone.bg};
+                              color:${tone.fg};
+                              font-size:11px;
+                              font-weight:800;
+                              line-height:1.5;
+                              white-space:nowrap;
+                              cursor:pointer;
+                            ">
                             <span style="
                               min-width:0;
-                              color:${color};
-                              font-weight:650;
-                              white-space:nowrap;
+                              overflow:hidden;
+                              text-overflow:ellipsis;
                             ">${statusLabel}</span>
                             <span style="
                               flex:0 0 auto;
-                              min-width:30px;
-                              color:${numberColor};
-                              font-size:14px;
-                              font-weight:800;
-                              line-height:1.2;
-                              text-align:right;
                               font-variant-numeric:tabular-nums;
                             ">${v}</span>
                           </div>`;
@@ -5457,15 +7969,51 @@
     grid.title =
       `cardCorpCode：${cardCorpCode}`;
 
+    /*
+     * 卡类数字上的两种点击，挂在同一个元素上：
+     *   左键 click       → 卡片明细弹窗（数据全在本地已查到的卡池 items 里，0 请求）
+     *   右键 contextmenu → 原行为：新标签页打开对应卡池并自动填单位代码查询
+     */
     grid
       .querySelectorAll(
-        "[data-soa-card-type][data-soa-card-code]"
+        "[data-soa-card-list-open][data-soa-card-type]"
       )
       .forEach(
         element => {
           element.addEventListener(
             "click",
             () => {
+              const cardType =
+                element.getAttribute(
+                  "data-soa-card-type"
+                );
+
+              const result =
+                cardType ===
+                  "storage"
+                  ? data.storedValueCard
+                  : cardType ===
+                      "ecommerce"
+                    ? data.ecommerceCard
+                    : data.packageCard;
+
+              openCardListModal(
+                cardType,
+                result,
+                data,
+                element.getAttribute(
+                  "data-soa-card-code"
+                ) ||
+                ""
+              );
+            }
+          );
+
+          element.addEventListener(
+            "contextmenu",
+            event => {
+              event.preventDefault();
+
               const cardType =
                 element.getAttribute(
                   "data-soa-card-type"
@@ -5493,86 +8041,66 @@
         }
       );
 
+    /*
+     * 状态色块：整条（文字 + 数字）左键 → 同一个弹窗，但只列该状态的卡。
+     * 与「数量」的区别只有入口和过滤条件，数据来源完全一样（本地 items）。
+     */
     grid
       .querySelectorAll(
-        "[data-soa-card-remark-detail]"
+        "[data-soa-card-status-open][data-soa-card-type]"
       )
       .forEach(
-        button => {
-          button.addEventListener(
+        element => {
+          element.addEventListener(
             "click",
-            event => {
-              event.preventDefault();
-              event.stopPropagation();
-
+            () => {
               const cardType =
-                button.getAttribute(
-                  "data-soa-card-remark-detail"
+                element.getAttribute(
+                  "data-soa-card-type"
                 );
-
-              openCardRemarkDetailModal(
-                cardType,
-                cardCorpCode
-              );
-            }
-          );
-        }
-      );
-
-    grid
-      .querySelectorAll(
-        "[data-soa-card-remark-type]"
-      )
-      .forEach(
-        button => {
-          button.addEventListener(
-            "click",
-            event => {
-              event.preventDefault();
-              event.stopPropagation();
-
-              const cardType =
-                button.getAttribute(
-                  "data-soa-card-remark-type"
-                );
-
-              const action =
-                button.getAttribute(
-                  "data-soa-card-remark-action"
-                );
-
-              if (
-                action ===
-                "view"
-              ) {
-                openCardRemarkDetailModal(
-                  cardType,
-                  cardCorpCode
-                );
-
-                return;
-              }
 
               const result =
                 cardType ===
                   "storage"
                   ? data.storedValueCard
-                  : data.packageCard;
+                  : cardType ===
+                      "ecommerce"
+                    ? data.ecommerceCard
+                    : data.packageCard;
 
-              queryCardRemarksByType(
+              openCardListModal(
                 cardType,
                 result,
                 data,
-                cardCorpCode
-              ).catch(
-                error => {
-                  updatePanelStatus(
-                    error?.message ||
-                    String(error),
-                    "error"
-                  );
+                element.getAttribute(
+                  "data-soa-card-code"
+                ) ||
+                "",
+                {
+                  status:
+                    element.getAttribute(
+                      "data-soa-card-status-open"
+                    ) ||
+                    ""
                 }
               );
+            }
+          );
+
+          // 可点提示：悬停时轻微压暗（面板全用内联样式，没有 :hover 可用）
+          element.addEventListener(
+            "mouseenter",
+            () => {
+              element.style.filter =
+                "brightness(0.96)";
+            }
+          );
+
+          element.addEventListener(
+            "mouseleave",
+            () => {
+              element.style.filter =
+                "";
             }
           );
         }
@@ -6384,7 +8912,7 @@
           font-size:15px;
           font-weight:700;
         ">
-          体检数据 v1.7.7
+          体检数据 v${SCRIPT_VERSION}
         </strong>
 
         <div style="
@@ -6514,15 +9042,6 @@
         "
       ></div>
 
-      <div style="
-        margin-top:7px;
-        color:#7b8494;
-        font-size:11px;
-        font-weight:500;
-        line-height:1.55;
-      ">
-        首次打开自动读取当前订单数据；需要更新时点击“刷新数据”。三类卡固定显示并支持点击数量进入对应卡池查询；有数据的套餐卡/储值卡可点击“查询备注”，完成后点击“查看备注”打开详情。
-      </div>
     `;
 
     document.body.appendChild(
@@ -6695,10 +9214,6 @@
         panelVisible
           ? "block"
           : "none";
-    }
-
-    if (!panelVisible) {
-      closeCardRemarkDetailModal();
     }
 
     if (panelVisible) {
