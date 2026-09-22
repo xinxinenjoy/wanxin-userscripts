@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.8套餐批量删除
 // @namespace    https://tampermonkey.net/
-// @version      1.0.0
-// @description  SOA 订单页：列出当前订单的全部套餐/加项包，勾选后批量删除。直接调接口（package/query + package/delete），不模拟点击；支持按类型批量勾选、逐条结果回报、删除后自动重算订单收入。
+// @version      1.1.0
+// @description  SOA 订单页：列出当前订单的全部套餐/加项包，勾选后批量删除。只在「未落单」或「已落单+检中修改」时加载；自动识别并灰显已作废套餐、已体检人员所在套餐、绑定关系复杂的加项包/赠送包。直接调接口（package/query + package/delete），不模拟点击。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -25,8 +25,23 @@
  * ── 关于删除与作废的边界（红领巾 2026-09-19 明确）──
  *   未落单订单内的套餐 = 【删除】  ← 本脚本只做这个
  *   已落单订单内的套餐 = 【作废】  ← 另一条线，本脚本**不做**，不要在 1.8 里混进来。
- *   因此脚本**不拦截**已落单订单，只把订单状态显示在面板上供你判断；
- *   真要删到已落单订单，服务端会拒绝，脚本如实把失败原因显示出来。
+ *
+ * ── 加载门槛（红领巾 2026-09-22）──
+ *   订单**只有两种情况可以改套餐**：① 已落单之前  ② 已落单但开启了「检中修改」。
+ *   其余一律**不加载**（连工具箱里的入口都不出现）。判据：
+ *     status != SUBMITTED 且属于落单前白名单  →  可用
+ *     status == SUBMITTED 且 process_status == 'SUB_DRAFT'（检中修改）  →  可用
+ *     status == SUBMITTED 但没开检中修改 / 取消 / 中止 / 完成 / 锁定  →  不加载
+ *   口径不准时的逃生口：控制台执行 window.__hlj_pkg_batch_del_v100.force() 强制挂载。
+ *
+ * ── 已作废的套餐要自己过滤（红领巾 2026-09-22 提的问题）──
+ *   ⚠️ **作废的套餐仍然出现在 package/query 的返回里**（实测 19 条里 13 条已作废），
+ *   不自己认出来就会被当成"可删除"挂在列表上。判据（前端 chunk 枚举 + 页面显示双向确认）：
+ *     process_status == 'INVALID'       → 作废      （页面在名字前加「已作废」，操作列只剩 查看/加项/复制/删除）
+ *     process_status == 'INVALID_ING'   → 作废中
+ *     process_status == 'INVALID_ERROR' → 作废失败
+ *   脚本把这三类整行压灰、复选框禁用、不参与全选，并在工具栏计数里单列一项。
+ *   「已删除」的套餐不在接口返回里，天然看不到，无需额外处理。
  *
  * ── 接口（2026-09-19 抓包 + 实测，全部已验证）──
  *
@@ -134,7 +149,7 @@
 
   const CUST_CN = { MALE: '男', FEMALE: '女未婚', WOMAN: '女已婚' };
 
-  // 订单状态（前端 chunk 挖到）。只用于面板展示，不做拦截
+  // 订单状态（前端 chunk 挖到）
   const ORDER_STATUS_CN = {
     DRAFT: '草稿',
     CONFIRM_AUDIT: '报价确认',
@@ -150,6 +165,46 @@
     FINISH: '完成',
   };
 
+  // 已落单之后的 process_status 子状态（前端 chunk 挖到）
+  const SUB_STATUS_CN = {
+    SUB_DRAFT: '检中修改',
+    SUB_AUDIT: '检中审核',
+    SUB_PUBLISH_AUDIT: '检中发单审核',
+    SUB_PRE_SUBMIT: '检中落单审核',
+  };
+
+  /**
+   * 「订单能不能改套餐」的口径（红领巾 2026-09-22 定，原话：
+   *   只有两种情况可以编辑套餐 —— ① 已落单之前 ② 开启了「检中修改」）。
+   *
+   * 白名单写成**枚举**而不是「非 SUBMITTED 即可」，是因为黑名单放开会让未知状态默认放行 ——
+   * 拿不准的时候宁可工具不出现（少一个入口，用户回页面手点就是了），
+   * 也不能在不该出现的时候出现（那才是真出事）。
+   *
+   * ⚠️ 判不出可编辑时不是静默消失：控制台会打出当前 status / process_status 与原因，
+   *    另有 `window[NS].force()` 可强制挂载（口径万一不准时的逃生口）。
+   */
+  const EDITABLE_BEFORE_SUBMIT = [
+    'DRAFT',            // 草稿
+    'CONFIRM_AUDIT',    // 报价确认
+    'BACKUP_AUDIT',     // 内勤复核
+    'CONTRACT_SUPPLE',  // 合同补充
+    'PUBLISH_AUDIT',    // 发单审核
+    'PRE_SUBMIT',       // 落单审核
+  ];
+  const SUB_EDITABLE = 'SUB_DRAFT'; // 已落单时唯一可改套餐的 process_status：检中修改
+
+  /**
+   * 套餐的「已作废」判据（2026-09-22 实测 + 前端 chunk 枚举确认）。
+   *
+   *   process_status: INVALID = 作废 / INVALID_ING = 作废中 / INVALID_ERROR = 作废失败
+   *   （页面给这三类行的名字前加「已作废」前缀，操作列只剩 查看/加项/复制/删除）
+   *
+   * ⚠️ 关键：**作废的套餐仍然出现在 package/query 的返回里**（实测 19 条里 13 条已作废），
+   *    所以必须自己过滤 —— 否则作废掉的会被当成可删除的显示出来。
+   */
+  const VOID_PROCESS_STATUS = ['INVALID', 'INVALID_ING', 'INVALID_ERROR'];
+
   const DELAY_MS = 150; // 相邻两次删除之间的间隔
 
   // ============================================================
@@ -161,6 +216,24 @@
     String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, (c) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
     );
+
+  /**
+   * 这条套餐是不是已经作废了。
+   * 主判 process_status（前端枚举里 INVALID 的中文就是「作废」）；
+   * 仅当该字段缺失时，才退一步看 status=DISABLE（实测两者在数据里同步，但这属于兜底）。
+   */
+  function isVoid(p) {
+    const ps = String((p && p.process_status) || '').toUpperCase();
+    if (VOID_PROCESS_STATUS.indexOf(ps) >= 0) return true;
+    if (!ps && String((p && p.status) || '').toUpperCase() === 'DISABLE') return true;
+    return false;
+  }
+
+  /** 作废态的中文（用于行内展示，作废中/作废失败都如实说，不一律叫「已作废」） */
+  function voidCn(p) {
+    const ps = String((p && p.process_status) || '').toUpperCase();
+    return { INVALID: '已作废', INVALID_ING: '作废中', INVALID_ERROR: '作废失败' }[ps] || '已作废';
+  }
 
   function log(msg, kind) {
     const box = $(IDS.log);
@@ -226,6 +299,83 @@
     if (m) return m[1];
 
     return null;
+  }
+
+  // ============================================================
+  // 3.5 加载门槛：这个订单能不能改套餐
+  // ============================================================
+
+  /**
+   * 门槛状态。
+   *   state: null = 还没判出来（此时**不挂按钮**，宁可晚 200ms 出现，也不闪一下又消失）
+   *          true = 放行；false = 拦截
+   * 判定按订单号缓存 —— 同一个订单不重复发请求（keepAlive 会被高频调用，不能每次判）。
+   */
+  const gate = {
+    orderCode: null,
+    state: null,
+    reason: '',
+    status: '',
+    process: '',
+  };
+
+  /** 纯函数：由订单详情算出能不能改套餐 */
+  function editableReason(info) {
+    const st = String((info && info.status) || '').toUpperCase();
+    const ps = String((info && info.process_status) || '').toUpperCase();
+    if (st === 'SUBMITTED') {
+      if (ps === SUB_EDITABLE) return { ok: true, reason: '已落单 · 检中修改' };
+      const psCn = ps ? SUB_STATUS_CN[ps] || ps : '未开启检中修改';
+      return { ok: false, reason: '已落单（' + psCn + '），套餐已锁定' };
+    }
+    if (EDITABLE_BEFORE_SUBMIT.indexOf(st) >= 0) {
+      return { ok: true, reason: '未落单（' + (ORDER_STATUS_CN[st] || st) + '）' };
+    }
+    return {
+      ok: false,
+      reason: '订单状态「' + (ORDER_STATUS_CN[st] || st || '未知') + '」不在可改套餐的范围内',
+    };
+  }
+
+  /**
+   * 判一次门槛。force = true 时忽略同订单缓存。
+   * 判完不由自己挂按钮 —— keepAlive 下一拍会看到 gate.state=true 自动挂上。
+   */
+  async function refreshGate(force) {
+    const code = currentOrderCode();
+    if (!code) {
+      gate.orderCode = null;
+      gate.state = false;
+      gate.reason = '没识别到订单号（不是订单页？）';
+      return false;
+    }
+    if (!force && gate.orderCode === code && gate.state !== null) return gate.state;
+
+    gate.orderCode = code;
+    gate.state = null; // 判定期间先别挂
+    try {
+      const info = await fetchOrderInfo(code);
+      const j = editableReason(info);
+      gate.status = info.status || '';
+      gate.process = info.process_status || '';
+      gate.reason = j.reason;
+      gate.state = j.ok;
+    } catch (e) {
+      gate.state = false;
+      gate.reason = '订单状态判定失败：' + (e.message || e);
+    }
+    if (gate.state) {
+      console.log('[扁鹊-1.8] 订单 ' + code + ' 可改套餐（' + gate.reason + '），工具已启用');
+    } else {
+      console.warn(
+        '[扁鹊-1.8] 订单 ' + code + ' 不可改套餐：' + gate.reason +
+          '（status=' + gate.status + ' process_status=' + gate.process + '）—— 工具不加载'
+      );
+      // 入口撤了，已经打开的面板也要一起收掉 —— 否则会留下「按钮没了、面板还开着」的鬼影
+      closePanel();
+    }
+    ensureSwitch();
+    return gate.state;
   }
 
   // ============================================================
@@ -406,6 +556,25 @@
       .hlj-bd-row.is-blocked .hlj-bd-name,
       .hlj-bd-row.is-blocked .hlj-bd-sub { color: #8c8c8c; }
       .hlj-bd-row.is-blocked input[type="checkbox"] { cursor: not-allowed; }
+
+      /* 已作废：和「已体检」一样整行压灰不可选，但配色更弱 —— 它已经不是待办，是历史遗留 */
+      .hlj-bd-row.is-voided {
+        background: #f7f7f7;
+        opacity: .5;
+        cursor: not-allowed;
+      }
+      .hlj-bd-row.is-voided:hover { background: #f7f7f7; }
+      .hlj-bd-row.is-voided .hlj-bd-name,
+      .hlj-bd-row.is-voided .hlj-bd-sub { color: #bfbfbf; }
+      .hlj-bd-row.is-voided .hlj-bd-tag { opacity: .6; cursor: default; }
+      .hlj-bd-row.is-voided input[type="checkbox"] { cursor: not-allowed; }
+      .hlj-bd-void {
+        flex: none;
+        font-size: 12px;
+        padding-top: 2px;
+        color: #8c8c8c;
+        white-space: nowrap;
+      }
       .hlj-bd-block {
         flex: none;
         font-size: 12px;
@@ -555,6 +724,14 @@
 
   function ensureSwitch() {
     const existing = $(IDS.switch);
+
+    // 加载门槛（红领巾 2026-09-22）：不可改套餐的订单，按钮压根不出现。
+    // 已落单且没开「检中修改」时命中这里；订单状态后来变了（比如检中修改已提交）
+    // 也会在下一拍把已经挂出去的按钮撤掉 —— 入口不能比权限活得久。
+    if (gate.state !== true) {
+      if (existing) existing.remove();
+      return;
+    }
 
     if (existing && existing.isConnected) {
       placeSwitch(existing);
@@ -715,6 +892,13 @@
   }
 
   function openPanel() {
+    // 门槛最后一闸：按钮已经不挂了，但面板还可能被其他路径唤起（比如切订单时面板是开着的）
+    if (gate.state !== true) {
+      console.warn(
+        '[扁鹊-1.8] 当前订单不可改套餐（' + (gate.reason || '状态未判定') + '），面板不打开'
+      );
+      return;
+    }
     ensureStyle();
     const p = ensurePanel();
     p.style.display = 'flex';
@@ -749,14 +933,16 @@
     }
     const info = state.orderInfo || {};
     const st = info.status;
-    const stCn = ORDER_STATUS_CN[st] || st || '未知';
-    const done = st === 'SUBMITTED';
+    const ps = info.process_status;
+    let stCn = ORDER_STATUS_CN[st] || st || '未知';
+    // 已落单要带上子状态 —— 「已落单」和「已落单 · 检中修改」的可编辑性完全不同
+    if (st === 'SUBMITTED' && ps) stCn += ' · ' + (SUB_STATUS_CN[ps] || ps);
     el.innerHTML =
       '订单 <b>' + esc(state.orderCode) + '</b>' +
       (state.orderType ? '（' + esc(state.orderType) + '）' : '') +
-      '<span class="hlj-bd-st' + (done ? ' is-done' : '') + '">' + esc(stCn) + '</span>' +
+      '<span class="hlj-bd-st' + (st === 'SUBMITTED' ? ' is-done' : '') + '">' + esc(stCn) + '</span>' +
       '<br><span>订单名称：' + esc(info.order_name || '—') + '</span>' +
-      '<br><span style="color:#8c8c8c">本工具只做「删除」。已落单订单内的套餐属于「作废」，不走这里。</span>';
+      '<br><span style="color:#8c8c8c">本工具只做「删除」。已作废的套餐已标灰，不参与删除。</span>';
   }
 
   function rowHtml(p) {
@@ -771,12 +957,16 @@
     //   check_list_size > 0     → 存在已检人员，整行压灰 + 标红，不可选
     const ck = state.checks.get(code);
     const bs = bindState(p);
-    const checking = ck === undefined && !done;
-    const unknown = ck === null && !done;
+    // 已作废的套餐：**仍然在 package/query 的返回里**（实测作废 13 条一条不少地返回），
+    // 必须自己认出来，否则会当成「可删除」挂在列表上 —— 这正是红领巾 2026-09-22 提的问题。
+    const voided = isVoid(p);
+    // 作废的不去查体检名单：作废 + 有已检人员并不改变结论（都不可动），少发一个请求
+    const checking = ck === undefined && !done && !voided;
+    const unknown = ck === null && !done && !voided;
     const hasChecked = !!ck && ck.check_list_size > 0;
     // 绑定关系复杂（宿主主套餐还挂着别的包）→ 不敢自动解绑，只能挡在这里
     const bindHard = bs.bound && !bs.simple;
-    const blocked = (hasChecked || bindHard) && !done;
+    const blocked = (hasChecked || bindHard || voided) && !done;
     const locked = blocked || checking || unknown;
     const checkCount = hasChecked ? ck.check_list_size : 0;
 
@@ -786,13 +976,19 @@
     if (p.estimate_count !== undefined && p.estimate_count !== null) nums.push(p.estimate_count + '人');
     if (p.sale_price !== undefined && p.sale_price !== null) nums.push('¥' + p.sale_price);
 
-    // 右侧状态位，优先级：删除结果 > 已体检 > 绑定关系复杂 > 检查中/未知
+    // 右侧状态位，优先级：删除结果 > 已作废 > 已体检 > 绑定关系复杂 > 检查中/未知
     let tailHtml = res
       ? '<span class="hlj-bd-res ' + (res.ok ? 'ok' : 'fail') + '" title="' + esc(res.msg || '') + '">' +
         (res.ok ? '已删除' : '失败') + '</span>'
       : '';
     if (!done) {
-      if (hasChecked) {
+      if (voided) {
+        tailHtml =
+          '<span class="hlj-bd-void" title="该套餐' +
+          esc(voidCn(p)) +
+          '。页面上的操作列虽仍留着「删除」，但本工具只处理有效套餐，作废的请回页面手工处理">' +
+          esc(voidCn(p)) + '</span>';
+      } else if (hasChecked) {
         tailHtml =
           '<span class="hlj-bd-block" title="' +
           esc(
@@ -826,7 +1022,7 @@
     }
 
     return `
-      <div class="hlj-bd-row${done ? ' is-done' : ''}${blocked ? ' is-blocked' : ''}" data-code="${esc(code)}">
+      <div class="hlj-bd-row${done ? ' is-done' : ''}${blocked && !voided ? ' is-blocked' : ''}${voided ? ' is-voided' : ''}" data-code="${esc(code)}">
         <input type="checkbox" data-code="${esc(code)}"${state.checked.has(code) ? ' checked' : ''}${done || locked ? ' disabled' : ''}>
         <div class="hlj-bd-main">
           <span class="hlj-bd-name">
@@ -911,13 +1107,15 @@
   }
 
   /**
-   * 这条套餐能不能被勾选。不可选的四种情况：
-   *   已经删过了 / 体检名单还在查 / 名单里有已检人员 / 被主套餐绑着且绑定关系复杂。
+   * 这条套餐能不能被勾选。不可选的五种情况：
+   *   已经删过了 / 已经作废了 / 体检名单还在查 / 名单里有已检人员 / 被主套餐绑着且绑定关系复杂。
    * 「还在查」也算不可选 —— 结果没回来就让人勾，等于给了一个随时会反悔的选择。
    */
   function selectable(p) {
     const code = p.package_code;
     if (state.results.has(code)) return false;
+    // 已作废：本工具只删有效套餐（页面上的作废残留请手工处理）
+    if (isVoid(p)) return false;
     const ck = state.checks.get(code);
     if (ck === undefined || ck === null) return false;
     if (ck.check_list_size > 0) return false;
@@ -934,17 +1132,20 @@
       if (!state.packages.length) {
         cnt.textContent = '';
       } else {
+        const byVoid = state.packages.filter(isVoid).length;
         const byCheck = state.packages.filter((p) => {
+          if (isVoid(p)) return false; // 作废的不查名单，也不该混进「已体检」计数
           const ck = state.checks.get(p.package_code);
           return !!ck && ck.check_list_size > 0;
         }).length;
         const byBind = state.packages.filter((p) => {
-          if (state.results.has(p.package_code)) return false;
+          if (state.results.has(p.package_code) || isVoid(p)) return false;
           const bs = bindState(p);
           return bs.bound && !bs.simple;
         }).length;
         cnt.innerHTML =
           '共 ' + state.packages.length + ' 条' +
+          (byVoid ? ' · <b style="color:#8c8c8c">已作废 ' + byVoid + '</b>' : '') +
           (byCheck ? ' · <b style="color:#cf1322">已体检 ' + byCheck + '</b>' : '') +
           (byBind ? ' · <b style="color:#cf1322">待解绑 ' + byBind + '</b>' : '') +
           ' · 已选 ' + state.checked.size;
@@ -1073,8 +1274,12 @@
    * 不阻塞列表渲染：列表先出来，行右侧先写「检查中…」，结果回来逐个替换。
    */
   async function probeChecks(list) {
+    // 已作废的不查：作废 + 有已检人员并不改变结论（都不可动），省下的请求留给有效套餐
     const todo = list.filter(
-      (p) => !state.results.has(p.package_code) && !state.checks.has(p.package_code)
+      (p) =>
+        !state.results.has(p.package_code) &&
+        !state.checks.has(p.package_code) &&
+        !isVoid(p)
     );
     if (!todo.length) return;
 
@@ -1140,6 +1345,27 @@
       state.orderType = info.order_type || null;
       if (!state.orderType) throw new Error('订单详情里没有 order_type，无法执行删除');
 
+      // 门槛二次校验：面板可能一直开着不动，而订单状态在别处被改了
+      // （最典型的是「检中修改」提交之后 —— 那一刻套餐就不能再删了）。
+      // 同步门槛状态并让按钮跟着消失，不能让入口比权限活得久。
+      const guard = editableReason(info);
+      gate.orderCode = state.orderCode;
+      gate.status = info.status || '';
+      gate.process = info.process_status || '';
+      gate.state = guard.ok;
+      gate.reason = guard.reason;
+      if (!guard.ok) {
+        state.busy = false;
+        state.loaded = false;
+        state.checked.clear();
+        paintAll();
+        log('该订单已不可改套餐：' + guard.reason + '（status=' + gate.status +
+          ' process_status=' + gate.process + '）—— 工具已停用', 'err');
+        closePanel();
+        ensureSwitch(); // 撤掉工具箱里的入口
+        return;
+      }
+
       const list = await fetchPackages(state.orderCode);
       state.packages = list;
       state.binds = buildBinds(list); // 绑定关系就在这份列表里，不用额外请求
@@ -1152,8 +1378,13 @@
       state.busy = false;
       state.armed = false;
       paintAll();
-      log('共 ' + list.length + ' 条套餐记录（订单状态：' +
-        (ORDER_STATUS_CN[info.status] || info.status || '未知') + '）', 'ok');
+      const stCn = ORDER_STATUS_CN[info.status] || info.status || '未知';
+      const subCn = info.status === 'SUBMITTED' && info.process_status
+        ? ' · ' + (SUB_STATUS_CN[info.process_status] || info.process_status)
+        : '';
+      const voidN = list.filter(isVoid).length;
+      log('共 ' + list.length + ' 条套餐记录（订单状态：' + stCn + subCn + '）' +
+        (voidN ? '，其中 ' + voidN + ' 条已作废、不参与删除' : ''), 'ok');
 
       // 列表已经显示出来了，体检名单状态在后台补 —— 不 await，先让用户看到东西
       if (list.length) {
@@ -1301,9 +1532,15 @@
       resetState(false);
       state.orderCode = code;
       clearLog();
-      if (open) load();
-      else paintAll();
+      // 换了订单，门槛必须重判 —— 「落单前 / 检中修改 / 已落单」对工具是开是关完全不同
+      refreshGate(true).then((ok) => {
+        if (!ok) return;
+        if (open) load();
+        else paintAll();
+      });
+      return;
     }
+    refreshGate(); // 同一订单内换页：带订单号缓存，不会重复发请求
   });
 
   // header 重绘时把开关补回去。
@@ -1320,14 +1557,33 @@
   });
 
   function boot() {
-    keepAlive();
+    keepAlive(); // 这一拍 gate.state 还是 null，按钮不会挂 —— 等判定结果
     if (document.body) {
       mo.observe(document.body, { childList: true, subtree: true });
     }
     // 启动时先认一下订单号（不发请求），面板打开时才真正读数据
     state.orderCode = currentOrderCode();
     console.log('[扁鹊-1.8] 订单套餐批量删除 v' + VERSION + ' 已就绪，订单：' + (state.orderCode || '未识别'));
+    // 门槛：判定通过才把按钮挂出去。不可改套餐的订单（已落单且未开检中修改），工具整体不出现。
+    refreshGate(true);
   }
+
+  // 逃生口：口径万一不准（比如前端将来加了新的订单状态值），
+  // 控制台执行 window.__hlj_pkg_batch_del_v100.force() 可强制挂载。
+  window[NS] = {
+    version: VERSION,
+    gate: gate,
+    state: state,
+    refreshGate: refreshGate,
+    force: function () {
+      gate.orderCode = currentOrderCode();
+      gate.state = true;
+      gate.reason = '强制挂载（绕过了订单状态门槛）';
+      ensureSwitch();
+      console.log('[扁鹊-1.8] 已强制挂载工具按钮');
+      return true;
+    },
+  };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
