@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.19
+// @version      6.20
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -17,9 +17,13 @@
 /*
  * 更新记录
  *
- * v6.19  -  2026-9-21
- * - 「当前状态」文案过长时按省略号裁掉（不再撑宽表格），鼠标悬浮在该格上时，在格子上方弹气泡
- *   显示完整文案。
+ * v6.20  -  2026-9-22
+ * - 修复：「当前状态」的完整文案气泡被截断（2026-9-22）★★
+ *     根因：本站的状态格是「自绘截断」的，站点把完整文案做成气泡挂在格子内部（异常状态时红色小图标上的
+ *     Tooltip，父节点就是 div#applyCode-*）；而脚本的通用 td 规则是 nowrap + overflow:hidden，
+ *     把格子里的一切都裁掉 ⇒ 气泡只剩半截字（234px 的气泡被裁到 110px）。
+ *     处置：状态格放开为 overflow:visible，**但省略号改裁在 span 上**（气泡是 span 的兄弟节点，
+ *     不受影响）⇒ 长文案仍显示「…」，悬浮那个小图标时站点气泡完整弹出。同时删掉上一版自建的悬浮气泡。
  * - 销方公司「改完不刷新」修复（今日反复迭代后的最终做法）：站点那格是自绘截断组件，
  *   数据变化时【只更新 title、不重画可见文本】，而脚本当初又把简称覆盖进 title ⇒ 真值被抹掉 +
  *   页面不重画 ⇒ 永远停在旧简称（点「查 询」也没用，只有 F5）。现在：
@@ -84,9 +88,6 @@ const COLUMN_LAYOUT = [
   const TABLE_SELECTOR = `.ant-table[${TABLE_MARKER}="1"]`;
   const LIST_CONTAINER_SELECTOR = ".mergeinvoice_container";
 
-  /* 状态列：文案过长时按省略号裁掉（列宽保持配置值，不撑宽表格），
-     hover 时用悬浮气泡显示完整文案，位置在单元格上方 */
-  const STATUS_TIP_ID = "tm-invoice-status-tip";
 
   /* 旁听发票接口响应、捞销方公司真值时的最大递归深度 */
   const TRUTH_SCAN_DEPTH = 6;
@@ -113,9 +114,6 @@ const COLUMN_LAYOUT = [
 
   let scheduled = false;
   let pendingForceStyle = false;
-
-  let statusTip = null;
-  let statusTipCell = null;
 
   const sellerTruth = new Map(); // applyCode → 站点真值（销方公司全称）
   let truthHookInstalled = false;
@@ -517,16 +515,26 @@ const COLUMN_LAYOUT = [
       `;
     });
 
-    // 状态文案过长时按省略号裁掉（列宽不变），完整文案由悬浮气泡给出（见 11.6 节）。
+    // 「当前状态」格：必须放开溢出（通用 td 规则是 nowrap + overflow:hidden，会把格内一切裁掉）。
+    // 站点自己的「完整文案气泡」就挂在这个格子内部 —— 异常状态时那个红色小图标上的 antd Tooltip，
+    // 父节点是 div#applyCode-*。格子一裁剪，气泡就成了半截字（2026-09-22 实测：234px 的气泡
+    // 被裁到 110px，文字断在中间）。
+    // ⚠️ 但格内文案本身仍要裁 —— 所以裁在 span 上：气泡是 span 的兄弟节点，不受影响。
     css += `
       ${scope} td[data-tm-status="1"] {
-        overflow: hidden !important;
+        overflow: visible !important;
       }
       ${scope} td[data-tm-status="1"] > div {
+        max-width: 100%;
+        overflow: visible !important;
+      }
+      ${scope} td[data-tm-status="1"] > div > span {
+        display: inline-block;
         max-width: 100%;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
         white-space: nowrap !important;
+        vertical-align: middle;
       }
     `;
 
@@ -668,6 +676,7 @@ const COLUMN_LAYOUT = [
 
     if (statusIdx === undefined || !cells[statusIdx]) return;
 
+    // 给状态格打标记：上面那套「放开溢出、让站点气泡不被裁」的 CSS 靠它定位
     cells[statusIdx].setAttribute("data-tm-status", "1");
 
     tr.classList.remove("tm-row-fail", "tm-row-refund");
@@ -1024,115 +1033,10 @@ const COLUMN_LAYOUT = [
         applyOrUpdateStyle(headerSignature);
       }
 
-      if (statusTipCell && !statusTipCell.isConnected) hideStatusTip();
-
       ensureUiButton();
       processRowsIncremental(observedTableRoot);
     });
   }
-
-  /******************** 11.6) 状态列：hover 悬浮气泡显示完整文案 ********************/
-  /* 列宽保持配置值不动（不撑宽表格）；文案被裁掉时，鼠标悬浮在单元格上，
-     在它上方弹一个气泡给出完整文案。用 position:fixed 挂到 body —— 表格祖先有
-     overflow，绝对定位的气泡会被直接裁掉。 */
-  const STATUS_TIP_OFFSET = 8;
-
-  function ensureStatusTip() {
-    if (statusTip && statusTip.isConnected) return statusTip;
-
-    statusTip = document.createElement("div");
-    statusTip.id = STATUS_TIP_ID;
-    Object.assign(statusTip.style, {
-      position: "fixed",
-      left: "0",
-      top: "0",
-      zIndex: "2147483000",
-      maxWidth: "min(560px, calc(100vw - 32px))",
-      padding: "8px 12px",
-      borderRadius: "8px",
-      background: "rgba(0, 0, 0, 0.85)",
-      color: "#fff",
-      font: "13px/20px -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif",
-      boxShadow: "0 6px 16px rgba(0, 0, 0, 0.2)",
-      whiteSpace: "normal",
-      wordBreak: "break-word",
-      pointerEvents: "none",
-      display: "none",
-    });
-
-    document.body.appendChild(statusTip);
-    return statusTip;
-  }
-
-  function hideStatusTip() {
-    if (statusTip) statusTip.style.display = "none";
-    statusTipCell = null;
-  }
-
-  function removeStatusTip() {
-    if (statusTip) {
-      statusTip.remove();
-      statusTip = null;
-    }
-    statusTipCell = null;
-  }
-
-  function showStatusTip(cell) {
-    const text = normText(cell.innerText);
-    if (!text) return;
-
-    const tip = ensureStatusTip();
-    tip.textContent = text;
-    tip.style.display = "block";
-
-    const cellRect = cell.getBoundingClientRect();
-    let top = cellRect.top - tip.offsetHeight - STATUS_TIP_OFFSET;
-    if (top < 4) top = cellRect.bottom + STATUS_TIP_OFFSET;   // 上方放不下就翻到下方
-
-    let left = cellRect.left;
-    const maxLeft = window.innerWidth - tip.offsetWidth - 8;
-    if (left > maxLeft) left = maxLeft;
-
-    tip.style.left = `${Math.round(Math.max(8, left))}px`;
-    tip.style.top = `${Math.round(Math.max(4, top))}px`;
-    statusTipCell = cell;
-  }
-
-  function handleStatusHover(event) {
-    if (!enabled) return;
-
-    const cell = event.target?.closest?.("td[data-tm-status='1']") || null;
-
-    if (!cell) {
-      if (statusTipCell) hideStatusTip();
-      return;
-    }
-
-    if (cell === statusTipCell) return;
-
-    // 没被裁就不用弹气泡
-    const inner = cell.firstElementChild || cell;
-    if (inner.scrollWidth <= inner.clientWidth) {
-      hideStatusTip();
-      return;
-    }
-
-    showStatusTip(cell);
-  }
-
-  document.addEventListener("mouseover", handleStatusHover, true);
-  document.addEventListener("mouseout", (event) => {
-    if (!statusTipCell) return;
-    const to = event.relatedTarget;
-    if (to && statusTipCell.contains(to)) return;
-    hideStatusTip();
-  }, true);
-  window.addEventListener("scroll", () => {
-    if (statusTipCell) hideStatusTip();
-  }, true);
-  window.addEventListener("resize", () => {
-    if (statusTipCell) hideStatusTip();
-  });
 
   /******************** 11.7) 销方公司真值：旁听接口响应 ********************/
   /* 页面自己拉数据（合并列表 / 按订单查 / 详情）时，响应里都带着 contractCompanyName —— 旁听下来
@@ -1391,7 +1295,6 @@ const COLUMN_LAYOUT = [
     disconnectRootObserver();
     removeStyle();
     removeUiButton();
-    removeStatusTip();
 
     customerWidthDelta = 0;
     lastPageKey = null;
