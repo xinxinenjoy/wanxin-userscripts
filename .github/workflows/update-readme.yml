@@ -167,6 +167,89 @@ jobs:
                   return "-", None
 
 
+          def source_last_commit(relative):
+              # 读取“本次提交”的标签内容，显示在“今日更新”右侧。
+              #
+              # 说明：自动维护提交（[AUTO· 开头）只是把发布副本搬运到
+              # publish/，会把真正的人工提交说明挤掉，因此优先跳过它，
+              # 只有实在找不到人工提交时才退回最近一次提交。
+              if not relative:
+                  return None
+
+              base_command = [
+                  "git",
+                  "log",
+                  "-1",
+                  "--format=%s%x00%h%x00%cI",
+              ]
+
+              target = relative.as_posix()
+
+              attempts = [
+                  base_command + [
+                      "--extended-regexp",
+                      "--invert-grep",
+                      "--grep=^\\[AUTO·",
+                      "--",
+                      target,
+                  ],
+                  base_command + ["--", target],
+              ]
+
+              for command in attempts:
+                  try:
+                      result = subprocess.run(
+                          command,
+                          cwd=ROOT,
+                          text=True,
+                          capture_output=True,
+                          check=True,
+                      )
+                  except Exception as exc:
+                      print(
+                          "::warning::"
+                          f"无法读取 {relative} 的提交信息：{exc}"
+                      )
+                      return None
+
+                  raw = result.stdout.strip()
+
+                  if not raw:
+                      continue
+
+                  parts = raw.split("\x00")
+                  subject = (parts[0] or "").strip()
+
+                  if not subject:
+                      continue
+
+                  short_sha = (
+                      (parts[1] or "").strip()
+                      if len(parts) > 1
+                      else ""
+                  )
+
+                  committed_at = ""
+
+                  if len(parts) > 2 and parts[2].strip():
+                      try:
+                          committed_at = (
+                              datetime.fromisoformat(parts[2].strip())
+                              .astimezone(TZ)
+                              .strftime("%Y-%m-%d %H:%M")
+                          )
+                      except Exception:
+                          committed_at = ""
+
+                  return {
+                      "subject": subject,
+                      "short_sha": short_sha,
+                      "committed_at": committed_at,
+                  }
+
+              return None
+
+
           # 1. 扫描源脚本，建立 publishID -> 原始分类 / 修改时间映射
           source_by_id = {}
           source_errors = []
@@ -329,6 +412,7 @@ jobs:
                   "install_url": install_url,
                   "github_raw": github_raw,
                   "github_source": github_source,
+                  "source_relative": source_relative,
               })
 
           if errors:
@@ -782,6 +866,7 @@ jobs:
                   )
 
                   update_badge = ""
+                  commit_tag = ""
 
                   if is_updated_today(item["modified_dt"]):
                       update_badge = (
@@ -792,6 +877,49 @@ jobs:
                           '<span aria-hidden="true">↻</span> 今日更新'
                           '</span>'
                       )
+
+                      commit = source_last_commit(
+                          item.get("source_relative")
+                      )
+
+                      if commit:
+                          commit_tip_parts = [
+                              f"本次提交：{commit['subject']}"
+                          ]
+
+                          if commit["short_sha"]:
+                              commit_tip_parts.append(
+                                  commit["short_sha"]
+                              )
+
+                          if commit["committed_at"]:
+                              commit_tip_parts.append(
+                                  commit["committed_at"]
+                              )
+
+                          commit_title = " · ".join(
+                              commit_tip_parts
+                          )
+
+                          if commit["short_sha"]:
+                              commit_tag = (
+                                  '<a class="script-commit-tag" '
+                                  'href="'
+                                  f'{h(GITHUB_REPO_URL)}/commit/'
+                                  f'{h(commit["short_sha"])}" '
+                                  'target="_blank" '
+                                  'rel="noopener noreferrer" '
+                                  f'title="{h(commit_title)}">'
+                                  f'{h(commit["subject"])}'
+                                  '</a>'
+                              )
+                          else:
+                              commit_tag = (
+                                  '<span class="script-commit-tag" '
+                                  f'title="{h(commit_title)}">'
+                                  f'{h(commit["subject"])}'
+                                  '</span>'
+                              )
 
                   cards.append(
                       f"""
@@ -804,6 +932,7 @@ jobs:
                           <div class="script-title-wrap">
                             <h3>{h(item["name"])}</h3>
                             {update_badge}
+                            {commit_tag}
                           </div>
                           <span class="script-version">v{h(item["version"])}</span>
                         </div>
@@ -1840,6 +1969,34 @@ jobs:
                 font-weight: 850;
                 line-height: 1;
                 white-space: nowrap;
+              }}
+
+              .script-commit-tag {{
+                display: inline-block;
+                max-width: 260px;
+                height: 22px;
+                padding: 0 9px;
+                overflow: hidden;
+                border: 1px solid var(--line);
+                border-radius: 999px;
+                color: var(--muted);
+                background: var(--panel-soft);
+                font-size: 11px;
+                font-weight: 700;
+                line-height: 20px;
+                text-overflow: ellipsis;
+                vertical-align: middle;
+                white-space: nowrap;
+                transition:
+                  color .16s ease,
+                  border-color .16s ease,
+                  background .16s ease;
+              }}
+
+              .script-commit-tag:hover {{
+                border-color: #ffc9c2;
+                color: #c9251a;
+                background: #fff0ed;
               }}
 
               .script-version {{
