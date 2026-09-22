@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.11.5
+// @version      1.11.6
 // @description  SOA体检数据：自动读取落单数据、体检汇总与三类卡数量；卡类数量/状态左键看卡片明细（自动按制卡批次带出备注）、右键跳卡池。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -29,7 +29,7 @@
  *   左键 → 同一个弹窗但只列该状态；两者的右键都是跳对应卡池（新标签页打开并自动填单位代码查询）。
  *   打开面板即自动查询，同订单 15 秒内复用结果。
  *
- * 【卡片明细弹窗】列表为 卡号 / 卡类 / 状态 / 备注，数据全部来自已查到的卡池 items，不发请求；
+ * 【卡片明细弹窗】列表为 卡号 / 卡类 / 状态 / 有效期 / 金额 / 备注，数据全部来自已查到的卡池 items，不发请求；
  *   点某一行就地展开该卡详情（含所属制卡批次的卡号区间 / 办卡日期 / 卡数 / 备注）。
  *   备注列随批次读取结果自动回填。
  *
@@ -57,7 +57,14 @@
  *
  * 更新记录
  *
- * v1.11.5  -  2026-9-21   ⬅ 当前版本（本日整轮改造的收尾）
+ * v1.11.6  -  2026-9-22   ⬅ 当前版本
+ * - 卡片明细列表新增「有效期」「金额」两列（取值与展开详情一致，均来自本地卡池 item、不发请求；
+ *   金额：储值卡为当前余额、套餐/参数卡为卡金额，无值显示 -）。
+ * - 表头与数据行的网格模板抽成 CARD_LIST_COLUMNS 常量共用，避免以后加列只改一处。
+ * - 顺带统一卡池日期写法：原时间戳走 zh-CN（2026/9/16）、字符串留横杠（2026-09-17），
+ *   同一列表里两种格式并存；现统一补零成 YYYY/MM/DD。
+ *
+ * v1.11.5  -  2026-9-21
  * - 「制卡批次」区块改为默认折叠：标题行右侧「展开批次 ▾」按钮（折叠态实底蓝高亮，展开后弱化为描边）；
  *   折叠只切该区块显示、不重渲染，每次打开弹窗回到折叠态。
  * - 去掉批次区块的「放大查看」按钮及背后的整个宽表大窗（批次区块已把区间 / 日期 / 卡数 / 备注看全）。
@@ -115,7 +122,7 @@
    * 改版本时两处一起改（`@grant none` 读不到元数据，没法自动同步）。
    * 2026-09-21 红领巾提醒：面板标题里原来是硬编码的 v1.7.7，早就和 @version 脱节了。
    */
-  const SCRIPT_VERSION = "1.11.5";
+  const SCRIPT_VERSION = "1.11.6";
 
   const ORDER_ROUTE_PREFIX =
     "#/order/";
@@ -3780,6 +3787,24 @@
   //
   // ⚠️ 卡池 item 里带 card_pwd（卡密）：这里只按白名单取字段，
   //    绝不把整个 item 铺进 DOM，也不做 JSON 透传。
+  /*
+   * 卡片明细列表的列定义。
+   * ⚠️ 表头与数据行**共用这一份** —— 两处各写一遍网格模板的话，加列时必漏一处
+   *   （2026-09-22 加「有效期 / 金额」两列时就是这么栽的：先改了行、差点忘了表头）。
+   */
+  const CARD_LIST_COLUMNS = {
+    gridTemplate:
+      "minmax(0,140px) minmax(0,92px) 50px 150px 74px minmax(0,1fr) 12px",
+    headers: [
+      "卡号",
+      "卡类",
+      "状态",
+      "有效期",
+      "金额",
+      "备注"
+    ]
+  };
+
   const cardListModalState = {
     cardType: "",
     cardCorpCode: "",
@@ -3863,6 +3888,12 @@
    *   储值卡         → "YYYY-MM-DD" 字符串（beginDay / endDay）
    * 统一转成页面惯用的 YYYY-MM-DD 再展示。
    */
+  /*
+   * 卡池日期归一化 —— 统一输出 YYYY/MM/DD。
+   * 卡池里日期有两种来源：13 位时间戳（套餐卡 / 参数卡）与 "2026-09-17" 这样的字符串（储值卡）。
+   * 不归一的话同一个列表里会同时出现 2026/9/16 和 2026-09-17 两种写法（2026-09-22 实测），
+   * 既难看、也没法按列对齐。补零后再配 tabular-nums，列宽才稳定。
+   */
   function formatPoolItemDate(
     value
   ) {
@@ -3875,30 +3906,78 @@
       return "";
     }
 
+    let year =
+      null;
+
+    let month =
+      null;
+
+    let day =
+      null;
+
     if (/^\d{13}$/.test(text)) {
       const date =
         new Date(
           Number(text)
         );
 
-      return Number.isFinite(
-        date.getTime()
-      )
-        ? date.toLocaleDateString(
-            "zh-CN"
-          )
-        : text;
+      if (
+        Number.isFinite(
+          date.getTime()
+        )
+      ) {
+        year =
+          date.getFullYear();
+
+        month =
+          date.getMonth() +
+          1;
+
+        day =
+          date.getDate();
+      }
+    } else {
+      const match =
+        text.match(
+          /(\d{4})-(\d{1,2})-(\d{1,2})/
+        );
+
+      if (match) {
+        year =
+          Number(match[1]);
+
+        month =
+          Number(match[2]);
+
+        day =
+          Number(match[3]);
+      }
     }
 
-    const match =
-      text.match(
-        /\d{4}-\d{1,2}-\d{1,2}/
-      );
+    if (
+      year ===
+        null ||
+      !Number.isFinite(
+        month
+      ) ||
+      !Number.isFinite(
+        day
+      )
+    ) {
+      /* 认不出来的原样返回，别把数据藏起来。 */
+      return text;
+    }
 
-    return (
-      match?.[0] ||
-      text
-    );
+    const pad =
+      number =>
+        String(
+          number
+        ).padStart(
+          2,
+          "0"
+        );
+
+    return `${year}/${pad(month)}/${pad(day)}`;
   }
 
   function getPoolItemDateRange(
@@ -4910,13 +4989,27 @@
         cardNo
       );
 
+    /*
+     * 有效期与金额都取自本地卡池 item（不发请求），取值口径与展开详情完全一致，
+     * 这样列表里看到的和点开看到的不会打架。
+     */
+    const dateRange =
+      getPoolItemDateRange(
+        item
+      );
+
+    const amount =
+      getPoolItemAmountInfo(
+        item
+      );
+
     return `
       <div data-soa-card-list-item="${escapeHtml(cardNo)}" style="
         border-bottom:1px solid #f1f4f8;
       ">
         <div data-soa-card-list-main="1" role="button" tabindex="0" title="点开看这张卡的详情" style="
           display:grid;
-          grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) 62px minmax(0,1.1fr) 12px;
+          grid-template-columns:${CARD_LIST_COLUMNS.gridTemplate};
           align-items:center;
           gap:8px;
           padding:7px 8px;
@@ -4932,7 +5025,7 @@
             font-size:12.5px;
             font-weight:650;
           ">${escapeHtml(cardNo || "-")}</span>
-          <span style="
+          <span title="${escapeHtml(activity || "")}" style="
             overflow:hidden;
             text-overflow:ellipsis;
             white-space:nowrap;
@@ -4945,6 +5038,24 @@
             font-weight:650;
             white-space:nowrap;
           ">${escapeHtml(status)}</span>
+          <span title="${escapeHtml(dateRange || "")}" style="
+            overflow:hidden;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+            color:#44546a;
+            font-size:11px;
+            font-variant-numeric:tabular-nums;
+          ">${escapeHtml(dateRange || "-")}</span>
+          <span style="
+            overflow:hidden;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+            color:${amount ? "#253247" : "#b4bdc9"};
+            font-size:11px;
+            font-weight:${amount ? "650" : "400"};
+            text-align:right;
+            font-variant-numeric:tabular-nums;
+          ">${escapeHtml(amount ? amount.text : "-")}</span>
           <span data-soa-card-list-remark="1" style="
             overflow:hidden;
             text-overflow:ellipsis;
@@ -5724,7 +5835,7 @@
             ${buildCardBatchSectionHtml()}
             <div style="
               display:grid;
-              grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) 62px minmax(0,1.1fr) 12px;
+              grid-template-columns:${CARD_LIST_COLUMNS.gridTemplate};
               gap:8px;
               padding:0 8px 5px;
               border-bottom:1px solid #e6ebf1;
@@ -5732,10 +5843,11 @@
               font-size:11px;
               font-weight:700;
             ">
-              <span>卡号</span>
-              <span>卡类</span>
-              <span>状态</span>
-              <span>备注</span>
+              ${CARD_LIST_COLUMNS.headers
+                .map(
+                  label => `<span>${label}</span>`
+                )
+                .join("")}
               <span></span>
             </div>
             ${items
