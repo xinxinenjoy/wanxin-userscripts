@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.11
+// @version      2.12
 // @description  SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -10642,6 +10642,6 @@
   routeCheck();
 
   console.log(
-    "[SOA智能审批] v2.11 已加载"
+    "[SOA智能审批] v2.12 已加载"
   );
 })();
