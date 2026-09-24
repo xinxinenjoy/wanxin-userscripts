@@ -853,6 +853,60 @@
     return false;
   }
 
+  // ============================================================
+  // 审批时间（bindTime）—— 零新增请求
+  //
+  // 审批记录里本来就带 bindTime，buildWhitelistAndTasks 已把它存进
+  // rawIntervals[].bindTime（见该函数里 rawIntervals.push 那段）。
+  // 这里只做「卡号 → 所属审批区间 → 取该区间的 bindTime」的本地查表，
+  // **不发任何请求**。
+  //
+  // ⚠️ 精度：process/page 的 bindTime 只到「日期」（如 2026-09-24）。
+  //    若哪天要精确到秒，得改调 process/detail（那才是新增请求）——
+  //    且 process/detail 的 remark 与 1.6 现用的 bqcard/detail 不同源，
+  //    动之前先读档案 03 的「时间字段实测」一节。
+  // ============================================================
+  function normalizeBindDate(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    // 只保留 YYYY-MM-DD；带时分秒的也一并截到天，保证与 1.3 口径一致。
+    const match = text.match(/\d{4}-\d{1,2}-\d{1,2}/);
+    return match ? match[0] : text;
+  }
+
+  function buildBindTimeLookup(rawIntervals) {
+    const byPrefix = new Map();
+
+    for (const it of Array.isArray(rawIntervals) ? rawIntervals : []) {
+      if (!it?.prefix) continue;
+      if (!byPrefix.has(it.prefix)) byPrefix.set(it.prefix, []);
+      byPrefix.get(it.prefix).push(it);
+    }
+
+    for (const list of byPrefix.values()) {
+      list.sort((a, b) => a.startSerial - b.startSerial || a.endSerial - b.endSerial);
+    }
+
+    return byPrefix;
+  }
+
+  function getCardBindDate(cardNo, bindTimeLookup) {
+    if (!bindTimeLookup?.size) return '';
+
+    const parsed = splitCardNo(cardNo);
+    if (!parsed) return '';
+
+    const intervals = bindTimeLookup.get(parsed.prefix);
+    if (!intervals?.length) return '';
+
+    for (const it of intervals) {
+      if (parsed.serial < it.startSerial) break;
+      if (parsed.serial <= it.endSerial) return normalizeBindDate(it.bindTime);
+    }
+
+    return '';
+  }
+
   // 同一前缀内若干区间的并集长度（去重后的卡数）。
   // 直接对区间端点做运算，不逐号展开成字符串，跨度再大也只是几段相加。
   function unionLength(intervals) {
@@ -904,6 +958,94 @@
       map.set(key, (map.get(key) || 0) + 1);
     }
     return Object.fromEntries([...map.entries()].sort((a, b) => b[1] - a[1]));
+  }
+
+  // ============================================================
+  // 卡池 item 的「有效期 / 金额」取值
+  //
+  // ⚠️ 取值口径与「扁鹊-1.3 体检数据查询」保持逐字一致（直接照搬那边实现）——
+  //    两边弹窗显示同一张卡时，日期与金额不能打架。
+  //
+  // 卡池日期实测有两种形态：毫秒时间戳字符串（1790179200000）与 "2026-09-22"，
+  // 故必须走 formatPoolItemDate 统一，别自己 new Date() 硬转。
+  // ============================================================
+  function pickPoolItemText(item, keys) {
+    if (!item || typeof item !== 'object') return '';
+    for (const key of keys) {
+      const text = String(item[key] ?? '').trim();
+      if (text) return text;
+    }
+    return '';
+  }
+
+  function formatPoolItemDate(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return '';
+
+    let year = null;
+    let month = null;
+    let day = null;
+
+    if (/^\d{13}$/.test(text)) {
+      const date = new Date(Number(text));
+      if (Number.isFinite(date.getTime())) {
+        year = date.getFullYear();
+        month = date.getMonth() + 1;
+        day = date.getDate();
+      }
+    } else {
+      const match = text.match(/(\d{4})\D{1,2}(\d{1,2})\D{1,2}(\d{1,2})/);
+      if (match) {
+        year = Number(match[1]);
+        month = Number(match[2]);
+        day = Number(match[3]);
+      }
+    }
+
+    if (year === null || month === null || day === null) return text;
+
+    return `${year}/${String(month).padStart(2, '0')}/${String(day).padStart(2, '0')}`;
+  }
+
+  function getPoolItemDateRange(item) {
+    const begin = formatPoolItemDate(
+      pickPoolItemText(item, ['begin_date', 'beginDay', 'beginDate', 'create_at', 'createAt'])
+    );
+    const end = formatPoolItemDate(
+      pickPoolItemText(item, ['end_date', 'endDay', 'endDate', 'init_end_date'])
+    );
+
+    if (begin && end && begin !== end) return `${begin} ~ ${end}`;
+    return begin || end;
+  }
+
+  /*
+   * 金额只取一个，并标明它是什么钱：
+   *   储值卡 → currentAmount（当前余额）
+   *   其余   → 卡金额（initAmount / saleAmount / sale_price / price）
+   * 不做单位换算、不猜语义：取不到就显示 -。
+   */
+  function getPoolItemAmountInfo(item) {
+    const current = Number(item?.currentAmount);
+    if (item?.currentAmount !== undefined && item?.currentAmount !== null &&
+        String(item.currentAmount).trim() !== '' && Number.isFinite(current)) {
+      return { label: '当前余额', text: `¥${current.toFixed(2)}` };
+    }
+
+    const matched = [
+      ['initAmount', '卡金额'],
+      ['saleAmount', '卡金额'],
+      ['sale_price', '卡金额'],
+      ['price', '卡金额'],
+    ].find(([key]) => {
+      const raw = item?.[key];
+      if (raw === undefined || raw === null || String(raw).trim() === '') return false;
+      return Number.isFinite(Number(raw));
+    });
+
+    if (!matched) return null;
+
+    return { label: matched[1], text: `¥${Number(item[matched[0]]).toFixed(2)}` };
   }
 
 
@@ -3099,7 +3241,7 @@
       }
 
       #${IDS.cardModal} .hlj-card-modal-panel {
-        width:min(760px,100%);
+        width:min(880px,100%);
         max-height:min(80vh,760px);
         display:flex;
         flex-direction:column;
@@ -3192,12 +3334,47 @@
 
       #${IDS.cardModal} .hlj-card-main {
         display:grid;
-        grid-template-columns:152px minmax(72px,1fr) 62px minmax(110px,1.4fr) 14px;
+        grid-template-columns:minmax(0,140px) minmax(0,92px) 50px 76px 150px 74px minmax(0,1fr) 12px;
         align-items:center;
         gap:8px;
         padding:7px 9px;
         cursor:pointer;
       }
+
+      /* 列表表头：与 .hlj-card-main 共用同一套列宽口径，加列时两处一起改 */
+      #${IDS.cardModal} .hlj-card-head {
+        display:grid;
+        grid-template-columns:minmax(0,140px) minmax(0,92px) 50px 76px 150px 74px minmax(0,1fr) 12px;
+        gap:8px;
+        padding:0 9px 5px;
+        border-bottom:1px solid #e2e8f0;
+        color:#8a94a3;
+        font-size:10px;
+        font-weight:800;
+        letter-spacing:.2px;
+      }
+
+      #${IDS.cardModal} .hlj-card-head span {
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+
+      #${IDS.cardModal} .hlj-card-bind,
+      #${IDS.cardModal} .hlj-card-date,
+      #${IDS.cardModal} .hlj-card-amount {
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+        font-size:11px;
+        font-variant-numeric:tabular-nums;
+      }
+
+      #${IDS.cardModal} .hlj-card-bind { color:#475569; }
+      #${IDS.cardModal} .hlj-card-date { color:#64748b; }
+      #${IDS.cardModal} .hlj-card-amount { color:#0f766e; font-weight:700; }
+      #${IDS.cardModal} .hlj-card-bind.is-empty,
+      #${IDS.cardModal} .hlj-card-date.is-empty { color:#c3cad4; }
 
       #${IDS.cardModal} .hlj-card-main:hover {
         background:#f1f5f9;
@@ -4019,19 +4196,41 @@
     const body = modal.querySelector('.hlj-card-modal-body');
     const head = `<div class="hlj-card-modal-sum">共 <b>${cards.length}</b> 张${note ? ` · ${escapeHtml(note)}` : ''}</div>`;
 
+    /*
+     * 审批时间查表：从本次已拉到的审批区间里取 bindTime（零新增请求）。
+     * state.lastData.rawIntervals 就是 buildWhitelistAndTasks 产出的那份。
+     */
+    const bindTimeLookup = buildBindTimeLookup(state.lastData?.rawIntervals);
+
     body.innerHTML = `
       ${head}
+      <div class="hlj-card-head">
+        <span>卡号</span>
+        <span>卡类</span>
+        <span>状态</span>
+        <span>审批时间</span>
+        <span>有效期</span>
+        <span>金额</span>
+        <span>备注</span>
+        <span></span>
+      </div>
       <div class="hlj-card-list">
         ${cards.map((card) => {
           const no = getCardNo(card);
           const status = translateCardStatus(card);
           const activity = String(card?.activity_name || '').trim();
+          const bindDate = getCardBindDate(no, bindTimeLookup);
+          const dateRange = getPoolItemDateRange(card);
+          const amount = getPoolItemAmountInfo(card);
           return `
             <div class="hlj-card-item" data-card-no="${escapeHtml(no)}">
               <div class="hlj-card-main" role="button" tabindex="0">
                 <span class="hlj-card-no">${escapeHtml(no)}</span>
                 <span class="hlj-card-act">${escapeHtml(activity || '未分类')}</span>
                 <span class="hlj-card-status ${getStatusToneClass(status)}">${escapeHtml(status)}</span>
+                <span class="hlj-card-bind${bindDate ? '' : ' is-empty'}" title="${escapeHtml(bindDate || '未返回审批时间')}">${escapeHtml(bindDate || '-')}</span>
+                <span class="hlj-card-date${dateRange ? '' : ' is-empty'}" title="${escapeHtml(dateRange || '未返回有效期')}">${escapeHtml(dateRange || '-')}</span>
+                <span class="hlj-card-amount" title="${escapeHtml(amount ? amount.label + ' ' + amount.text : '未返回金额')}">${escapeHtml(amount ? amount.text : '-')}</span>
                 <span class="hlj-card-remark is-pending">备注加载中…</span>
                 <span class="hlj-card-caret">›</span>
               </div>

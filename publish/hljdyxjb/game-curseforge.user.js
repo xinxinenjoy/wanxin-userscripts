@@ -15,14 +15,6 @@
 // @downloadURL  https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-curseforge.user.js
 // ==/UserScript==
 
-/*
- * 更新记录
- *
- * v4.1 - 2026-8-29
- * - 更新：测试版本
- *
- */
-
 (function () {
     'use strict';
 
