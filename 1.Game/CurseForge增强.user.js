@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CurseForge增强
 // @namespace    http://tampermonkey.net/
-// @version      4.2
+// @version      4.3
 // @description  增强CurseForge网站的中文显示，翻译部分英文为中文，支持动态加载内容的翻译。
 
 // @match        https://www.curseforge.com/*

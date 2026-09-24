@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.8套餐批量删除
 // @namespace    https://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.1
 // @description  SOA 订单页：列出当前订单的全部套餐/加项包，勾选后批量删除。只在「未落单」或「已落单+检中修改」时加载；自动识别并灰显已作废套餐、已体检人员所在套餐、绑定关系复杂的加项包/赠送包。直接调接口（package/query + package/delete），不模拟点击。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -115,7 +115,7 @@
   const TOOLBOX_GROUP_ID = '__soa_tools_switch_group_v10';
   const TOOLBOX_ANCHOR = '.tabs-wrap > .tabs > .order-desc';
   const TOOL_ORDER = '4'; // 1.2=1 / 1.3=2 / 1.4=3，本脚本接在第 4 位
-  const VERSION = '1.1.0'; // 与文件头 @version 保持一致（2026-09-24 修正，原为 1.0.0）
+  const VERSION = '1.1.1'; // 与文件头 @version 保持一致（2026-09-24 修正，原为 1.0.0）
   const SWITCH_LABEL = '批量删套餐';
   const POS_KEY = `${NS}_pos`;
 

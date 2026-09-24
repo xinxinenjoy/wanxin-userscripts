@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.1首页模块排序
 // @namespace    https://tampermonkey.net/
-// @version      4.7
+// @version      4.8
 // @description  SOA首页模块排序：支持网页原始顺序/脚本排序两种图标方案，并支持拖拽保存、列数、模块宽度及列间距设置。
 
 // @match        *://*home.health-100.cn/*
@@ -2505,7 +2505,7 @@
         applyCurrentLayout();
 
         console.log(
-          `[SOA布局] v4.7 初始化完成。` +
+          `[SOA布局] v4.8 初始化完成。` +
           `列数：${getSavedColumns()}，` +
           `模块宽度：${getSavedCardWidth()}px，` +
           `列间距：${getSavedColumnGap()}px。`

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.11.6
+// @version      1.11.7
 // @description  SOA体检数据：自动读取落单数据、体检汇总与三类卡数量；卡类数量/状态左键看卡片明细（自动按制卡批次带出备注）、右键跳卡池。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -66,7 +66,7 @@
    * 改版本时两处一起改（`@grant none` 读不到元数据，没法自动同步）。
    * 2026-09-21 红领巾提醒：面板标题里原来是硬编码的 v1.7.7，早就和 @version 脱节了。
    */
-  const SCRIPT_VERSION = "1.11.6";
+  const SCRIPT_VERSION = "1.11.7";
 
   const ORDER_ROUTE_PREFIX =
     "#/order/";

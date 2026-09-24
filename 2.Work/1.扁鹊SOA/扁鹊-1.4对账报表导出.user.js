@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.4对账报表导出
 // @namespace    https://tampermonkey.net/
-// @version      1.9
+// @version      1.10
 // @description  SOA对账报表：支持自定义日期区间，突破3年的时间段限制，自动分段查询、导出。并自动对比报表与订单内的数据差异。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -3585,7 +3585,7 @@
         <strong style="
           font-size:15px;
           line-height:1.2;
-        ">对账报表 v1.9</strong>
+        ">对账报表 v1.10</strong>
 
         <button
           id="__soa_report_close_v13"

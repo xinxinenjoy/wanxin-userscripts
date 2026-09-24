@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.7订单特殊审批
 // @namespace    https://tampermonkey.net/
-// @version      2.2.0
+// @version      2.2.1
 // @description  SOA特殊审批开关：一键在「特殊审批 开」（业务员报价后不可修改订单=勾选 + 检中修改钉钉审批=不启用）与「特殊审批 关」（反之，已恢复正常）之间切换。直接发请求、不跳转页面、不弹确认框，切完自动回读校验。
 // @match        https://checkup-soa3.health-100.cn/*
 // @match        https://app-fly.health-100.cn/*
@@ -95,7 +95,7 @@
   // 与 1.4/1.5/1.6 共用的顶部工具组（报表工具创建）。存在就把开关挂进去
   const TOP_TOOL_GROUP_ID = '__hlj_soa_top_tool_group_v1';
 
-  const SCRIPT_VERSION = '2.2.0';
+  const SCRIPT_VERSION = '2.2.1';
   const POS_KEY = `${NS}_pos`;
 
   const CLIENT_ID = 'MN_SOA3';
