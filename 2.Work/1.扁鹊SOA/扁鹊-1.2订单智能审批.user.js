@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.10
+// @version      2.11
 // @description  SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -27,6 +27,11 @@
  * - 面板支持显示开关、拖动、折叠、位置记忆和网页提示记录。
  *
  * 更新记录
+ *
+ * v2.11 -  2026-9-24
+ * - 修复每次运行都弹出“允许此网站查看和复制‘临时落单.txt’？”授权框的问题。
+ *   绑定文件权限改回「先 queryPermission、确认未授权才 requestPermission」，
+ *   已授权时不再重复弹窗（该逻辑在 v1.x 精简代码时被误删）。
  *
  * v2.10 -  2026-9-16
  * - 合同补充阶段新增“无合同证明文件”上传项：与合同文件、授权书共用同一个已绑定文件，
@@ -4871,21 +4876,17 @@
       "granted";
 
     /*
-     * 该函数必须直接由真实用户点击触发。
-     * requestPermission 在调用瞬间即可利用当前 user activation；
-     * 已经授权时会直接返回 granted，不会重复弹窗。
+     * 必须先 queryPermission 后 requestPermission。
+     *
+     * ⛔ 不能直接调 requestPermission：只要没现成的授权记录，
+     * 即使权限查询结果本来就是 granted，部分浏览器也会弹窗询问；
+     * 已授权的会话里再调一次同样会重复弹。
+     *
+     * 原来的实现（v1.x，见提交 14ee07f）就是「先查、查不到才申请」：
+     * 查询已 granted 时一次都不会弹；只有真的失效时才借当前用户点击
+     * 的 user activation 去申请授权。
      */
     if (
-      typeof boundFileHandle
-        .requestPermission ===
-      "function"
-    ) {
-      permission =
-        await boundFileHandle
-          .requestPermission({
-            mode: "read"
-          });
-    } else if (
       typeof boundFileHandle
         .queryPermission ===
       "function"
@@ -4893,6 +4894,25 @@
       permission =
         await boundFileHandle
           .queryPermission({
+            mode: "read"
+          });
+    }
+
+    if (
+      permission !==
+      "granted" &&
+      typeof boundFileHandle
+        .requestPermission ===
+        "function" &&
+      (
+        navigator.userActivation
+          ?.isActive ??
+        true
+      )
+    ) {
+      permission =
+        await boundFileHandle
+          .requestPermission({
             mode: "read"
           });
     }
@@ -9045,7 +9065,7 @@
           min-width:0;
           font-size:15px;
         ">
-          智能审批 v2.10
+          智能审批 v2.11
         </strong>
 
         <button
@@ -10681,6 +10701,6 @@
   routeCheck();
 
   console.log(
-    "[SOA智能审批] v2.10 已加载"
+    "[SOA智能审批] v2.11 已加载"
   );
 })();
