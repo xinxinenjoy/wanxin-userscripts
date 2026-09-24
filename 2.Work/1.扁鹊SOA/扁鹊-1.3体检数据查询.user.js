@@ -55,62 +55,6 @@
  * 【其它】卡池返回的 card_pwd（卡密）统一剔除，弹窗只按白名单取字段；
  *   与 SOA.3.1 智能审批完全解耦，不修改订单业务数据。卡类查询需要账号对应权限。
  *
- * 更新记录
- *
- * v1.11.6  -  2026-9-22   ⬅ 当前版本
- * - 卡片明细列表新增「有效期」「金额」两列（取值与展开详情一致，均来自本地卡池 item、不发请求；
- *   金额：储值卡为当前余额、套餐/参数卡为卡金额，无值显示 -）。
- * - 表头与数据行的网格模板抽成 CARD_LIST_COLUMNS 常量共用，避免以后加列只改一处。
- * - 顺带统一卡池日期写法：原时间戳走 zh-CN（2026/9/16）、字符串留横杠（2026-09-17），
- *   同一列表里两种格式并存；现统一补零成 YYYY/MM/DD。
- *
- * v1.11.5  -  2026-9-21
- * - 「制卡批次」区块改为默认折叠：标题行右侧「展开批次 ▾」按钮（折叠态实底蓝高亮，展开后弱化为描边）；
- *   折叠只切该区块显示、不重渲染，每次打开弹窗回到折叠态。
- * - 去掉批次区块的「放大查看」按钮及背后的整个宽表大窗（批次区块已把区间 / 日期 / 卡数 / 备注看全）。
- * - 状态明细整条改为可点色块（左键按状态筛选卡片明细），配色对齐「扁鹊-1.6」面板那套；已核销用灰。
- * - 「左键明细 · 右键卡池」提示移到「卡类数量」标题行右侧；面板标题版本号改读 SCRIPT_VERSION；
- *   删除面板底部那段冗余说明。
- *
- * v1.11.0  -  2026-9-21
- * - 备注不再需要单独操作：打开卡片明细弹窗即自动读取制卡审批，判区间时顺带把 process/detail 的备注
- *   一并拿回；撤掉卡片上的「查询备注 / 查看备注」与页脚按钮（含已成死代码的两个渲染 / 绑定函数）。
- * - 备注主循环重写为「先切段、再细分」（见上方【卡备注 · 制卡批次】1)~3)）。
- * - 新增可疑批次机制：可疑批次不参与剪枝，只针对该条加密核对；批次区块显示
- *   「本单卡池 N 张 / 审批声明 K 张」等口径数字，差额附注正常口径差异说明。
- *
- * v1.8.0  -  2026-9-21
- * - 卡号区间判断改用结构化规则（年份2 + 标识3 + 活动码6 + 序号6 = 17 位），删除「后 5 位」比较，
- *   修掉跨 10 万进位时的区间错并 / 漏查；跨组或解析失败的区间不自动拆分，退回按单卡处理。
- * - 备注仍按「同一批次 2 次请求」（process/page → process/detail），抽出统一取数入口避免两处漂移。
- * - 卡类数字新增左键入口（卡片明细弹窗，0 请求）；右键保留跳卡池并自动填单位代码；
- *   卡池返回的 card_pwd（卡密）统一剔除。
- *
- * v1.7.5  -  2026-9-9
- * - 卡片内不再直接展开备注：数量大于 0 时显示「查询备注」，完成后变「查看备注」，打开放大详情窗
- *   （显示卡号区间、办卡日期、数量、备注）。备注入口自 v1.11.0 起改为自动读取。
- *
- * v1.7.0 ~ v1.7.4  -  2026-9-9
- * - 卡备注功能成形：按卡类型独立查询；page 取批次 id → detail 取 remark，同批次详情只读一次；
- *   同一区间内的卡号自动排除，滚动覆盖其余批次；放大详情按制卡区间逐条列出。
- *   ⚠️ 该阶段的区间比较用的是「卡号后 5 位」，v1.8.0 已整体删除。
- *
- * v1.6.0 ~ v1.6.4  -  2026-9-7
- * - v1.6.0 新增电商卡分类；v1.6.1 三类卡固定显示（0 张占位）+ 状态字段兼容扩展；
- *   v1.6.2 状态展示顺序固定为 生效中 → 已核销 → 已冻结 → 作废 → 其他；
- *   v1.6.3 卡分类 UI 收紧信息密度；v1.6.4 大卡池分页请求节奏优化（分页间隔 + 批次停顿）。
- *
- * v1.5.0 ~ v1.5.2  -  2026-9-7
- * - v1.5.0 卡池改为 page_size=100 完整分页 + 状态统计；v1.5.1 / v1.5.2 状态色标改为左右对齐明细色。
- *
- * v1.4.0 ~ v1.4.3  -  2026-9-5 / 9-6
- * - v1.4.0 增加手动刷新；v1.4.1 修复刷新与关闭按钮 ID 冲突；v1.4.2 数据分区显示；
- *   v1.4.3 缓存绑定当前订单页面（不持久化，切换订单自动失效，避免串单）。
- *
- * v1.0 ~ v1.3  -  2026-9-1 / 9-5
- * - v1.0 从 SOA.2.5 v1.32 迁移落单数据 / 体检数据 / 卡类查询与卡池跳转；
- *   v1.1 更名 SOA.3.2 体检数据、打开即自动加载、同订单 15 秒内复用；
- *   v1.2 内置公共工具箱框体样式；v1.3 商机编号增加老订单兼容（缺失时回退单位代码）。
  */
 
 (() => {
@@ -3690,6 +3634,46 @@
     return "";
   }
 
+  /*
+   * 审批时间（bindTime）—— 与上面的「办卡日期」刻意分开：
+   *
+   * cardDate 是多候选（**优先 detail.beginDate**），它是批次区块「办卡日期」的口径；
+   * 而红领巾 2026-09-24 要的「审批时间」这一列，口径必须是确定的 bindTime，
+   * 不能跟着候选顺序漂移（否则同一列有时显示 beginDate、有时显示 bindTime）。
+   *
+   * 实测（2026-09-24 真机打接口）：
+   *   process/page   的 bindTime → 日期级   "2026-09-24"
+   *   process/detail 的 bindTime → 到秒     "2026-09-24 15:52:00"
+   * 这里统一截到日期（YYYY-MM-DD），与 1.6 那一列保持同一精度。
+   * ⚠️ 两个接口都在调（备注用），**零新增请求**。
+   */
+  function extractCardBindTime(
+    detail,
+    record
+  ) {
+    const text =
+      cleanText(
+        detail?.bindTime
+      ) ||
+      cleanText(
+        record?.bindTime
+      );
+
+    if (!text) {
+      return "";
+    }
+
+    const match =
+      text.match(
+        /\d{4}-\d{1,2}-\d{1,2}/
+      );
+
+    return (
+      match?.[0] ||
+      text
+    );
+  }
+
   function getCardRemarkBatchList(
     state
   ) {
@@ -3794,11 +3778,12 @@
    */
   const CARD_LIST_COLUMNS = {
     gridTemplate:
-      "minmax(0,140px) minmax(0,92px) 50px 150px 74px minmax(0,1fr) 12px",
+      "minmax(0,140px) minmax(0,92px) 50px 76px 150px 74px minmax(0,1fr) 12px",
     headers: [
       "卡号",
       "卡类",
       "状态",
+      "审批时间",
       "有效期",
       "金额",
       "备注"
@@ -4286,6 +4271,57 @@
           ? "#253247"
           : "#8a94a3"
     };
+  }
+
+  /*
+   * 卡片明细行里的「审批时间」。
+   *
+   * 与备注同源：都用「卡号 → 所属批次」这一步（findCardRemarkBatchForCardNo），
+   * 数据在算备注时**已经拿到并存进 batch**（batch.bindTime），这里只是取出来 ——
+   * **不发任何请求**。
+   *
+   * 只有走制卡审批的卡类才有这个时间，故与备注同样限 general / storage；
+   * 电商卡等没有制卡审批的，显示 "—"。
+   */
+  function getCardBindTimeCellText(
+    cardNo
+  ) {
+    const cardType =
+      cardListModalState.cardType;
+
+    if (
+      cardType !==
+        "general" &&
+      cardType !==
+        "storage"
+    ) {
+      return "—";
+    }
+
+    const state =
+      getCardRemarkTypeState(
+        cardType,
+        getCurrentOrderCode(),
+        cardListModalState.cardCorpCode
+      );
+
+    const batch =
+      findCardRemarkBatchForCardNo(
+        cardNo,
+        state
+      );
+
+    if (!batch) {
+      return state.complete
+        ? "未识别批次"
+        : "未查询";
+    }
+
+    return (
+      cleanText(
+        batch.bindTime
+      ) || "—"
+    );
   }
 
   function closeCardListModal() {
@@ -4776,6 +4812,12 @@
           detail,
           record
         ),
+      // 审批时间（独立于 cardDate，只认 bindTime；见 extractCardBindTime 注释）
+      bindTime:
+        extractCardBindTime(
+          detail,
+          record
+        ),
       cardNum:
         reportCardNum,
       // 区间自检结果（空串 = 一切正常）
@@ -4989,6 +5031,12 @@
         cardNo
       );
 
+    // 审批时间（bindTime）—— 与备注同源、零新增请求；见 getCardBindTimeCellText
+    const bindTime =
+      getCardBindTimeCellText(
+        cardNo
+      );
+
     /*
      * 有效期与金额都取自本地卡池 item（不发请求），取值口径与展开详情完全一致，
      * 这样列表里看到的和点开看到的不会打架。
@@ -5038,6 +5086,14 @@
             font-weight:650;
             white-space:nowrap;
           ">${escapeHtml(status)}</span>
+          <span title="${escapeHtml(bindTime)}" style="
+            overflow:hidden;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+            color:${bindTime === "—" ? "#c3cad4" : "#44546a"};
+            font-size:11px;
+            font-variant-numeric:tabular-nums;
+          ">${escapeHtml(bindTime)}</span>
           <span title="${escapeHtml(dateRange || "")}" style="
             overflow:hidden;
             text-overflow:ellipsis;

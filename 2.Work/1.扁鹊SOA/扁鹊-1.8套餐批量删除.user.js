@@ -115,7 +115,7 @@
   const TOOLBOX_GROUP_ID = '__soa_tools_switch_group_v10';
   const TOOLBOX_ANCHOR = '.tabs-wrap > .tabs > .order-desc';
   const TOOL_ORDER = '4'; // 1.2=1 / 1.3=2 / 1.4=3，本脚本接在第 4 位
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0'; // 与文件头 @version 保持一致（2026-09-24 修正，原为 1.0.0）
   const SWITCH_LABEL = '批量删套餐';
   const POS_KEY = `${NS}_pos`;
 
