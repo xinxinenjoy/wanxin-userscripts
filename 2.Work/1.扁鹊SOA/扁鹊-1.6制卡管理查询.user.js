@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.6制卡管理查询
 // @namespace    https://tampermonkey.net/
-// @version      0.5.6
+// @version      0.5.8
 // @description  查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -55,7 +55,7 @@
   const PANEL_VIEWPORT_MARGIN = 40;
 
   // 版本号单一来源：改动时与文件头 @version 一并同步
-  const SCRIPT_VERSION = '0.5.6';
+  const SCRIPT_VERSION = '0.5.8';
 
   const PROCESS_API = '/soa-card/api/v1/bqcard/process/page';
   const POOL_API = '/soa-card/api/v1/card/business/pool/display';
@@ -890,21 +890,46 @@
     return byPrefix;
   }
 
-  function getCardBindDate(cardNo, bindTimeLookup) {
-    if (!bindTimeLookup?.size) return '';
+  /*
+   * 命中卡号所属的那条审批区间。
+   * 同一张卡可能落在多条审批里（同一号段被反复申请：跳号作废后重提、号码被复用），
+   * 所以命中多条时不能只取第一条 —— 判据与「扁鹊-1.3」的 getProcessRecordSpan 对齐：
+   *   ① 未作废的优先（ACCESS 优于 INVALID）
+   *   ② 区间更窄的优先（更具体的审批才是这张卡真正所属的那条）
+   *   ③ 绑定时间更新的优先（号码重用时以最后生效的为准）
+   * 详情块的「所属制卡批次 / 办卡日期 / 该批次卡数」与列表的「审批时间」都走这一条，
+   * 保证点开前后指向同一段。
+   */
+  function findCardInterval(cardNo, lookup) {
+    if (!lookup?.size) return null;
 
     const parsed = splitCardNo(cardNo);
-    if (!parsed) return '';
+    if (!parsed) return null;
 
-    const intervals = bindTimeLookup.get(parsed.prefix);
-    if (!intervals?.length) return '';
+    const list = lookup.get(parsed.prefix);
+    if (!list?.length) return null;
 
-    for (const it of intervals) {
-      if (parsed.serial < it.startSerial) break;
-      if (parsed.serial <= it.endSerial) return normalizeBindDate(it.bindTime);
-    }
+    const hits = list.filter((it) => parsed.serial >= it.startSerial && parsed.serial <= it.endSerial);
+    if (!hits.length) return null;
+    if (hits.length === 1) return hits[0];
 
-    return '';
+    return hits.slice().sort((a, b) => {
+      const voidA = a.processStatus === 'INVALID' ? 1 : 0;
+      const voidB = b.processStatus === 'INVALID' ? 1 : 0;
+      if (voidA !== voidB) return voidA - voidB;
+
+      const spanA = a.endSerial - a.startSerial;
+      const spanB = b.endSerial - b.startSerial;
+      if (spanA !== spanB) return spanA - spanB;
+
+      return String(b.bindTime || '').localeCompare(String(a.bindTime || ''));
+    })[0];
+  }
+
+  // 卡片明细列表「审批时间」列。与详情块的「办卡日期」同源（同一条区间），点开前后一致。
+  function getCardBindDate(cardNo, lookup) {
+    const it = findCardInterval(cardNo, lookup);
+    return it ? normalizeBindDate(it.bindTime) : '';
   }
 
   // 同一前缀内若干区间的并集长度（去重后的卡数）。
@@ -1020,23 +1045,20 @@
   }
 
   /*
-   * 金额只取一个，并标明它是什么钱：
-   *   储值卡 → currentAmount（当前余额）
-   *   其余   → 卡金额（initAmount / saleAmount / sale_price / price）
-   * 不做单位换算、不猜语义：取不到就显示 -。
+   * 金额只取一个，并标明它是什么钱 —— **一律取「成交价」，不显示原价**（红领巾 2026-09-26 要求）：
+   *   套餐卡 / 电商卡 → price      （卡池实测：price＝成交价、sale_price＝面值）
+   *   储值卡         → saleAmount （公司实收；储值卡池没有 price 字段）
+   *
+   * 2026-09-26 用真实登录态实测两张卡，卡池与卡详情两个接口交叉印证：
+   *   24X7A212024020874（新乡邀约卡） price=50  sale_price=1020   ／ detail.saleAmount=50、currentAmount=1020
+   *   26X7A210202011920（长垣套餐卡） price=700 sale_price=2364.30／ detail.saleAmount=700、currentAmount=2364.30
+   * ⇒ sale_price / initAmount / currentAmount 都是面值（原价），price 才是成交价。
+   * 取不到就显示 - —— **不回落到原价**。不做单位换算、不猜语义。
    */
   function getPoolItemAmountInfo(item) {
-    const current = Number(item?.currentAmount);
-    if (item?.currentAmount !== undefined && item?.currentAmount !== null &&
-        String(item.currentAmount).trim() !== '' && Number.isFinite(current)) {
-      return { label: '当前余额', text: `¥${current.toFixed(2)}` };
-    }
-
     const matched = [
-      ['initAmount', '卡金额'],
-      ['saleAmount', '卡金额'],
-      ['sale_price', '卡金额'],
-      ['price', '卡金额'],
+      ['price', '成交价'],
+      ['saleAmount', '成交价'],
     ].find(([key]) => {
       const raw = item?.[key];
       if (raw === undefined || raw === null || String(raw).trim() === '') return false;
@@ -1049,30 +1071,91 @@
   }
 
 
-  function translateCardStatus(card) {
-    const status = String(card?.status || '').trim().toUpperCase();
-    const business = String(card?.status_business ?? card?.statusBusiness ?? '').trim();
+  /*
+   * 卡状态映射表 —— 与「扁鹊-1.3」的 CARD_STATUS_MAP 对齐（红领巾 2026-09-26 要求
+   * 「状态一律以 1.3 为准」）。1.3 那边是纯英文码表（ENABLE / ACTIVE / NORMAL / CONSUMED /
+   * LOCK / CANCEL / EXPIRED …），这里**原样搬过来**，另外补了几个中文键：
+   * 实测后端 status_business 会直接返回中文「已预约」，只认英文码会把预约状态漏成「生效中」。
+   */
+  const CARD_STATUS_MAP = {
+    ENABLE: '生效中',
+    ENABLED: '生效中',
+    ACTIVE: '生效中',
+    NORMAL: '生效中',
+    AVAILABLE: '生效中',
+    VALID: '生效中',
+    UNUSED: '生效中',
+    生效中: '生效中',
 
-    // 页面字段有时会把预约状态放在 status_business，而主 status 仍为 ENABLE。
+    APPOINTED: '已预约',
+    APPOINT: '已预约',
+    APPOINTMENT: '已预约',
+    RESERVED: '已预约',
+    RESERVE: '已预约',
+    BOOKED: '已预约',
+    BOOK: '已预约',
+    已预约: '已预约',
+    预约: '已预约',
+
+    USED: '已核销',
+    CONSUMED: '已核销',
+    VERIFIED: '已核销',
+    WRITE_OFF: '已核销',
+    WRITEOFF: '已核销',
+    已核销: '已核销',
+
+    FREEZE: '冻结',
+    FROZEN: '冻结',
+    LOCK: '冻结',
+    LOCKED: '冻结',
+    冻结: '冻结',
+
+    INVALID: '作废',
+    CANCEL: '作废',
+    CANCELED: '作废',
+    CANCELLED: '作废',
+    VOID: '作废',
+    DISABLE: '作废',
+    DISABLED: '作废',
+    EXPIRED: '作废',
+    作废: '作废',
+  };
+
+  function normalizeCardStatusValue(value) {
+    return String(value ?? '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+  }
+
+  /*
+   * 状态取值口径 = 1.3 的 resolveCardStatus：
+   *   依次看 status → status_business → statusBusiness → card_status → cardStatus
+   *   → use_status → useStatus → state，取第一个能命中映射表的；
+   *   **一个都认不出来就是「其他」**（不回显原始码、不写「未知」）。
+   * 唯一保留的 1.6 自有序：预约特判提前 —— 实测主 status 仍为 ENABLE、预约信息只在
+   * status_business，按 1.3 的「先 status 后 business」顺序会把已预约误判成生效中。
+   */
+  function translateCardStatus(card) {
+    const business = String(card?.status_business ?? card?.statusBusiness ?? '').trim();
     if (/预约|APPOINT|RESERV|BOOK/i.test(business)) {
       return '已预约';
     }
 
-    const map = {
-      ENABLE: '生效中',
-      USED: '已核销',
-      FREEZE: '冻结',
-      INVALID: '作废',
-      APPOINT: '已预约',
-      APPOINTED: '已预约',
-      APPOINTMENT: '已预约',
-      RESERVED: '已预约',
-      RESERVE: '已预约',
-      BOOKED: '已预约',
-      BOOK: '已预约',
-    };
+    const candidates = [
+      card?.status,
+      card?.status_business,
+      card?.statusBusiness,
+      card?.card_status,
+      card?.cardStatus,
+      card?.use_status,
+      card?.useStatus,
+      card?.state,
+    ];
 
-    return map[status] || status || '未知';
+    for (const value of candidates) {
+      const key = normalizeCardStatusValue(value);
+      if (key && CARD_STATUS_MAP[key]) return CARD_STATUS_MAP[key];
+    }
+
+    return '其他';
   }
 
   function getCardSaleName(card) {
@@ -2236,6 +2319,11 @@
       #${IDS.panel} .hlj-status-value.is-freeze:not(.is-zero) {
         color:#c2410c;
         background:#fff7ed;
+      }
+
+      #${IDS.panel} .hlj-status-value.is-other:not(.is-zero) {
+        background:#f1f5f9;
+        color:#475569;
       }
 
       #${IDS.panel} .hlj-status-value.is-invalid:not(.is-zero) {
@@ -3412,6 +3500,7 @@
       #${IDS.cardModal} .hlj-card-status.is-used { background:#f5f3ff; color:#6d28d9; }
       #${IDS.cardModal} .hlj-card-status.is-freeze { background:#fff7ed; color:#c2410c; }
       #${IDS.cardModal} .hlj-card-status.is-invalid { background:#fef2f2; color:#b91c1c; }
+      #${IDS.cardModal} .hlj-card-status.is-other { background:#f1f5f9; color:#475569; }
 
       #${IDS.cardModal} .hlj-card-remark {
         color:#334155;
@@ -3433,9 +3522,7 @@
       }
 
       #${IDS.cardModal} .hlj-card-detail {
-        padding:9px 10px 11px;
-        border-top:1px dashed #dbe3ec;
-        background:#fbfcfe;
+        padding:0 9px 10px;
       }
 
       #${IDS.cardModal} .hlj-card-detail[hidden] {
@@ -3448,65 +3535,63 @@
         font-weight:600;
       }
 
+      /* 详情块整盒 —— 与「扁鹊-1.3」卡片详情同一套取值（见 renderCardModalDetailHtml 注释） */
+      #${IDS.cardModal} .hlj-card-detail-box {
+        padding:8px 9px;
+        border:1px solid #e6ebf1;
+        border-radius:7px;
+        background:#fbfcfe;
+      }
+
       #${IDS.cardModal} .hlj-card-detail-grid {
         display:grid;
-        grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
-        gap:6px;
+        grid-template-columns:repeat(2, minmax(0, 1fr));
+        gap:5px 12px;
       }
 
       #${IDS.cardModal} .hlj-card-detail-cell {
         display:flex;
         gap:6px;
-        align-items:baseline;
-        padding:5px 7px;
-        border:1px solid #e6ecf3;
-        border-radius:6px;
-        background:#fff;
-        font-size:11px;
+        min-width:0;
+        font-size:12px;
+        line-height:1.5;
       }
 
       #${IDS.cardModal} .hlj-card-detail-label {
         flex:0 0 auto;
-        color:#64748b;
-        font-weight:700;
+        min-width:62px;
+        color:#7a8599;
       }
 
       #${IDS.cardModal} .hlj-card-detail-value {
-        flex:1 1 auto;
         min-width:0;
-        overflow:hidden;
-        color:#1f2937;
-        font-weight:700;
-        text-overflow:ellipsis;
-        white-space:nowrap;
+        color:#253247;
+        font-weight:650;
+        word-break:break-all;
       }
 
       #${IDS.cardModal} .hlj-card-detail-remark {
-        margin-top:8px;
+        margin-top:7px;
+        padding-top:6px;
+        border-top:1px solid #eaeff5;
       }
 
       #${IDS.cardModal} .hlj-card-detail-remark-title {
-        color:#64748b;
-        font-size:11px;
-        font-weight:800;
+        color:#7a8599;
+        font-size:12px;
+        line-height:1.5;
       }
 
       #${IDS.cardModal} .hlj-card-detail-remark-body {
-        margin-top:4px;
-        padding:8px 9px;
-        border:1px solid #e6ecf3;
-        border-radius:7px;
-        background:#fff;
-        color:#1f2937;
-        font-size:12px;
-        line-height:1.5;
+        margin-top:2px;
+        color:#253247;
+        font-size:12.5px;
+        line-height:1.6;
         white-space:pre-wrap;
-        word-break:break-word;
+        word-break:break-all;
       }
 
       #${IDS.cardModal} .hlj-card-detail-remark-body.is-error {
-        border-color:#fecaca;
-        background:#fff7f7;
         color:#b91c1c;
       }
     `;
@@ -3867,6 +3952,7 @@
       '已核销': 'is-used',
       '冻结': 'is-freeze',
       '作废': 'is-invalid',
+      '其他': 'is-other',
     };
     const queryStart = data?.queryPeriod?.startDate || '-';
     const queryEnd = data?.queryPeriod?.endDate || '-';
@@ -4028,6 +4114,8 @@
     '已核销': 'is-used',
     '冻结': 'is-freeze',
     '作废': 'is-invalid',
+    // 与 1.3 对齐后的兜底档（认不出状态码时返回「其他」）
+    '其他': 'is-other',
   };
 
   function getStatusToneClass(status) {
@@ -4085,21 +4173,59 @@
     cardModalState.token += 1;
   }
 
-  function formatAmountText(value) {
-    const num = Number(value);
-    if (!Number.isFinite(num)) return '';
-    return `¥${num.toFixed(2)}`;
-  }
-
+  /*
+   * 卡信息详情块。
+   *
+   * ⚠️ 版式**与「扁鹊-1.3 体检数据查询」的卡片详情对齐**（红领巾 2026-09-26 要求）：
+   *    无边框两列 label/value（label 固定 62px、#7a8599），卡备注用一条细线分隔开，
+   *    整体包在一个 #fbfcfe 圆角盒里 —— 取值见 .hlj-card-detail-box 那组样式。
+   *    两边点开同一张卡时长得一样，别再往格子里加边框/底色。
+   *
+   * 金额只有一个，且**一律成交价**（getPoolItemAmountInfo），
+   * 不再单列「当前余额 / 销售金额」—— 那两个分别是面值与销售金额，面值（原价）不展示。
+   *
+   * 字段集与顺序在下面 renderCardModalDetailHtml 的注释里（2026-09-26 已整表向 1.3 对齐：
+   * 去掉「适用机构 / 订单有效期」，补上「所属制卡批次 / 办卡日期 / 该批次卡数」，
+   * 并把「关联订单」放在 1.3 的同一位置）。
+   */
+  /*
+   * 卡片详情块 —— 字段集 / 顺序 / 版式一律照「扁鹊-1.3」的卡片明细详情块
+   * （红领巾 2026-09-26 要求「完全向 1.3 靠拢」；1.3 那边同步新增「关联订单」）：
+   *   卡号 / 卡类 · 当前状态 / 领取人 · 卡有效期 / 成交价 ·
+   *   所属制卡批次 / 办卡日期 · 该批次卡数 / 关联订单
+   *
+   * 1.6 独有的两项按 1.3 口径去掉：「适用机构」（1.3 没有）、「订单有效期」（1.3 没有）。
+   *
+   * 数据来源：
+   *   - 所属制卡批次 / 办卡日期 / 该批次卡数 —— 从本地已拉到的审批区间里匹配（零新增请求），
+   *     取哪一条与列表「审批时间」同一判据（见 findCardInterval）
+   *   - 关联订单 —— 卡详情接口的 orderCode。实测与命中批次记录的 orderCode 同值
+   *     （24X7A212024031429：卡详情 SOA16823426246100573 ＝ 审批记录 SOA16823426246100573）
+   *   - 状态 / 有效期 / 金额 —— 与列表同源（卡池 item），点开前后一致
+   *
+   * ⚠️ 卡备注正文必须**紧贴标签写**（`>${escapeHtml(remarkText)}<`，中间不能换行、不能缩进）：
+   *    它是 white-space:pre-wrap，模板里每多一个换行/缩进就会多渲染出一个空行。
+   *    2026-09-26 实测：1.6 的详情块比 1.3 整整高出 40px，查下来就是备注正文上下各多了一行空白。
+   */
   function renderCardModalDetailHtml(card, detail) {
     const no = getCardNo(card);
     const activity = String(card?.activity_name || '').trim();
     const status = translateCardStatus(card);
     const saleName = getCardSaleName(card);
-    const beginTs = Number(card?.begin_date || 0);
-    const endTs = Number(card?.end_date || 0);
-    const cardRange = beginTs && endTs
-      ? `${new Date(beginTs).toLocaleDateString('zh-CN')} ~ ${new Date(endTs).toLocaleDateString('zh-CN')}`
+    const cardRange = getPoolItemDateRange(card);
+    const amount = getPoolItemAmountInfo(card);
+
+    const interval = findCardInterval(no, buildBindTimeLookup(state.lastData?.rawIntervals));
+    // 单张区间时 1.3 只显示一个卡号，不写成「A ~ A」
+    const batchRange = interval
+      ? (interval.beginNo === interval.endNo
+          ? interval.beginNo
+          : `${interval.beginNo} ~ ${interval.endNo}`)
+      : '';
+    const batchDate = interval ? normalizeBindDate(interval.bindTime) : '';
+    // 卡数口径与 1.3 的 getCardRemarkBatchCount 一致：优先审批声明的 cardNum，兜底区间长度
+    const batchCount = interval
+      ? String(Number(interval.cardNum) > 0 ? Number(interval.cardNum) : interval.rangeCardCount)
       : '';
 
     const remarkText = detail?.status === 'ok'
@@ -4109,32 +4235,30 @@
     const infoRows = [
       ['卡号', no],
       ['卡类', activity || '未分类'],
-      ['领取人', saleName || '-'],
       ['当前状态', status],
-      cardRange ? ['卡有效期', cardRange] : null,
-      detail?.corpName ? ['适用机构', detail.corpName] : null,
+      ['领取人', saleName || '-'],
+      ['卡有效期', cardRange || '-'],
+      amount ? [amount.label, amount.text] : null,
+      batchRange ? ['所属制卡批次', batchRange] : null,
+      batchDate ? ['办卡日期', batchDate] : null,
+      batchCount ? ['该批次卡数', batchCount] : null,
       detail?.orderCode ? ['关联订单', detail.orderCode] : null,
-      detail?.orderBeginDate && detail?.orderEndDate
-        ? ['订单有效期', `${detail.orderBeginDate} ~ ${detail.orderEndDate}`]
-        : null,
-      formatAmountText(detail?.currentAmount) ? ['当前余额', formatAmountText(detail.currentAmount)] : null,
-      formatAmountText(detail?.saleAmount) ? ['销售金额', formatAmountText(detail.saleAmount)] : null,
     ].filter(Boolean);
 
     return `
-      <div class="hlj-card-detail-grid">
-        ${infoRows.map(([label, value]) => `
-          <div class="hlj-card-detail-cell">
-            <span class="hlj-card-detail-label">${escapeHtml(label)}</span>
-            <span class="hlj-card-detail-value">${escapeHtml(String(value))}</span>
-          </div>
-        `).join('')}
-      </div>
+      <div class="hlj-card-detail-box">
+        <div class="hlj-card-detail-grid">
+          ${infoRows.map(([label, value]) => `
+            <div class="hlj-card-detail-cell">
+              <span class="hlj-card-detail-label">${escapeHtml(label)}</span>
+              <span class="hlj-card-detail-value">${escapeHtml(String(value))}</span>
+            </div>
+          `).join('')}
+        </div>
 
-      <div class="hlj-card-detail-remark">
-        <div class="hlj-card-detail-remark-title">卡备注</div>
-        <div class="hlj-card-detail-remark-body ${detail?.status === 'error' ? 'is-error' : ''}">
-          ${escapeHtml(remarkText)}
+        <div class="hlj-card-detail-remark">
+          <div class="hlj-card-detail-remark-title">卡备注</div>
+          <div class="hlj-card-detail-remark-body ${detail?.status === 'error' ? 'is-error' : ''}">${escapeHtml(remarkText)}</div>
         </div>
       </div>
     `;

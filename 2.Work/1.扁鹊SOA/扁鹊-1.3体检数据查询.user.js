@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.3体检数据查询
 // @namespace    https://tampermonkey.net/
-// @version      1.11.7
+// @version      1.11.9
 // @description  SOA体检数据：自动读取落单数据、体检汇总与三类卡数量；卡类数量/状态左键看卡片明细（自动按制卡批次带出备注）、右键跳卡池。注意：卡类查询需要账号对应权限
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -32,6 +32,8 @@
  * 【卡片明细弹窗】列表为 卡号 / 卡类 / 状态 / 有效期 / 金额 / 备注，数据全部来自已查到的卡池 items，不发请求；
  *   点某一行就地展开该卡详情（含所属制卡批次的卡号区间 / 办卡日期 / 卡数 / 备注）。
  *   备注列随批次读取结果自动回填。
+ *   「金额」列与详情里的金额**都是成交价**（套餐/电商卡取卡池 price，储值卡取 saleAmount），
+ *   不显示面值/原价 —— 口径实测依据见 getPoolItemAmountInfo 上方注释（2026-09-26）。
  *
  * 【卡备注 · 制卡批次】打开明细弹窗即自动读取该卡类的制卡审批：
  *   1) 卡池卡号按「同前缀 + 序号连续」切成连续段（跳号处断开）；
@@ -66,7 +68,7 @@
    * 改版本时两处一起改（`@grant none` 读不到元数据，没法自动同步）。
    * 2026-09-21 红领巾提醒：面板标题里原来是硬编码的 v1.7.7，早就和 @version 脱节了。
    */
-  const SCRIPT_VERSION = "1.11.7";
+  const SCRIPT_VERSION = "1.11.9";
 
   const ORDER_ROUTE_PREFIX =
     "#/order/";
@@ -4010,46 +4012,40 @@
   }
 
   /*
-   * 金额只取一个，并标明它是什么钱：
-   *   储值卡 → currentAmount（当前余额）
-   *   其余   → 卡金额（initAmount / saleAmount / sale_price / price）
-   * 不做单位换算、不猜语义：取不到就不显示这一行。
+   * 金额只取一个，并标明它是什么钱 —— **一律取「成交价」，不显示原价**
+   * （红领巾 2026-09-26 要求）：
+   *   套餐卡 / 电商卡 → price      （卡池实测：price＝成交价、sale_price＝面值）
+   *   储值卡         → saleAmount （公司实收；储值卡池没有 price 字段）
+   *
+   * 2026-09-26 用真实登录态实测两张卡，卡池与卡详情两个接口交叉印证：
+   *   24X7A212024020874（新乡邀约卡） price=50  sale_price=1020   ／ detail.saleAmount=50、currentAmount=1020
+   *   26X7A210202011920（长垣套餐卡） price=700 sale_price=2364.30／ detail.saleAmount=700、currentAmount=2364.30
+   * ⇒ sale_price / initAmount / currentAmount 都是面值（原价），price 才是成交价。
+   * 取不到就不显示这一行 —— **不回落到原价**，免得又把面值当金额显示出来。
+   * 不做单位换算、不猜语义。
+   *
+   * ⚠️ 与「扁鹊-1.6制卡管理查询」的 getPoolItemAmountInfo **保持逐字一致**，改一处两处一起改。
    */
   function getPoolItemAmountInfo(
     item
   ) {
-    const current =
-      Number(
-        item?.currentAmount
-      );
-
-    if (
-      Number.isFinite(
-        current
-      )
-    ) {
-      return {
-        label:
-          "当前余额",
-        text:
-          `¥${current.toFixed(2)}`
-      };
-    }
-
     const matched =
       [
-        ["initAmount", "卡金额"],
-        ["saleAmount", "卡金额"],
-        ["sale_price", "卡金额"],
-        ["price", "卡金额"]
-      ].find(
-        ([key]) =>
+        ["price", "成交价"],
+        ["saleAmount", "成交价"]
+      ].find(([key]) => {
+        const raw =
+          item?.[key];
+
+        return (
+          raw !== undefined &&
+          raw !== null &&
+          String(raw).trim() !== "" &&
           Number.isFinite(
-            Number(
-              item?.[key]
-            )
+            Number(raw)
           )
-      );
+        );
+      });
 
     if (!matched) {
       return null;
@@ -5233,7 +5229,7 @@
         ).label
       ],
       [
-        "领取人/销售",
+        "领取人",
         getPoolItemSaleName(
           item
         ) || "-"
@@ -5272,6 +5268,20 @@
                 batch
               )
             )
+          ]
+        : null,
+      /*
+       * 关联订单 = 当前页面的订单号（getCurrentOrderCode）。
+       * 卡池 item 里没有订单号字段（2026-09-26 实测：只有
+       * card_no / activity_name / card_sale_name / price / sale_price / status …），
+       * 而这个订单号本来就是卡备注查询的前置条件（没它就查不了批次），
+       * 所以只要有批次数据就一定有订单号，等于零成本。
+       * 取不到（按单位查、URL 无订单号）就不渲染这一行。
+       */
+      orderCode
+        ? [
+            "关联订单",
+            orderCode
           ]
         : null
     ].filter(Boolean);
