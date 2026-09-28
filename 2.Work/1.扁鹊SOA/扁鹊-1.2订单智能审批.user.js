@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.12
+// @version      2.13
 // @description  SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -144,7 +144,20 @@
     DB_VERSION: 1,
     STORE_NAME: "handles",
     HANDLE_KEY:
-      "sharedContractFile"
+      "sharedContractFile",
+
+    /*
+     * 文件内容缓存键。
+     *
+     * 为什么要缓存内容：File System Access 的读权限在关闭所有同源标签页
+     * 后即失效（API 原生行为），而本机 Chrome 不提供三向持久授权
+     * ⇒ 每次重启后都必须重新授权、必弹窗。
+     *
+     * 在**有权限时**把内容读进 IndexedDB，运行时用缓存内容直接构造 File，
+     * 就彻底不依赖句柄权限 ⇒ 永不弹窗。
+     */
+    CONTENT_KEY:
+      "sharedContractFileContent"
   };
 
   const TOOLBOX_STYLE_ID =
@@ -236,6 +249,14 @@
   };
 
   let boundFileHandle = null;
+
+  /*
+   * 已绑定文件的内容缓存。
+   * 形如 { name, type, lastModified, buffer, savedAt }；
+   * 有它就不再需要句柄权限，运行时零弹窗。
+   */
+  let boundFileContent = null;
+
   let processRunning = false;
   let activeFlowToken = null;
 
@@ -4713,6 +4734,164 @@
     }
   }
 
+  /*
+   * 把已授权读到的文件内容存进 IndexedDB。
+   *
+   * ⚠️ 必须在 handle 权限为 granted 时调用（由调用方保证），
+   *    否则 getFile() 会抛错。
+   */
+  async function saveBoundFileContent(
+    file
+  ) {
+    if (!file) {
+      return false;
+    }
+
+    const buffer =
+      await file.arrayBuffer();
+
+    const record = {
+      name: file.name,
+      type: file.type || "text/plain",
+      lastModified:
+        file.lastModified ||
+        Date.now(),
+      buffer,
+      savedAt: Date.now()
+    };
+
+    const db =
+      await openBindingDb();
+
+    try {
+      await new Promise(
+        (resolve, reject) => {
+          const transaction =
+            db.transaction(
+              FILE_BINDING.STORE_NAME,
+              "readwrite"
+            );
+
+          transaction
+            .objectStore(
+              FILE_BINDING.STORE_NAME
+            )
+            .put(
+              record,
+              FILE_BINDING.CONTENT_KEY
+            );
+
+          transaction.oncomplete =
+            () => resolve();
+
+          transaction.onerror =
+            () =>
+              reject(
+                transaction.error ||
+                new Error(
+                  "保存文件内容缓存失败"
+                )
+              );
+
+          transaction.onabort =
+            () =>
+              reject(
+                transaction.error ||
+                new Error(
+                  "保存文件内容缓存已中止"
+                )
+              );
+        }
+      );
+    } finally {
+      db.close();
+    }
+
+    boundFileContent =
+      record;
+
+    return true;
+  }
+
+  async function loadBoundFileContent() {
+    const db =
+      await openBindingDb();
+
+    try {
+      const record =
+        await new Promise(
+          (resolve, reject) => {
+            const transaction =
+              db.transaction(
+                FILE_BINDING.STORE_NAME,
+                "readonly"
+              );
+
+            const request =
+              transaction
+                .objectStore(
+                  FILE_BINDING.STORE_NAME
+                )
+                .get(
+                  FILE_BINDING.CONTENT_KEY
+                );
+
+            request.onsuccess =
+              () =>
+                resolve(
+                  request.result ||
+                  null
+                );
+
+            request.onerror =
+              () =>
+                reject(
+                  request.error ||
+                  new Error(
+                    "读取文件内容缓存失败"
+                  )
+                );
+          }
+        );
+
+      if (
+        record &&
+        record.buffer
+      ) {
+        boundFileContent =
+          record;
+      }
+
+      return boundFileContent;
+    } finally {
+      db.close();
+    }
+  }
+
+  /*
+   * 用缓存内容构造一个 File。
+   * 与句柄 getFile() 得到的 File 在使用上是等价的（上传只看 name/type/内容）。
+   */
+  function buildFileFromContentCache() {
+    if (!boundFileContent?.buffer) {
+      return null;
+    }
+
+    return new File(
+      [boundFileContent.buffer],
+      boundFileContent.name ||
+        "临时落单.txt",
+      {
+        type:
+          boundFileContent.type ||
+          "text/plain",
+        lastModified:
+          boundFileContent.lastModified ||
+          Date.now()
+      }
+    );
+  }
+
   function updateBoundFileDisplay() {
     const button =
       document.getElementById(
@@ -4723,16 +4902,29 @@
       return;
     }
 
-    if (boundFileHandle) {
+    if (
+      boundFileHandle ||
+      boundFileContent
+    ) {
       const name =
-        boundFileHandle.name ||
+        boundFileContent?.name ||
+        boundFileHandle?.name ||
         "已绑定文件";
+
+      const cachedAt =
+        boundFileContent?.savedAt
+          ? new Date(
+              boundFileContent.savedAt
+            ).toLocaleString()
+          : null;
 
       button.textContent =
         "文件已选择";
 
       button.title =
-        `当前文件：${name}。点击重新选择`;
+        cachedAt
+          ? `当前文件：${name}（内容已缓存于 ${cachedAt}，无权限时直接用缓存上传，不再弹授权框）。点击重新选择`
+          : `当前文件：${name}（尚无内容缓存，本次会读取一次）。点击重新选择`;
 
       button.style.color =
         "#389e0d";
@@ -4796,97 +4988,108 @@
       handle
     );
 
-    updateBoundFileDisplay();
+    /*
+     * ⭐ 关键一步：绑定瞬间必然持有读取权限，
+     * 顺势把**文件内容**存进 IndexedDB。
+     *
+     * 之后运行时直接用内容缓存构造 File，不再依赖句柄权限
+     * ⇒ 永不弹授权框，也不受浏览器重启导致权限失效的影响。
+     */
+    try {
+      const file =
+        await handle.getFile();
 
-    log(
-      `✓ 已选择共用文件：${handle.name}`
-    );
+      await saveBoundFileContent(
+        file
+      );
+
+      log(
+        `✓ 已选择共用文件：${handle.name}（内容已缓存，后续运行不再弹授权框）`
+      );
+    } catch (error) {
+      boundFileContent =
+        null;
+
+      warn(
+        `已选择共用文件：${handle.name}，但内容缓存失败：${error?.message || error}`
+      );
+    }
+
+    updateBoundFileDisplay();
 
     return true;
   }
 
 
-  async function ensureBoundFilePermissionFromUserGesture() {
+  /*
+   * 只在「本来就有读取权限」时顺手刷新内容缓存；⛔ 绝不主动申请权限。
+   *
+   * 为什么不再申请（2026-09-28 实测）：
+   *   ① File System Access 的读权限在关闭所有同源标签页后即失效（API 原生行为）；
+   *   ② 本机 Chrome 153 不提供「每次访问时都允许」的三向持久授权（实测只有两向框）；
+   *   ③ 站点设置里只有「文件修改」（写权限），没有「文件读取」，加白名单也无效。
+   *   ⇒ 主动 requestPermission 一次只换来**当次会话**的有效期，
+   *     浏览器一重启就回到 prompt，于是每重启必弹一次。
+   *
+   * 现方案：权限还在就刷新缓存（内容保持最新）；不在就什么都不做，
+   *         运行时一律用内容缓存 ⇒ 彻底不弹窗。
+   */
+  async function refreshBoundFileContentCache() {
     if (!boundFileHandle) {
-      throw new Error(
-        "尚未选择共用文件，请先点击文件按钮完成绑定"
-      );
-    }
-
-    let permission =
-      "granted";
-
-    /*
-     * 必须先 queryPermission 后 requestPermission。
-     *
-     * ⛔ 不能直接调 requestPermission：只要没现成的授权记录，
-     * 即使权限查询结果本来就是 granted，部分浏览器也会弹窗询问；
-     * 已授权的会话里再调一次同样会重复弹。
-     *
-     * 原来的实现（v1.x，见提交 14ee07f）就是「先查、查不到才申请」：
-     * 查询已 granted 时一次都不会弹；只有真的失效时才借当前用户点击
-     * 的 user activation 去申请授权。
-     */
-    if (
-      typeof boundFileHandle
-        .queryPermission ===
-      "function"
-    ) {
-      permission =
-        await boundFileHandle
-          .queryPermission({
-            mode: "read"
-          });
-    }
-
-    if (
-      permission !==
-      "granted" &&
-      typeof boundFileHandle
-        .requestPermission ===
-        "function" &&
-      (
-        navigator.userActivation
-          ?.isActive ??
-        true
-      )
-    ) {
-      permission =
-        await boundFileHandle
-          .requestPermission({
-            mode: "read"
-          });
-    }
-
-    if (
-      permission !==
-      "granted"
-    ) {
-      throw new Error(
-        "已绑定文件尚未获得读取权限，请重新授权或重新绑定文件"
-      );
+      return false;
     }
 
     try {
+      const permission =
+        typeof boundFileHandle
+          .queryPermission ===
+        "function"
+          ? await boundFileHandle
+              .queryPermission({
+                mode: "read"
+              })
+          : "prompt";
+
+      if (
+        permission !==
+        "granted"
+      ) {
+        return false;
+      }
+
       const file =
         await boundFileHandle
           .getFile();
 
-      if (!file) {
-        throw new Error(
-          "读取文件失败"
-        );
-      }
-
-      return file;
-    } catch (error) {
-      throw new Error(
-        "已绑定文件可能被移动、删除或权限失效，请重新绑定文件"
+      await saveBoundFileContent(
+        file
       );
+
+      return true;
+    } catch (error) {
+      console.warn(
+        "[SOA流程自动化] 刷新文件内容缓存失败：",
+        error
+      );
+
+      return false;
     }
   }
 
   async function getBoundFileForRun() {
+    /*
+     * 优先用内容缓存：零弹窗、且不受跨会话权限失效影响。
+     *
+     * 实测（2026-09-28）：读权限在关闭所有同源标签页后即失效，
+     * 本机 Chrome 也不提供三向持久授权 ⇒ 走句柄必然每重启一次弹一次。
+     */
+    const cachedFile =
+      buildFileFromContentCache();
+
+    if (cachedFile) {
+      return cachedFile;
+    }
+
     if (!boundFileHandle) {
       throw new Error(
         "尚未选择共用文件，请先点击“待选择文件”"
@@ -9996,7 +10199,12 @@
               );
 
             if (shouldPrepareBoundFile) {
-              await ensureBoundFilePermissionFromUserGesture();
+              const refreshed =
+                await refreshBoundFileContentCache();
+
+              if (refreshed) {
+                updateBoundFileDisplay();
+              }
             }
 
             const token =
@@ -10057,11 +10265,24 @@
       boundFileHandle =
         await loadBoundFileHandle();
 
+      await loadBoundFileContent();
+
       updateBoundFileDisplay();
 
-      if (boundFileHandle) {
+      if (boundFileContent) {
+        const savedAt =
+          boundFileContent.savedAt
+            ? new Date(
+                boundFileContent.savedAt
+              ).toLocaleString()
+            : "未知时间";
+
         console.log(
-          `[SOA流程自动化] 已恢复绑定文件：${boundFileHandle.name}`
+          `[SOA流程自动化] 已加载文件内容缓存：${boundFileContent.name}（缓存于 ${savedAt}）`
+        );
+      } else if (boundFileHandle) {
+        console.log(
+          `[SOA流程自动化] 已恢复绑定文件：${boundFileHandle.name}（尚无内容缓存，首次运行会读取）`
         );
       }
     } catch (error) {
@@ -10642,6 +10863,6 @@
   routeCheck();
 
   console.log(
-    "[SOA智能审批] v2.12 已加载"
+    "[SOA智能审批] v2.13 已加载"
   );
 })();
