@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.13
-// @description  SOA订单智能审批：自动推进审批流程，合同阶段会自动导入提前选择好的文件。
+// @version      2.14
+// @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理。
 
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        none
@@ -18,7 +18,9 @@
  * SOA.3.1智能审批
  *
  * 功能：
- * - 识别订单流程阶段并执行已支持的自动处理（内勤复核、合同补充、发起落单、落单审核）。
+ * - 识别订单流程阶段并执行已支持的自动处理（报价确认、内勤复核、合同补充、发起落单、落单审核）。
+ * - 报价确认阶段自动点击“提交内勤落单”，弹窗“是否独家”固定选“是”并提交，进入内勤复核。
+ * - 合同模块可单独处理（面板“处理合同”按钮）：只补全字段与上传文件，不发起落单。
  * - 支持审批备注、体检时间校验与报价确认阶段时间修正。
  * - 合同阶段智能补全字段，并绑定共用文件（合同 / 无合同证明文件 / 授权书）按需上传。
  * - 关键动作执行后动态验证页面真实状态；长时间未推进时显示卡点诊断，不重复提交。
@@ -245,7 +247,10 @@
     EXAM_DURATION_ID:
       "__soa_flow_exam_duration_v113",
     EXAM_DATE_FIX_BUTTON_ID:
-      "__soa_flow_exam_date_fix_button_v110"
+      "__soa_flow_exam_date_fix_button_v110",
+
+    CONTRACT_ONLY_BUTTON_ID:
+      "__soa_flow_contract_only_button_v214"
   };
 
   let boundFileHandle = null;
@@ -259,6 +264,12 @@
 
   let processRunning = false;
   let activeFlowToken = null;
+
+  /*
+   * “单独处理合同”是否正在运行（与主流程共用 processRunning 互斥，
+   * 这个标志只用于按钮文案/显隐，避免主按钮被当成合同任务的开关）。
+   */
+  let contractOnlyRunning = false;
 
   let panelVisible = false;
 
@@ -1135,6 +1146,18 @@
 
       if (
         title === "流程进度"
+      ) {
+        continue;
+      }
+
+      /*
+       * “是否独家”弹窗是我们自己在报价确认阶段点出来的，
+       * 属于预期弹窗，不能算卡点。
+       */
+      if (
+        compactText(text).includes(
+          QUOTE_MODAL_KEYWORD
+        )
       ) {
         continue;
       }
@@ -6633,6 +6656,18 @@
       return false;
     }
 
+    /*
+     * v2.14 起“报价确认”支持自动推进（提交内勤落单），
+     * 不再算“尚未进入内勤复核”的拦阻阶段 —— 否则它会先被这条
+     * 判定拦掉，永远走不到自动处理分支。
+     */
+    if (
+      stage ===
+      "报价确认"
+    ) {
+      return false;
+    }
+
     const titles =
       getFlowStepTitles();
 
@@ -6657,25 +6692,36 @@
     /*
      * DOM 顺序无法判断时使用已知早期阶段兜底。
      * “制单”用于兼容部分订单页面对报价单设计阶段的不同命名。
+     * ⚠️ “报价确认”已在本函数开头显式放行（v2.14 起支持自动推进），
+     * 这里不能再列进来。
      */
     return [
       "制单",
       "报价单设计",
-      "授权审批",
-      "报价确认"
+      "授权审批"
     ].includes(stage);
   }
+
+  /*
+   * 支持自动处理的阶段白名单。
+   * “报价确认”自 v2.14 起纳入（提交内勤落单）；
+   * “落单中 / 已落单”只是等待与收尾阶段，没有需要提交的动作。
+   */
+  const AUTO_PROCESS_STAGES = [
+    "报价确认",
+    "内勤复核",
+    "合同补充",
+    "落单审核",
+    "落单中",
+    "已落单"
+  ];
 
   function isSupportedAutoProcessStage(
     stage
   ) {
-    return [
-      "内勤复核",
-      "合同补充",
-      "落单审核",
-      "落单中",
-      "已落单"
-    ].includes(stage);
+    return AUTO_PROCESS_STAGES.includes(
+      stage
+    );
   }
 
   function getAutomationStageIssue(
@@ -6854,7 +6900,7 @@
         size: "14px",
         weight: "700",
         hint:
-          "当前处于报价确认阶段，等待流程进入内勤复核。"
+          "点击“立即处理订单”可自动提交内勤落单（弹窗按“是”选择独家）并进入内勤复核。"
       },
 
       "内勤复核": {
@@ -6997,6 +7043,10 @@
       stage;
 
     updateFlowRunButtonState(
+      stage
+    );
+
+    updateContractOnlyButton(
       stage
     );
 
@@ -7565,6 +7615,51 @@
     return buttons[0] || null;
   }
 
+  /*
+   * 底部主按钮的“安全版”定位。
+   *
+   * ⚠️ 实测（2026-09-29，处于报价确认阶段的订单）底部 .bottom .actions
+   * 的 DOM 顺序是：
+   *   撤回制单 / 导 出 / 编 辑(ant-btn-primary ant-btn-background-ghost)
+   *   / 提交内勤落单(ant-btn-primary)
+   * “编 辑”同样带 ant-btn-primary 类名、且排在“提交内勤落单”之前
+   * ⇒ 裸用 findBottomPrimaryAction() 会点到“编 辑”。这里必须排除
+   * ghost（背景幽灵）与危险样式按钮。
+   */
+  function findBottomPrimaryActionExcludingGhost() {
+    const bottom =
+      document.querySelector(
+        ".bottom .actions"
+      );
+
+    if (!bottom) {
+      return null;
+    }
+
+    const buttons =
+      Array.from(
+        bottom.querySelectorAll(
+          "button"
+        )
+      ).filter(button => {
+        return (
+          isVisible(button) &&
+          !button.disabled &&
+          button.classList.contains(
+            "ant-btn-primary"
+          ) &&
+          !button.classList.contains(
+            "ant-btn-background-ghost"
+          ) &&
+          !button.classList.contains(
+            "ant-btn-dangerous"
+          )
+        );
+      });
+
+    return buttons[0] || null;
+  }
+
   const FLOW_STAGE_SEQUENCE = [
     "制单",
     "报价单设计",
@@ -8108,6 +8203,408 @@
     return nextStage;
   }
 
+  /*
+   * ── 报价确认阶段（v2.14 新增） ──
+   *
+   * 页面动作：底部“提交内勤落单” → 弹窗选择“是否独家” → 确定 → 进入内勤复核。
+   * 红领巾 2026-09-29 定：独家固定选“是”，不做面板配置。
+   */
+  const QUOTE_SUBMIT_ACTION_TEXT =
+    "提交内勤落单";
+
+  const QUOTE_MODAL_KEYWORD =
+    "独家";
+
+  /*
+   * 判断某个选项文案是否属于“独家 = 是”。
+   * 先排除“非 / 否”，再匹配“是 / 独家”，
+   * 避免把“非独家”“否”误判成目标项。
+   */
+  function isExclusiveYesText(text) {
+    const value =
+      compactText(text);
+
+    if (!value) {
+      return false;
+    }
+
+    if (
+      value.includes("非") ||
+      value.includes("否")
+    ) {
+      return false;
+    }
+
+    return (
+      value.includes("是") ||
+      value.includes(QUOTE_MODAL_KEYWORD)
+    );
+  }
+
+  function findQuoteConfirmModal() {
+    const modals =
+      Array.from(
+        document.querySelectorAll(
+          ".ant-modal"
+        )
+      ).filter(isVisible);
+
+    return (
+      modals.find(modal => {
+        const title =
+          compactText(
+            modal.querySelector(
+              ".ant-modal-title"
+            )?.textContent
+          );
+
+        if (
+          title ===
+          "流程进度"
+        ) {
+          return false;
+        }
+
+        return compactText(
+          modal.textContent
+        ).includes(
+          QUOTE_MODAL_KEYWORD
+        );
+      }) ||
+      null
+    );
+  }
+
+  function findModalFooterConfirmButton(
+    modal
+  ) {
+    if (!modal) {
+      return null;
+    }
+
+    const texts = [
+      "确认",
+      "确定",
+      "提交"
+    ];
+
+    const buttons =
+      Array.from(
+        modal.querySelectorAll(
+          ".ant-modal-footer button"
+        )
+      ).filter(button => {
+        return (
+          isVisible(button) &&
+          !button.disabled &&
+          !button.classList.contains(
+            "ant-btn-loading"
+          ) &&
+          texts.includes(
+            compactText(
+              button.textContent
+            )
+          )
+        );
+      });
+
+    return (
+      buttons.find(button =>
+        button.classList.contains(
+          "ant-btn-primary"
+        )
+      ) ||
+      buttons[0] ||
+      null
+    );
+  }
+
+  /*
+   * 在“是否独家”弹窗里把选择固定为“是”。
+   *
+   * 兼容两种控件形态（按实测结构择一，找不到就停，绝不猜）：
+   *   ① 单选框组 .ant-radio-wrapper
+   *   ② 下拉选择 .ant-select
+   */
+  async function chooseExclusiveYes(
+    modal,
+    token = null
+  ) {
+    const radio =
+      Array.from(
+        modal.querySelectorAll(
+          ".ant-radio-wrapper"
+        )
+      ).find(wrapper => {
+        return (
+          isVisible(wrapper) &&
+          isExclusiveYesText(
+            wrapper.textContent
+          )
+        );
+      });
+
+    if (radio) {
+      const input =
+        radio.querySelector(
+          "input[type=radio]"
+        );
+
+      if (input?.checked) {
+        log(
+          "报价确认：弹窗“是否独家”已是“是”，无需改动。"
+        );
+
+        return true;
+      }
+
+      const label =
+        compactText(
+          radio.textContent
+        );
+
+      radio.click();
+
+      const checked =
+        await waitFor(
+          () =>
+            radio.querySelector(
+              "input[type=radio]"
+            )?.checked ||
+            null,
+          2500,
+          100
+        );
+
+      if (!checked) {
+        throw new FlowBlockedError(
+          `报价确认弹窗中“${label}”未能选中，已停止自动提交`
+        );
+      }
+
+      log(
+        `报价确认：弹窗“是否独家”已选择“${label}”。`
+      );
+
+      return true;
+    }
+
+    const select =
+      modal.querySelector(
+        ".ant-select"
+      );
+
+    if (
+      select &&
+      isVisible(select)
+    ) {
+      /*
+       * 用 placeholder 判断“是否还没选”。
+       * 不能只看文本：placeholder 文案本身可能含“是”字，
+       * 误判成“已选是”就会跳过选择，提交时被页面校验拦下。
+       */
+      const hasPlaceholder =
+        Boolean(
+          select.querySelector(
+            ".ant-select-selection-placeholder"
+          )
+        );
+
+      if (
+        !hasPlaceholder &&
+        isExclusiveYesText(
+          select.textContent
+        )
+      ) {
+        log(
+          "报价确认：弹窗“是否独家”下拉已是“是”，无需改动。"
+        );
+
+        return true;
+      }
+
+      const trigger =
+        select.querySelector(
+          ".ant-select-selector"
+        ) ||
+        select;
+
+      trigger.click();
+
+      const option =
+        await waitFor(
+          () =>
+            Array.from(
+              document.querySelectorAll(
+                ".ant-select-item-option"
+              )
+            ).find(item => {
+              return (
+                isVisible(item) &&
+                isExclusiveYesText(
+                  item.textContent
+                )
+              );
+            }) ||
+            null,
+          CONFIG.PICKER_TIMEOUT,
+          120
+        );
+
+      if (!option) {
+        throw new FlowBlockedError(
+          "报价确认弹窗的“是否独家”下拉里没找到“是”，已停止自动提交"
+        );
+      }
+
+      option.click();
+
+      log(
+        "报价确认：弹窗“是否独家”下拉已选择“是”。"
+      );
+
+      return true;
+    }
+
+    throw new FlowBlockedError(
+      "报价确认弹窗中未识别到“是否独家”选择控件，已停止自动提交，请人工确认"
+    );
+  }
+
+  async function submitQuoteConfirmStage(
+    token = null
+  ) {
+    const stage =
+      getCurrentFlowStage();
+
+    if (
+      stage !==
+      "报价确认"
+    ) {
+      throw new Error(
+        `当前阶段为“${stage || "未知"}”，不是报价确认`
+      );
+    }
+
+    /*
+     * ⚠️ 这里刻意不用 findBottomPrimaryAction()：
+     * 底部“编 辑”同样带 ant-btn-primary，且排在“提交内勤落单”之前。
+     * 先按文案精确取，再退回“排除 ghost 的 primary”。
+     */
+    const action =
+      await waitForReactiveCondition(
+        () =>
+          findBottomActionByText(
+            QUOTE_SUBMIT_ACTION_TEXT
+          ) ||
+          findBottomPrimaryActionExcludingGhost() ||
+          null,
+        {
+          label:
+            `报价确认阶段“${QUOTE_SUBMIT_ACTION_TEXT}”按钮`,
+          token,
+          blockerCheck:
+            () =>
+              getVisibleErrorFeedback(),
+          diagnose:
+            () =>
+              getFlowWaitDiagnostic(
+                `等待“${QUOTE_SUBMIT_ACTION_TEXT}”按钮可点击`
+              )
+        }
+      );
+
+    log(
+      `报价确认：点击“${cleanText(action.textContent)}”，等待“是否独家”弹窗...`
+    );
+
+    action.click();
+
+    const modal =
+      await waitForReactiveCondition(
+        () =>
+          findQuoteConfirmModal() ||
+          null,
+        {
+          label:
+            "报价确认“是否独家”弹窗",
+          token,
+          blockerCheck:
+            () =>
+              getVisibleErrorFeedback(),
+          diagnose:
+            () =>
+              getFlowWaitDiagnostic(
+                `已点击“${QUOTE_SUBMIT_ACTION_TEXT}”，等待弹窗`
+              )
+        }
+      );
+
+    await chooseExclusiveYes(
+      modal,
+      token
+    );
+
+    throwIfFlowCancelled(
+      token
+    );
+
+    const confirm =
+      await waitForReactiveCondition(
+        () =>
+          findModalFooterConfirmButton(
+            modal
+          ) ||
+          null,
+        {
+          label:
+            "报价确认弹窗“确定”按钮",
+          token,
+          blockerCheck:
+            () =>
+              getVisibleErrorFeedback(),
+          diagnose:
+            () =>
+              getFlowWaitDiagnostic(
+                "弹窗已选择独家，等待确定按钮可提交"
+              )
+        }
+      );
+
+    log(
+      "报价确认：点击“确定”，等待流程进入内勤复核..."
+    );
+
+    confirm.click();
+
+    const nextStage =
+      await waitForStageChange(
+        "报价确认",
+        token,
+        {
+          strict: false
+        }
+      );
+
+    /*
+     * 弹窗关闭动画没结束就回到主循环，会被 getPageBlocker()
+     * 当成“非预期弹窗”中断流程 ⇒ 这里先等它退场（超时不报错，
+     * 因为订单其实已经提交成功）。
+     */
+    await waitFor(
+      () =>
+        !findQuoteConfirmModal(),
+      3000,
+      120
+    );
+
+    log(
+      `✓ 报价确认已提交，进入：${nextStage}`
+    );
+
+    return nextStage;
+  }
+
   async function submitContractStage(
     token = null
   ) {
@@ -8368,6 +8865,17 @@
           );
 
           return;
+        }
+
+        if (
+          stage ===
+          "报价确认"
+        ) {
+          await submitQuoteConfirmStage(
+            token
+          );
+
+          continue;
         }
 
         if (
@@ -8820,6 +9328,154 @@
         : "✓ 合同资料验证通过，无需重复处理。",
       "success"
     );
+  }
+
+  /*
+   * ── 单独处理合同模块（v2.14 新增） ──
+   *
+   * 与主流程的区别：只做“补字段 + 上传文件 + 保存”，
+   * 不点击“发起落单”⇒ 不会推进流程，随时可以单独跑。
+   * 显示范围与可处理阶段一致（AUTO_PROCESS_STAGES）。
+   */
+  function updateContractOnlyButton(
+    stage =
+      getCurrentFlowStage()
+  ) {
+    const button =
+      document.getElementById(
+        UI.CONTRACT_ONLY_BUTTON_ID
+      );
+
+    if (!button) {
+      return;
+    }
+
+    if (contractOnlyRunning) {
+      button.style.display =
+        "inline-flex";
+
+      button.disabled =
+        true;
+
+      button.textContent =
+        "处理中...";
+
+      return;
+    }
+
+    const shouldShow =
+      !processRunning &&
+      isSupportedAutoProcessStage(
+        stage
+      );
+
+    button.style.display =
+      shouldShow
+        ? "inline-flex"
+        : "none";
+
+    button.disabled =
+      false;
+
+    button.textContent =
+      "处理合同";
+  }
+
+  async function runContractOnlyProcess() {
+    if (contractOnlyRunning) {
+      return;
+    }
+
+    if (processRunning) {
+      updatePanelStatus(
+        "自动流程正在运行，请先停止后再单独处理合同。",
+        "error"
+      );
+
+      return;
+    }
+
+    const token =
+      createFlowToken();
+
+    activeFlowToken =
+      token;
+
+    processRunning =
+      true;
+
+    contractOnlyRunning =
+      true;
+
+    updateFlowRunButtonState(
+      getCurrentFlowStage()
+    );
+
+    updateContractOnlyButton();
+
+    try {
+      throwIfFlowCancelled(
+        token
+      );
+
+      updatePanelStatus(
+        "合同模块：单独处理中，仅补全字段与上传文件，不会发起落单..."
+      );
+
+      await ensureContractTabVisible(
+        token
+      );
+
+      throwIfFlowCancelled(
+        token
+      );
+
+      await runContractProcess({
+        token
+      });
+
+      updatePanelStatus(
+        "✓ 合同模块已单独处理完成（未发起落单）。",
+        "success",
+        {
+          persistent: true
+        }
+      );
+    } catch (error) {
+      if (
+        error instanceof
+          FlowCancelledError ||
+        token.cancelled
+      ) {
+        updatePanelStatus(
+          "■ 合同模块处理已停止。"
+        );
+
+        return;
+      }
+
+      throw error;
+    } finally {
+      processRunning =
+        false;
+
+      contractOnlyRunning =
+        false;
+
+      if (
+        activeFlowToken ===
+        token
+      ) {
+        activeFlowToken =
+          null;
+      }
+
+      updateFlowRunButtonState(
+        getCurrentFlowStage()
+      );
+
+      updateContractOnlyButton();
+    }
   }
 
   function clamp(
@@ -9281,7 +9937,12 @@
 
           <div style="margin-bottom:3px;">
             <strong style="color:#444;">流程：</strong>
-            内勤复核及后续支持阶段可执行；合同阶段严格复核，其余阶段动态等待页面推进；已落单后自动复制落单数据。
+            报价确认及后续支持阶段可执行；报价确认自动提交内勤落单（独家固定选“是”），合同阶段严格复核，其余阶段动态等待页面推进；已落单后自动复制落单数据。
+          </div>
+
+          <div style="margin-bottom:3px;">
+            <strong style="color:#444;">合同：</strong>
+            “处理合同”按钮单独处理合同模块（补字段 + 上传文件 + 保存），<strong style="color:#444;">不发起落单</strong>，可在可处理阶段随时点。
           </div>
 
           <div style="margin-bottom:3px;">
@@ -9668,6 +10329,30 @@
             >
               正在读取页面流程状态...
             </div>
+
+            <button
+              id="${UI.CONTRACT_ONLY_BUTTON_ID}"
+              type="button"
+              style="
+                display:none;
+                flex:0 0 auto;
+                align-items:center;
+                justify-content:center;
+                height:24px;
+                padding:0 8px;
+                border:1px solid #1677ff;
+                border-radius:5px;
+                background:#fff;
+                color:#1677ff;
+                font-size:11px;
+                font-weight:600;
+                cursor:pointer;
+                white-space:nowrap;
+              "
+              title="只处理合同模块：补全合同字段并上传文件，不发起落单"
+            >
+              处理合同
+            </button>
 
             <button
               id="${UI.EXAM_DATE_FIX_BUTTON_ID}"
@@ -10123,6 +10808,28 @@
 
     document
       .getElementById(
+        UI.CONTRACT_ONLY_BUTTON_ID
+      )
+      ?.addEventListener(
+        "click",
+        () => {
+          runContractOnlyProcess()
+            .catch(error => {
+              warn(
+                error?.message ||
+                String(error)
+              );
+
+              console.error(
+                "[SOA流程自动化] 单独处理合同失败：",
+                error
+              );
+            });
+        }
+      );
+
+    document
+      .getElementById(
         UI.EXAM_DATE_FIX_BUTTON_ID
       )
       ?.addEventListener(
@@ -10166,7 +10873,7 @@
           if (stageIssue) {
             updatePanelStatus(
               stageIssue +
-              "。请先在网页中将流程推进到内勤复核或后续支持阶段。",
+              "。请先在网页中将流程推进到报价确认或后续支持阶段。",
               "error"
             );
 
