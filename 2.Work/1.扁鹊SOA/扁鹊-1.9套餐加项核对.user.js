@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.9套餐加项核对
 // @namespace    https://tampermonkey.net/
-// @version      1.0.0
+// @version      1.2.0
 // @description  SOA 订单页：核对「套餐 ↔ 绑定的赠送包 ↔ 包内项目」。只看赠送包(GIVEPKG)、不看加项包；列出套餐名称、原价、成交价与赠送包内的全部项目（多个项目换行显示）。纯只读，不发起任何写请求。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -68,6 +68,18 @@
  *   ⚠️ 定位方式是「找到文本为『第三方套餐码』的 button，取其父 .btn-wrap」——
  *     不按 `.btn-wrap` 的序号取，页面上这种 wrap 不止一个，按序号会挂错行。
  *
+ * ── 按钮长什么样（2026-09-29 第二轮：几何向页面看齐，配色向 1.6 看齐）──
+ *   几何：24px 高 · 2px 圆角 · 14px 字 · padding 0 7px —— **照页面 antd `.ant-btn-sm` 的实际计算值抄**，
+ *   与同行 4 个按钮水平完全齐平（红领巾要的「平整度」）。
+ *   配色：**取「扁鹊-1.6制卡管理查询」顶部那个琥珀开关**（红领巾 2026-09-29 贴截图指定）：
+ *   边框 #e2aa3f · 底 linear-gradient(#fff8df→#ffefbd) · 字 #6a4300 · 双阴影；色值从 1.6 原样搬来。
+ *   ⚠️ 只搬了**配色**，几何没跟 1.6（它是 31px 高 / 7px 圆角 / 700 字重，照搬就跟同行按钮不齐了）。
+ *   ⚠️ 两个坑（改样式前必读，CSS 里也有同样的注释）：
+ *     ① 高度不能写 28px —— 比同行高 4px、顶部对齐 ⇒ 底部悬出 4px，`.btn-wrap` 盒子也被撑高、
+ *        左边标题跟着不居中。这就是「不平整」的根因。
+ *     ② 自己不能加 margin —— 页面按钮每个都自带 `margin-left:16px` 提供间距，
+ *        脚本再加 `margin-right:8px` ⇒ 间距变 24px，比别处多一截。
+ *
  * ── 为什么只读也要走接口，不模拟点击 ──
  *   包内项目在页面上要点开弹窗才看得到，且一次只能看一个；接口单次约 300ms，
  *   套餐再多也能并发拉完。前端改版也不会把脚本改挂。
@@ -94,7 +106,7 @@
     body: `${NS}_body`,
     footer: `${NS}_footer`,
   };
-  const VERSION = '1.0.0';
+  const VERSION = '1.2.0';
   const SWITCH_LABEL = '加项包核对';
   const POS_KEY = `${NS}_pos`;
 
@@ -241,30 +253,65 @@
     const style = document.createElement('style');
     style.id = IDS.style;
     style.textContent = `
-      /* ---------- 操作行里的开关（与页面 antd 小按钮同高，蓝框蓝字，一眼可辨）---------- */
+      /* ---------- 操作行里的开关 ----------
+       * 🎯 几何**照抄页面自带按钮**，与它同一行时完全齐平（2026-09-29 真机量的基准，
+       *    页面按钮 class = "ant-btn ant-btn-sm"）：
+       *      height 24px · padding 0 7px · border-radius 2px
+       *      font-size 14px · font-weight 400 · 字体族继承页面
+       *
+       * 🎨 配色取「扁鹊-1.6制卡管理查询」顶部那个琥珀开关（红领巾 2026-09-29 指定参考，
+       *    贴了截图）。色值**从 1.6 原样搬来**，两处保持一致，改一处记得同步另一处：
+       *      边框 #e2aa3f · 底 linear-gradient(180deg,#fff8df,#ffefbd) · 字 #6a4300
+       *      shadow 0 1px 2px rgba(81,54,12,.10) + inset 0 1px 0 rgba(255,255,255,.75)
+       *      hover 底 #fff4cf→#ffe6a1 · 边框 #d59625 · shadow 0 2px 6px rgba(108,72,11,.16)
+       *    ⚠️ 只搬了**配色**，几何仍与页面按钮一致（1.6 那个是 31px 高 / 7px 圆角 / 700 字重，
+       *       照搬过来就跟同行按钮不齐了 —— 红领巾这一轮的头号诉求是「平整度」）。
+       *    ⚠️ 底色是 gradient ⇒ "background-color" 计算值是 transparent，断言要读 "backgroundImage"。
+       *
+       * ⚠️ 两条踩过的坑（改这个按钮前先看）：
+       *   ① **高度必须 24px**。原先写成 28px ⇒ 比同行按钮高 4px，flex 里表现为**顶部对齐、
+       *      底部悬出 4px**；连 ".btn-wrap" 的盒子都被撑高 4px，左边那行标题跟着不居中。
+       *      这就是「不平整」的根因 —— 不是 margin 的问题，是高度。
+       *   ② **自己不要加任何 margin**。页面按钮每个都自带 "margin-left:16px" 提供间距，
+       *      脚本再加 "margin-right:8px" ⇒ 实际间距 24px，比别处（16px）多一截。
+       *      本行间距全部交给页面按钮自带的那个 margin-left。 */
       #${IDS.switch} {
-        display: inline-flex;
         flex: 0 0 auto;
+        display: inline-flex;
         align-items: center;
         justify-content: center;
-        height: 28px;
-        padding: 0 10px;
-        margin-right: 8px;
-        border: 1px solid #1677ff;
-        border-radius: 4px;
-        background: #fff;
-        color: #1677ff;
-        font-size: 13px;
-        font-weight: 500;
+        height: 24px;
+        padding: 0 7px;
+        margin: 0;
+        border: 1px solid #e2aa3f;
+        border-radius: 2px;
+        background: linear-gradient(180deg, #fff8df 0%, #ffefbd 100%);
+        color: #6a4300;
+        font-size: 14px;
+        font-weight: 400;
         line-height: 1;
         cursor: pointer;
         white-space: nowrap;
-        vertical-align: middle;
         box-sizing: border-box;
+        box-shadow: 0 1px 2px rgba(81, 54, 12, .10), inset 0 1px 0 rgba(255, 255, 255, .75);
+        transition: background .12s ease, border-color .12s ease, box-shadow .12s ease;
       }
-      #${IDS.switch}:hover { background: #e6f4ff; }
-      #${IDS.switch}:active { background: #bae0ff; }
-      #${IDS.switch}.is-active { background: #1677ff; color: #fff; border-color: #1677ff; }
+      #${IDS.switch}:hover {
+        background: linear-gradient(180deg, #fff4cf 0%, #ffe6a1 100%);
+        border-color: #d59625;
+        box-shadow: 0 2px 6px rgba(108, 72, 11, .16), inset 0 1px 0 rgba(255, 255, 255, .82);
+      }
+      /* 面板打开时：换成「实心琥珀」，与浅底一眼可分（1.6 那个按钮没有开合态，这段是本脚本自己的） */
+      #${IDS.switch}.is-active {
+        background: linear-gradient(180deg, #ffd76a 0%, #f5c542 100%);
+        border-color: #d59625;
+        color: #5a3a00;
+        box-shadow: 0 1px 2px rgba(81, 54, 12, .14), inset 0 1px 0 rgba(255, 255, 255, .45);
+      }
+      #${IDS.switch}.is-active:hover {
+        background: linear-gradient(180deg, #ffdf85 0%, #fbd05c 100%);
+        border-color: #c98c1c;
+      }
 
       /* ---------- 面板 ---------- */
       #${IDS.panel} {
