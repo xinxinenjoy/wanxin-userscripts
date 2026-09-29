@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.9套餐加项核对
 // @namespace    https://tampermonkey.net/
-// @version      1.2.0
-// @description  SOA 订单页：核对「套餐 ↔ 绑定的赠送包 ↔ 包内项目」。只看赠送包(GIVEPKG)、不看加项包；列出套餐名称、原价、成交价与赠送包内的全部项目（多个项目换行显示）。纯只读，不发起任何写请求。
+// @version      1.6.0
+// @description  SOA 订单页：核对「套餐 ↔ 绑定的赠送包 ↔ 包内项目」。只看赠送包(GIVEPKG)、不看加项包；按组展示、组头标注该组「几选几」（最少选N个/最多选N个）；每行 = 套餐信息头（套餐名 · 原价 · 成交价 · 客户类型/编码，横排一行）+ 赠送区（包内项目按纵向两列排）。纯只读，不发起任何写请求。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -31,6 +31,10 @@
  *      「赠送项目」取它绑定的赠送包里的项目明细。
  *   ⑤ 纯只读 → **不设订单状态门槛**（不像 1.8 那样只在未落单/检中修改时出现）。
  *      任何订单、任何状态都能点开看。
+ *   ⑥ 赠送项目**按组展示**，组头写明该组的「几选几」（红领巾 2026-09-29 第二轮要求）。
+ *      组头文案照页面：`A组：最少选1个 最多选1个` —— 取自宿主套餐的 selectionSizeList，
+ *      推导见下面接口第 ③ 条。⛔ 只显示**含赠送包的组**；只含加项包的组整组不出现
+ *      （口径不变：不管加项包）。空组也不显示（与页面 popover 一致）。
  *
  * ── 接口（2026-09-29 实测，全部已验证）──
  *
@@ -52,6 +56,24 @@
  *      ⚠️ 实测传 `{package_code: …}` 会报 `code不能为空(null)`；必须是 `code`。
  *      ⚠️ 只要 code，**不需要 order_code**（传了也无害，返回一致）。
  *      ⚠️ `sequence` 是包内展示顺序，渲染前按它升序排（接口返回的顺序实测也是递增，但不依赖它）。
+ *
+ *   ③ 组的「几选几」约束 —— 在**主套餐自己**的 `selectionSizeList` 上（2026-09-29 实测）
+ *      ⛔ `add_packages` 每项只有 `{group, package_code, package_name}`，
+ *         **组约束不在那里**，而在宿主套餐的同级字段：
+ *           `selectionSizeList[group - 1] = { minSize, maxSize }`
+ *         ⇒ **group 是 1 基、数组是 0 基**：group 1 → [0]、group 2 → [1] …… 最多 5 组。
+ *         （另有一个 `selectionAppointmentTimeList[group - 1]` 存预约时间，本脚本不用。）
+ *      🔴 依据不是猜的，是**页面自己的渲染代码**（`p__orderLayout.*.async.js`，Tt 组件）：
+ *           first.number  = n.selectionSizeList[0] || 0      // … 一路到 fifth = [4]
+ *           1===t.group ? e.first.items += t.package_name
+ *                     : 2===t.group ? e.secound … 5===t.group && e.fifth …
+ *           组头文案硬编码： "A组：最少选" + number.minSize + "个 最多选" + number.maxSize + "个"
+ *           且**只有该组有包时才渲染**（`e.first.items && …`）⇒ 空组整个不出现。
+ *      ⚠️ `group === -1` 的包被页面**显式忽略**（`-1 !== t.group && …`）⇒ 不属于任何组。
+ *      ⚠️ `selectionSizeList` 的元素可能是 `{}`（空对象）⇒ minSize/maxSize 为 undefined，
+ *         页面会渲染成「最少选个 最多选个」（空文案）；本脚本改标「无约束数据」，不显示空文案。
+ *      ⚠️ 页面组头还会追加「预约时间：begin - end」（取 selectionAppointmentTimeList[i]）；
+ *         实测该数组为 [{}] 时不出。本脚本不展示预约时间（核对赠送项目用不上）。
  *
  * ── 🔴 价格字段的反直觉映射（2026-09-29 实测，别按字段名猜）──
  *   页面套餐表头：
@@ -106,7 +128,7 @@
     body: `${NS}_body`,
     footer: `${NS}_footer`,
   };
-  const VERSION = '1.2.0';
+  const VERSION = '1.6.0';
   const SWITCH_LABEL = '加项包核对';
   const POS_KEY = `${NS}_pos`;
 
@@ -119,6 +141,14 @@
 
   // 只看赠送包。加项包(ADDPKG) / 智略加项包(AIADDPKG) 不看 —— 红领巾 2026-09-29 定的口径
   const GIVE_TYPE = 'GIVEPKG';
+
+  // ---- 组（「几选几」的容器）----
+  // group 是 **1 基**、selectionSizeList 是 **0 基**：group N 的约束 = selectionSizeList[N-1]。
+  // 最多 5 组 —— 页面渲染代码里只有 first/second/third/fourth/fifth 五个位置，
+  // group 落在 1..5 之外（含 -1）的包，页面统统不归组（-1 那批被显式跳过）。
+  const GROUP_MAX = 5;
+  const GROUP_LETTERS = ['A', 'B', 'C', 'D', 'E'];
+  const GROUP_NONE_CN = '未分组';
 
   const TYPE_CN = {
     PACKAGE: '普通套餐',
@@ -228,7 +258,9 @@
   const state = {
     orderCode: null,
     loading: false,
-    rows: [], // 渲染用：{code,name,type,custType,salePrice,price,voided,gives:[{name,items:[]}]}
+    // 渲染用：{code,name,type,custType,salePrice,price,voided,
+    //          groups:[{no,name,min,max,gives:[{code,name,group,items:[{name,price,salePrice}]}]}]}
+    rows: [],
     bindTotal: 0, // 本订单绑定的包总数（去重后）
     giveTotal: 0, // 其中赠送包数
     itemTotal: 0, // 赠送包内项目总数
@@ -313,12 +345,18 @@
         border-color: #c98c1c;
       }
 
-      /* ---------- 面板 ---------- */
+      /* ---------- 面板 ----------
+       * 宽度 780 → 720（2026-09-29 第三轮，红领巾：「右侧留白太多」）。
+       *   实测（订单 SOA37906492773140442，v1.4.0）：面板 780 / 内容区 763，
+       *   赠送列分到 534px，但它的内容**最长只用到 296px**（+ 左右 padding 20 = 316），
+       *   ⇒ 右侧整整空出 228px（占该列 43%）。这不是「列太窄」，是「列太宽」。
+       *   缩到 720 后：赠送列 372（余量 56px）、套餐列 331（原 229）。
+       * ⚠️ 别再退回按 30%/70% 分列 —— 见 paintBody 里 th 的注释。 */
       #${IDS.panel} {
         position: fixed;
         top: 96px;
         right: 18px;
-        width: 780px;
+        width: 720px;
         max-width: calc(100vw - 36px);
         max-height: calc(100vh - 130px);
         display: flex;
@@ -377,34 +415,42 @@
         border-collapse: collapse;
         font-size: 12.5px;
       }
-      .hlj-gc-table thead th {
-        position: sticky;
-        top: 0;
-        z-index: 1;
-        padding: 7px 10px;
-        text-align: left;
-        font-weight: 600;
-        color: #262626;
-        background: #fafafa;
-        border-bottom: 1px solid #e8e8e8;
-        white-space: nowrap;
-      }
+      /* ⚠️ 没有 thead —— 行内自解释（第四轮改，见下）。 */
       .hlj-gc-table tbody td {
-        padding: 7px 10px;
-        border-bottom: 1px solid #f5f5f5;
-        vertical-align: top;
+        padding: 9px 11px 11px;
+        border-bottom: 0;
         line-height: 1.55;
         word-break: break-all;
       }
+      /* 行与行之间用一条**留白带**分隔（比 1px 细线更清楚「哪条是哪条」） */
+      .hlj-gc-table tbody tr + tr td { border-top: 3px solid #f0f0f0; }
       .hlj-gc-table tbody tr:hover { background: #fafafa; }
       .hlj-gc-table tbody tr.is-voided { background: #f7f7f7; }
       .hlj-gc-table tbody tr.is-voided td { color: #8c8c8c; }
 
-      .hlj-gc-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
-      .hlj-gc-name { font-weight: 500; }
-      .hlj-gc-sub {
-        margin-top: 2px; color: #8c8c8c; font-size: 11.5px;
+      /* ── 行头：套餐信息横排一行 ────────────────────────────────────────
+       * 第四轮改（2026-09-29，红领巾：「左侧列数据少，在右侧包较多时会有大量空白」）。
+       * 旧的两列布局：左侧套餐信息只有 67.8px 高，行高被右侧赠送区撑到 315px
+       * ⇒ 左侧纵向空白 247.5px = 行高的 78%（真机量出来的，不是估的）。
+       * 改成「套餐信息一行做头 + 赠送区全宽」后空白归零，行高 315 → 272。
+       * ⚠️ 别再退回两列：列宽解决的是**横向**，这个问题是**纵向**的，两回事。 */
+      .hlj-gc-head {
+        display: flex; align-items: baseline; gap: 6px 16px; flex-wrap: wrap;
+        padding-bottom: 6px; border-bottom: 1px solid #f0f0f0;
       }
+      /* 套餐名不硬断（break-all 会把它从任意字拆开），只在真放不下时才折 */
+      .hlj-gc-head-main { font-weight: 500; font-size: 13px; word-break: normal; overflow-wrap: anywhere; }
+      .hlj-gc-head-main .hlj-gc-tag { vertical-align: 1px; }
+      /* 金额：14px（红领巾 2026-09-29 要求放大），成交价琥珀色强调，原价压灰 */
+      .hlj-gc-prices {
+        display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 18px;
+        font-size: 14px; line-height: 1.35; color: #8c8c8c;
+      }
+      .hlj-gc-prices b { font-weight: 600; font-variant-numeric: tabular-nums; }
+      .hlj-gc-p1 b { color: #595959; }
+      .hlj-gc-p2 b { color: #d46b08; }
+      .hlj-gc-sub { color: #8c8c8c; font-size: 11.5px; }
+      .hlj-gc-gives { margin-top: 7px; }
       .hlj-gc-tag {
         display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 11px;
         line-height: 16px; margin-right: 5px; vertical-align: 1px;
@@ -417,7 +463,26 @@
       .hlj-gc-tag.t-AIADDPKG { background: #e6fffb; color: #08979c; }
       .hlj-gc-tag.t-void { background: #f5f5f5; color: #8c8c8c; }
 
-      /* 赠送项目：按赠送包分组，包名做小标题，项目用有序列表（每个项目独占一行） */
+      /* 赠送项目：先按**组**分块（组头写「几选几」），组内再按赠送包分组、包内列项目 */
+      .hlj-gc-group + .hlj-gc-group { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #e8e8e8; }
+      .hlj-gc-group-head {
+        display: flex; align-items: baseline; gap: 6px;
+        margin-bottom: 4px; line-height: 1.4;
+      }
+      .hlj-gc-group-name {
+        flex: 0 0 auto;
+        padding: 0 5px; border-radius: 3px; font-size: 11px; line-height: 16px;
+        font-weight: 600; background: #fff7e6; color: #d46b08;
+        border: 1px solid #ffe7ba;
+      }
+      .hlj-gc-group-limit { color: #8c8c8c; font-size: 11.5px; }
+      .hlj-gc-group-limit.is-unknown { color: #d46b08; }
+      .hlj-gc-group-warn {
+        color: #cf1322; font-size: 11px;
+        border-bottom: 1px dashed #ffa39e; cursor: help;
+      }
+
+      /* 赠送项目：组内按赠送包分组，包名做小标题，项目用有序列表（每个项目独占一行） */
       .hlj-gc-give + .hlj-gc-give { margin-top: 6px; padding-top: 6px; border-top: 1px dashed #f0f0f0; }
       .hlj-gc-give-name {
         display: block;
@@ -425,12 +490,17 @@
         font-size: 11.5px;
         margin-bottom: 2px;
       }
+      /* 项目名按**纵向两列**排 —— columns 是纵向流向（左列排满再到右列），阅读顺序
+       * 1,2 / 3,4 保持自上而下。⚠️ 别换成 grid：grid 是横向铺，序号会变成 1,3 / 2,4。
+       * 两列各约 321px，实测最长项目名（含「原价 498.8」小字）= 296px，余量 25px。 */
       .hlj-gc-items {
         margin: 0;
         padding-left: 18px;
         color: #262626;
+        columns: 2;
+        column-gap: 20px;
       }
-      .hlj-gc-items li { margin: 1px 0; }
+      .hlj-gc-items li { margin: 1px 0; break-inside: avoid; }
       .hlj-gc-items .hlj-gc-item-p {
         color: #bfbfbf;
         font-size: 11px;
@@ -629,6 +699,51 @@
   // ============================================================
   // 8. 渲染
   // ============================================================
+
+  /**
+   * 把该套餐绑的赠送包按「组」归拢，并带上每组的「几选几」约束。
+   *
+   * 口径照**页面自己的渲染代码**（依据见文件头接口第 ③ 条）：
+   *   ① group 是 1 基、selectionSizeList 是 0 基 ⇒ 第 N 组约束 = selectionSizeList[N-1]
+   *   ② 只认 1..5 组（页面只有五个位置）；落到外面的（含 group === -1）归「未分组」并标注
+   *   ③ **空组不产出条目** —— 与页面一致（那组没包就整组不渲染）
+   *   ④ 约束元素可能是 {} ⇒ min/max 记 null，渲染时标「无约束数据」，不显示空文案
+   */
+  function buildGroups(gives, sizeList) {
+    const bucket = new Map(); // no -> [give]
+    gives.forEach((g) => {
+      const no = Number(g.group);
+      const key = no >= 1 && no <= GROUP_MAX ? no : 0; // 0 = 页面不认的组
+      if (!bucket.has(key)) bucket.set(key, []);
+      bucket.get(key).push(g);
+    });
+
+    const readLimit = (no) => {
+      const s = Array.isArray(sizeList) ? sizeList[no - 1] : null;
+      const min = s && s.minSize !== null && s.minSize !== undefined ? Number(s.minSize) : null;
+      const max = s && s.maxSize !== null && s.maxSize !== undefined ? Number(s.maxSize) : null;
+      return { min: min, max: max };
+    };
+
+    const out = [];
+    for (let no = 1; no <= GROUP_MAX; no++) {
+      const list = bucket.get(no);
+      if (!list || !list.length) continue; // 空组不显示（与页面一致）
+      const lim = readLimit(no);
+      out.push({
+        no: no,
+        name: GROUP_LETTERS[no - 1] + '组',
+        min: lim.min,
+        max: lim.max,
+        gives: list,
+      });
+    }
+    if (bucket.get(0)) {
+      out.push({ no: 0, name: GROUP_NONE_CN, min: null, max: null, gives: bucket.get(0) });
+    }
+    return out;
+  }
+
   function paintMeta() {
     const el = $(IDS.meta);
     if (!el) return;
@@ -649,6 +764,51 @@
       (state.err ? '<br><span style="color:#cf1322">' + esc(state.err) + '</span>' : '');
   }
 
+  /** 一个赠送包：包名 + 包内项目（每项一行，带原价） */
+  function giveHtml(g) {
+    const items = g.items.length
+      ? '<ol class="hlj-gc-items">' +
+        g.items
+          .map(
+            (it) =>
+              '<li>' + esc(it.name) +
+              (it.salePrice !== null && it.salePrice !== undefined
+                ? '<span class="hlj-gc-item-p">原价 ' + esc(fmtMoney(it.salePrice)) + '</span>'
+                : '') +
+              '</li>'
+          )
+          .join('') +
+        '</ol>'
+      : '<div style="color:#8c8c8c">（该赠送包里没有项目）</div>';
+    return (
+      '<div class="hlj-gc-give">' +
+      '<span class="hlj-gc-give-name">【赠送包】' + esc(g.name || g.code) + '</span>' +
+      items +
+      '</div>'
+    );
+  }
+
+  /** 一组：组头（组名 + 几选几）+ 该组下的赠送包 */
+  function groupHtml(gr) {
+    // 「未分组」不写约束 —— 它本来就不属于任何组，写「无约束数据」是噪音
+    const limit = gr.no === 0
+      ? ''
+      : (gr.min === null || gr.max === null
+        ? '<span class="hlj-gc-group-limit is-unknown">无约束数据</span>'
+        : '<span class="hlj-gc-group-limit">最少选' + esc(gr.min) + '个 最多选' + esc(gr.max) + '个</span>');
+    const warn = gr.no === 0 ? '<span class="hlj-gc-group-warn">页面不归此组</span>' : '';
+    return (
+      '<div class="hlj-gc-group">' +
+      '<div class="hlj-gc-group-head">' +
+      '<span class="hlj-gc-group-name">' + esc(gr.name) + '</span>' +
+      limit +
+      warn +
+      '</div>' +
+      gr.gives.map(giveHtml).join('') +
+      '</div>'
+    );
+  }
+
   function rowHtml(r) {
     const tags =
       '<span class="hlj-gc-tag t-' + esc(r.type) + '">' + esc(TYPE_CN[r.type] || r.type || '套餐') + '</span>' +
@@ -658,37 +818,24 @@
     if (r.custType) sub.push(CUST_CN[r.custType] || r.custType);
     if (r.code) sub.push(r.code);
 
-    const givesHtml = r.gives
-      .map((g) => {
-        const items = g.items.length
-          ? '<ol class="hlj-gc-items">' +
-            g.items
-              .map(
-                (it) =>
-                  '<li>' + esc(it.name) +
-                  (it.salePrice !== null && it.salePrice !== undefined
-                    ? '<span class="hlj-gc-item-p">原价 ' + esc(fmtMoney(it.salePrice)) + '</span>'
-                    : '') +
-                  '</li>'
-              )
-              .join('') +
-            '</ol>'
-          : '<div style="color:#8c8c8c">（该赠送包里没有项目）</div>';
-        return (
-          '<div class="hlj-gc-give">' +
-          '<span class="hlj-gc-give-name">【赠送包】' + esc(g.name || g.code) + '</span>' +
-          items +
-          '</div>'
-        );
-      })
-      .join('');
+    const prices =
+      '<span class="hlj-gc-prices">' +
+      '<span class="hlj-gc-p1">原价 <b>' + esc(fmtMoney(r.salePrice)) + '</b></span>' +
+      '<span class="hlj-gc-p2">成交价 <b>' + esc(fmtMoney(r.price)) + '</b></span>' +
+      '</span>';
+
+    const givesHtml = r.groups.map(groupHtml).join('');
 
     return `
       <tr class="${r.voided ? 'is-voided' : ''}">
-        <td class="hlj-gc-name">${tags}${esc(r.name)}<div class="hlj-gc-sub">${esc(sub.join(' · '))}</div></td>
-        <td class="hlj-gc-num">${esc(fmtMoney(r.salePrice))}</td>
-        <td class="hlj-gc-num">${esc(fmtMoney(r.price))}</td>
-        <td>${givesHtml}</td>
+        <td>
+          <div class="hlj-gc-head">
+            <span class="hlj-gc-head-main">${tags}${esc(r.name)}</span>
+            ${prices}
+            <span class="hlj-gc-sub">${esc(sub.join(' · '))}</span>
+          </div>
+          <div class="hlj-gc-gives">${givesHtml}</div>
+        </td>
       </tr>
     `;
   }
@@ -705,14 +852,10 @@
           '</div>';
       return;
     }
+    // ④ 单列 + 无表头（2026-09-29 红领巾定）：行内自解释，不需要「套餐 / 赠送项目」表头；
+    //    表头还存在的话反而会让人以为下面是两列对齐的。
     box.innerHTML =
       '<table class="hlj-gc-table">' +
-      '<thead><tr>' +
-      '<th style="width:27%">套餐名称</th>' +
-      '<th style="width:11%;text-align:right">原价(元)</th>' +
-      '<th style="width:11%;text-align:right">成交价(元)</th>' +
-      '<th>赠送项目</th>' +
-      '</tr></thead>' +
       '<tbody>' + state.rows.map(rowHtml).join('') + '</tbody>' +
       '</table>';
   }
@@ -827,6 +970,7 @@
           gives.push({
             code: a.package_code,
             name: d.package_name || a.package_name || '',
+            group: a.group, // 组号（1 基）；约束要去宿主套餐的 selectionSizeList[group-1] 取
             items: items,
           });
         });
@@ -845,7 +989,8 @@
           salePrice: host.sale_price, // 原价
           price: host.price, // 成交价
           voided: isVoid(host),
-          gives: gives,
+          // 组头要的是**宿主套餐自己**的约束（不是赠送包的）—— 见文件头接口第 ③ 条
+          groups: buildGroups(gives, host.selectionSizeList),
         });
       });
 
