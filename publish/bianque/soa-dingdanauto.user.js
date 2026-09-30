@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.14
-// @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理。
+// @version      2.15
+// @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
-// @grant        none
+// @grant        GM_setClipboard
 
 // @author       WanXin
 // @publishGroup bianque
@@ -25,7 +25,19 @@
  * - 合同阶段智能补全字段，并绑定共用文件（合同 / 无合同证明文件 / 授权书）按需上传。
  * - 关键动作执行后动态验证页面真实状态；长时间未推进时显示卡点诊断，不重复提交。
  * - 落单完成后自动复制订单名称、编号、商机代码、健管顾问、落单时间。
+ * - 面板提供“重新复制”按钮：随时重新获取最新落单数据并复制，无需切到体检数据模块。
  * - 面板支持显示开关、拖动、折叠、位置记忆和网页提示记录。
+ *
+ * 关于剪贴板写入（v2.15 起）：
+ * - 原实现走 navigator.clipboard.writeText / document.execCommand("copy")，
+ *   两者都要求“调用它的文档处于聚焦状态”—— 浏览器窗口一切走就报
+ *   “Document is not focused”，自动复制必然失败（自动流程跑完时人多半已切去别处）。
+ * - 现改为优先调用 GM_setClipboard：它由油猴扩展自己的内容脚本执行，
+ *   而扩展持有 clipboardWrite 权限，Chrome 对该上下文豁免焦点要求。
+ *   本机实测（TM 5.5.0 + Chrome）：窗口失焦时 execCommand 写法 4/4 全部写入成功，
+ *   同一段代码在没有该权限的扩展世界里则失败 —— 变量是权限，不是写法。
+ * - 因此必须 @grant（见元数据块）。@grant none 会让脚本运行在页面世界，
+ *   只能拿到页面身份，拿不到扩展权限。
  */
 
 (function () {
@@ -104,6 +116,12 @@
       15000,
     LANDING_COPY_TIMEOUT:
       30000,
+    /*
+     * 面板“重新复制”是人工触发，等不起 30 秒：
+     * 订单早已落单时日志里一定有记录，第一次轮询就能拿到。
+     */
+    MANUAL_RECOPY_TIMEOUT:
+      8000,
     LANDING_COPY_POLL_INTERVAL:
       900,
 
@@ -250,7 +268,9 @@
       "__soa_flow_exam_date_fix_button_v110",
 
     CONTRACT_ONLY_BUTTON_ID:
-      "__soa_flow_contract_only_button_v214"
+      "__soa_flow_contract_only_button_v214",
+    RECOPY_BUTTON_ID:
+      "__soa_flow_recopy_button_v215"
   };
 
   let boundFileHandle = null;
@@ -270,6 +290,12 @@
    * 这个标志只用于按钮文案/显隐，避免主按钮被当成合同任务的开关）。
    */
   let contractOnlyRunning = false;
+
+  /*
+   * 「重新复制落单数据」是否正在运行。
+   * 同样是互斥标志：只影响该按钮的文案与显隐，不参与主流程状态机。
+   */
+  let recopyRunning = false;
 
   let panelVisible = false;
 
@@ -537,7 +563,7 @@
     }
 
     try {
-      await navigator.clipboard.writeText(
+      await copyTextToClipboard(
         text
       );
 
@@ -548,6 +574,10 @@
 
       return true;
     } catch (_) {
+      /*
+       * 统一入口失败时退回“选中记录框内容”的最后手段，
+       * 供人工在窗口聚焦的情况下自行复制。
+       */
       const list =
         document.getElementById(
           UI.WEB_NOTICE_LIST_ID
@@ -560,22 +590,6 @@
       ) {
         list.focus();
         list.select();
-
-        try {
-          const ok =
-            document.execCommand(
-              "copy"
-            );
-
-          if (ok) {
-            updatePanelStatus(
-              "✓ 网页提示已复制到剪贴板",
-              "success"
-            );
-
-            return true;
-          }
-        } catch (_) {}
       }
 
       updatePanelStatus(
@@ -6408,16 +6422,57 @@
     );
   }
 
-  async function copyTextToClipboard(
-    text
-  ) {
+  /*
+   * 剪贴板写入统一入口（v2.15）。
+   *
+   * 通道优先级：
+   *   1. GM_setClipboard —— 由油猴扩展自己的内容脚本执行，扩展持有
+   *      clipboardWrite 权限，Chrome 对该上下文豁免“文档必须聚焦”的限制，
+   *      因此**窗口失焦时也能写入**。自动化跑完时人多半已切去别处，
+   *      这是唯一可用通道。
+   *   2. navigator.clipboard.writeText —— 需要文档聚焦，留给扩展 API 不可用时兜底。
+   *   3. document.execCommand("copy") —— 同样需要文档聚焦，失焦时返回 false。
+   *
+   * 注意：GM_setClipboard 是“发消息给内容脚本后写入”的异步过程，
+   * 且不回传失败原因，这里无法回读校验；面板的“重新复制”按钮
+   * 就是为这种情况准备的人工兜底入口。
+   */
+  async function copyTextToClipboard(text) {
+    const value =
+      String(text ?? "");
+
+    if (!value) {
+      throw new Error(
+        "没有可复制的内容"
+      );
+    }
+
+    if (
+      typeof GM_setClipboard ===
+      "function"
+    ) {
+      try {
+        GM_setClipboard(
+          value,
+          "text"
+        );
+
+        return true;
+      } catch (error) {
+        console.warn(
+          "[SOA智能审批] GM_setClipboard 写入失败，改用原生通道：",
+          error
+        );
+      }
+    }
+
     if (
       navigator.clipboard &&
       window.isSecureContext
     ) {
       try {
         await navigator.clipboard
-          .writeText(text);
+          .writeText(value);
 
         return true;
       } catch (_) {
@@ -6431,7 +6486,7 @@
       );
 
     textarea.value =
-      text;
+      value;
 
     textarea.style.position =
       "fixed";
@@ -6456,7 +6511,7 @@
 
     if (!ok) {
       throw new Error(
-        "浏览器未允许自动复制，可打开“体检数据”模块手动复制"
+        "浏览器未允许自动复制；请点击面板上的“重新复制”按钮重试"
       );
     }
 
@@ -6465,8 +6520,19 @@
 
   async function waitForLatestLandingRecordAfterFlow(
     flowStartedAt,
-    token = null
+    token = null,
+    options = {}
   ) {
+    /*
+     * timeout：等待上限。自动流程用 CONFIG 常量；
+     *          面板“重新复制”是人工触发，用更短的超时，避免干等。
+     * quiet：  人工触发时不必反复刷“等待落单日志”的提示。
+     */
+    const {
+      timeout = CONFIG.LANDING_COPY_TIMEOUT,
+      quiet = false
+    } = options;
+
     const startedAt =
       Date.now();
 
@@ -6478,7 +6544,7 @@
     while (
       Date.now() -
         startedAt <
-      CONFIG.LANDING_COPY_TIMEOUT
+      timeout
     ) {
       throwIfFlowCancelled(
         token
@@ -6531,15 +6597,17 @@
           error;
       }
 
-      updatePanelStatus(
-        lastSeen
-          ? `订单已落单，等待本次最新落单日志刷新；当前最新记录：${lastSeen.latest.time}`
-          : "订单已落单，正在等待落单日志生成后自动复制数据...",
-        "normal",
-        {
-          persistent: true
-        }
-      );
+      if (!quiet) {
+        updatePanelStatus(
+          lastSeen
+            ? `订单已落单，等待本次最新落单日志刷新；当前最新记录：${lastSeen.latest.time}`
+            : "订单已落单，正在等待落单日志生成后自动复制数据...",
+          "normal",
+          {
+            persistent: true
+          }
+        );
+      }
 
       await sleep(
         interval
@@ -6552,6 +6620,11 @@
         );
     }
 
+    const timeoutSeconds =
+      Math.round(
+        timeout / 1000
+      );
+
     if (lastError) {
       throw new Error(
         `订单已完成，但读取最新落单日志失败：${lastError?.message || lastError}`
@@ -6560,25 +6633,33 @@
 
     if (lastSeen) {
       throw new Error(
-        `订单已完成，但30秒内未确认本次最新落单记录；当前日志最新时间为 ${lastSeen.latest.time}`
+        `订单已完成，但${timeoutSeconds}秒内未确认本次最新落单记录；当前日志最新时间为 ${lastSeen.latest.time}`
       );
     }
 
     throw new Error(
-      "订单已完成，但30秒内未读取到落单记录"
+      `订单已完成，但${timeoutSeconds}秒内未读取到落单记录`
     );
   }
 
   async function copyLandingDataAfterFlow(
     {
       flowStartedAt,
-      token = null
+      token = null,
+      manual = false
     }
   ) {
     const result =
       await waitForLatestLandingRecordAfterFlow(
         flowStartedAt,
-        token
+        token,
+        manual
+          ? {
+              timeout:
+                CONFIG.MANUAL_RECOPY_TIMEOUT,
+              quiet: true
+            }
+          : {}
       );
 
     const latest =
@@ -7047,6 +7128,10 @@
     );
 
     updateContractOnlyButton(
+      stage
+    );
+
+    updateRecopyButton(
       stage
     );
 
@@ -9008,7 +9093,7 @@
               );
 
               updatePanelStatus(
-                `✓ 订单流程已完成，但自动复制落单数据失败：${error?.message || error}。可打开“体检数据”模块手动复制。`,
+                `✓ 订单流程已完成，但自动复制落单数据失败：${error?.message || error}。可点面板上的“重新复制”按钮重试。`,
                 "error",
                 {
                   persistent: true
@@ -9337,6 +9422,121 @@
    * 不点击“发起落单”⇒ 不会推进流程，随时可以单独跑。
    * 显示范围与可处理阶段一致（AUTO_PROCESS_STAGES）。
    */
+  /*
+   * 「重新复制落单数据」按钮（v2.15）。
+   *
+   * 存在意义：
+   *   GM_setClipboard 是“发消息给内容脚本后写入”的异步过程，且不回传失败原因，
+   *   脚本无法回读校验是否真的写进剪贴板。万一没写进去，
+   *   用户不必再切到“体检数据”模块重新找一遍 —— 在本面板点一下即可。
+   *
+   * 显隐范围：仅在“已落单”阶段显示（其他阶段没有落单数据可复制）。
+   */
+  function updateRecopyButton(
+    stage =
+      getCurrentFlowStage()
+  ) {
+    const button =
+      document.getElementById(
+        UI.RECOPY_BUTTON_ID
+      );
+
+    if (!button) {
+      return;
+    }
+
+    if (recopyRunning) {
+      button.style.display =
+        "inline-flex";
+
+      button.disabled =
+        true;
+
+      button.textContent =
+        "复制中...";
+
+      return;
+    }
+
+    const shouldShow =
+      !processRunning &&
+      stage === "已落单";
+
+    button.style.display =
+      shouldShow
+        ? "inline-flex"
+        : "none";
+
+    button.disabled =
+      false;
+
+    button.textContent =
+      "重新复制";
+  }
+
+  async function recopyLandingDataManually() {
+    if (recopyRunning) {
+      return;
+    }
+
+    if (processRunning) {
+      updatePanelStatus(
+        "自动流程正在运行，请等流程结束后再重新复制落单数据。",
+        "error"
+      );
+
+      return;
+    }
+
+    recopyRunning =
+      true;
+
+    updateRecopyButton();
+
+    try {
+      /*
+       * flowStartedAt 传 0：手动重试的语义是“取当前最新落单记录”，
+       * 不做“只接受本次流程之后产生”的时间过滤。
+       */
+      const copied =
+        await copyLandingDataAfterFlow({
+          flowStartedAt: 0,
+          manual: true
+        });
+
+      updatePanelStatus(
+        `✓ 已重新复制“${copied.label}”落单数据，可直接粘贴到表格。`,
+        "success",
+        {
+          persistent: true
+        }
+      );
+
+      console.log(
+        "[SOA智能审批] 手动重新复制落单数据：",
+        copied
+      );
+    } catch (error) {
+      console.error(
+        "[SOA智能审批] 手动重新复制落单数据失败：",
+        error
+      );
+
+      updatePanelStatus(
+        `重新复制落单数据失败：${error?.message || error}`,
+        "error",
+        {
+          persistent: true
+        }
+      );
+    } finally {
+      recopyRunning =
+        false;
+
+      updateRecopyButton();
+    }
+  }
+
   function updateContractOnlyButton(
     stage =
       getCurrentFlowStage()
@@ -9937,7 +10137,7 @@
 
           <div style="margin-bottom:3px;">
             <strong style="color:#444;">流程：</strong>
-            报价确认及后续支持阶段可执行；报价确认自动提交内勤落单（独家固定选“是”），合同阶段严格复核，其余阶段动态等待页面推进；已落单后自动复制落单数据。
+            报价确认及后续支持阶段可执行；报价确认自动提交内勤落单（独家固定选“是”），合同阶段严格复核，其余阶段动态等待页面推进；已落单后自动复制落单数据，复制不成功时可点“重新复制”。
           </div>
 
           <div style="margin-bottom:3px;">
@@ -10375,6 +10575,30 @@
               "
             >
               修改时间
+            </button>
+
+            <button
+              id="${UI.RECOPY_BUTTON_ID}"
+              type="button"
+              style="
+                display:none;
+                flex:0 0 auto;
+                align-items:center;
+                justify-content:center;
+                height:24px;
+                padding:0 8px;
+                border:1px solid #389e0d;
+                border-radius:5px;
+                background:#fff;
+                color:#389e0d;
+                font-size:11px;
+                font-weight:600;
+                cursor:pointer;
+                white-space:nowrap;
+              "
+              title="重新获取最新落单记录并复制到剪贴板（自动复制失败或想再复制一次时用）"
+            >
+              重新复制
             </button>
           </div>
 
@@ -10844,6 +11068,28 @@
 
               console.error(
                 "[SOA流程自动化] 修改体检时间失败：",
+                error
+              );
+            });
+        }
+      );
+
+    document
+      .getElementById(
+        UI.RECOPY_BUTTON_ID
+      )
+      ?.addEventListener(
+        "click",
+        () => {
+          recopyLandingDataManually()
+            .catch(error => {
+              warn(
+                error?.message ||
+                String(error)
+              );
+
+              console.error(
+                "[SOA流程自动化] 重新复制落单数据失败：",
                 error
               );
             });

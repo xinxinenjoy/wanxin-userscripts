@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.21
+// @version      6.22
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -59,6 +59,16 @@ const COLUMN_LAYOUT = [
   };
 
   const WIDTH_STEP = 60;
+
+  /* 「发票金额」列宽自适应。
+     合并开票来的记录，站点会在金额格里多挂一个自己的标签（<span class="ant-tag">合</span>），
+     而这一列原本写死 80px（去掉左右 padding 只剩 64px），实测内容要 88.7px
+     —— 装不下就被 flex 挤在一起。表头 / 表体是两张独立 table，纯 CSS 取不到
+     彼此的宽度，只能先量出来、再同时写给两边。 */
+  const AMOUNT_COLUMN_HEADER = "发票金额";
+  const AMOUNT_COLUMN_MIN = 80;
+  const AMOUNT_COLUMN_MAX = 240;
+
   const TABLE_MARKER = "data-tm-invoice-table";
   const TABLE_SELECTOR = `.ant-table[${TABLE_MARKER}="1"]`;
   const LIST_CONTAINER_SELECTOR = ".mergeinvoice_container";
@@ -75,6 +85,7 @@ const COLUMN_LAYOUT = [
   /******************** 2) 状态 ********************/
   let enabled = false;
   let customerWidthDelta = 0;
+  let amountColumnWidth = AMOUNT_COLUMN_MIN;
   let lastPageKey = null;
   let lastHeaderSignature = "";
 
@@ -164,8 +175,66 @@ const COLUMN_LAYOUT = [
   }
 
   function getColumnWidth(column) {
+    if (column.header === AMOUNT_COLUMN_HEADER) return amountColumnWidth;
+
     const delta = column.adjustable ? customerWidthDelta : 0;
     return Math.max(80, column.width + delta);
+  }
+
+  /* 量「发票金额」列实际需要多宽：逐行取该格内容的宽度（含站点自己挂的
+     「合」标签），取最大值再加单元格内边距，夹在 [80, 240] 之间。
+
+     ⚠️ 量的是格内元素自身的 min-content 宽度 —— 它不随当前列宽变化，
+     所以这个函数可以重复调用而不产生抖动。 */
+  function measureAmountColumnWidth(headerIndexMap) {
+    if (!observedTableRoot) return AMOUNT_COLUMN_MIN;
+
+    const index = headerIndexMap.get(AMOUNT_COLUMN_HEADER);
+    if (index === undefined) return AMOUNT_COLUMN_MIN;
+
+    let widest = 0;
+    let padding = 0;
+
+    for (const tr of getBodyRows(observedTableRoot)) {
+      const td = tr.children[index];
+      if (!td) continue;
+
+      if (!padding) {
+        const style = getComputedStyle(td);
+        padding =
+          (parseFloat(style.paddingLeft) || 0) +
+          (parseFloat(style.paddingRight) || 0);
+      }
+
+      let content = 0;
+
+      td.childNodes.forEach((node) => {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          content += node.getBoundingClientRect().width;
+        } else if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          content += range.getBoundingClientRect().width;
+        }
+      });
+
+      if (content > widest) widest = content;
+    }
+
+    if (!widest) return AMOUNT_COLUMN_MIN;
+
+    return Math.min(
+      AMOUNT_COLUMN_MAX,
+      Math.max(AMOUNT_COLUMN_MIN, Math.ceil(widest + padding))
+    );
+  }
+
+  function syncAmountColumnWidth(headerIndexMap) {
+    const next = measureAmountColumnWidth(headerIndexMap);
+    if (next === amountColumnWidth) return false;
+
+    amountColumnWidth = next;
+    return true;
   }
 
   function getAdjustableColumn() {
@@ -332,6 +401,29 @@ const COLUMN_LAYOUT = [
   function removeAmountSeparators(raw) {
     const cleaned = normText(raw).replace(/,/g, "");
     return cleaned || raw;
+  }
+
+  /* 金额格去千分位逗号。
+     ⚠️ 不能走 setCellTextKeepStructure —— 它是「首节点写整串、其余文本节点清空」，
+     而金额格里还挂着站点自己的「合」标签（合并开票来的记录），标签里的字会被一起
+     清空，只剩一个空标签（2026-09-30 实测：21,635合 → 21635合 + 空 ant-tag）。
+     这里只动数字所在的文本节点，标签内部一律不碰，结构也不重建。 */
+  function cleanAmountCell(cell) {
+    const rawAmount = getCellFullText(cell);
+    if (removeAmountSeparators(rawAmount) === rawAmount) return;
+
+    const tagRoot = cell.querySelector(".ant-tag");
+    const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (tagRoot && tagRoot.contains(node)) continue;
+
+      const value = node.nodeValue || "";
+      if (!value.includes(",")) continue;
+
+      node.nodeValue = value.replace(/,/g, "");
+    }
   }
 
   /******************** 6) CSS：列重排 + 宽度 + 对齐 ********************/
@@ -642,11 +734,7 @@ const COLUMN_LAYOUT = [
       cells[amountIdx] &&
       !cells[amountIdx].querySelector("a,button")
     ) {
-      const rawAmount = getCellFullText(cells[amountIdx]);
-      const cleanedAmount = removeAmountSeparators(rawAmount);
-      if (cleanedAmount !== rawAmount) {
-        setCellTextKeepStructure(cells[amountIdx], cleanedAmount);
-      }
+      cleanAmountCell(cells[amountIdx]);
     }
 
     if (statusIdx === undefined || !cells[statusIdx]) return;
@@ -1010,6 +1098,15 @@ const COLUMN_LAYOUT = [
 
       ensureUiButton();
       processRowsIncremental(observedTableRoot);
+
+      // 金额列宽跟着内容走：量宽放在行处理之后，这样量到的是去过千分位逗号的
+      // 干净内容；翻页 / 数据刷新后最长的那条金额可能就变了。
+      if (
+        observedTableRoot &&
+        syncAmountColumnWidth(getHeaderIndexMap(observedTableRoot))
+      ) {
+        applyOrUpdateStyle(headerSignature);
+      }
     });
   }
 
@@ -1259,6 +1356,17 @@ const COLUMN_LAYOUT = [
     ensureUiButton();
     if (observedTableRoot) applyOrUpdateStyle();
     processRowsIncremental(observedTableRoot);
+
+    // ⚠️ 量宽这里同步做一次，不能只放在 scheduleWork 的 rAF 里：
+    // 标签页在后台时 requestAnimationFrame 不触发（实测：后台标签注入后
+    // 列宽一直停在 80，就是卡在这一步）。
+    if (
+      observedTableRoot &&
+      syncAmountColumnWidth(getHeaderIndexMap(observedTableRoot))
+    ) {
+      applyOrUpdateStyle();
+    }
+
     scheduleWork(false);
   }
 
