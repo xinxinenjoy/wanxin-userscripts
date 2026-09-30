@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.9套餐加项核对
 // @namespace    https://tampermonkey.net/
-// @version      1.6.0
-// @description  SOA 订单页：核对「套餐 ↔ 绑定的赠送包 ↔ 包内项目」。只看赠送包(GIVEPKG)、不看加项包；按组展示、组头标注该组「几选几」（最少选N个/最多选N个）；每行 = 套餐信息头（套餐名 · 原价 · 成交价 · 客户类型/编码，横排一行）+ 赠送区（包内项目按纵向两列排）。纯只读，不发起任何写请求。
+// @version      1.9.0
+// @description  SOA 订单页：核对「套餐 ↔ 绑定的赠送包 ↔ 包内项目」。只看赠送包(GIVEPKG)、不看加项包；按组展示、组头标注该组「几选几」（最少选N个/最多选N个）；每条套餐 = 一张独立卡片（序号 + 套餐信息头 + 赠送区），长套餐名/包名的共同前缀提到顶部只说一次；包内项目**一列**竖排、**包与包之间两列并排**；面板支持 **ESC 关闭**。纯只读，不发起任何写请求。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -106,6 +106,53 @@
  *   包内项目在页面上要点开弹窗才看得到，且一次只能看一个；接口单次约 300ms，
  *   套餐再多也能并发拉完。前端改版也不会把脚本改挂。
  *   ⛔ 本脚本**只发 query / detail 两个读接口**，不调用任何写接口（delete / update / relation 都不碰）。
+ *
+ * ── v1.7.0：把「一团乱麻」改成「一条一条」（红领巾 2026-09-30）──
+ *   红领巾原话：「昨天最后这个改动虽然把布局的问题解决了，可是这样看着没有终点，一团乱麻的感觉」。
+ *   真机实测（订单 SOA37906452851870365）把「乱」拆成三个可量化的原因：
+ *     ① **没边界** —— 行与行之间唯一的分隔是 3px `#f0f0f0`，对比度 ≈1.14:1
+ *        （WCAG 非文本对比下限是 3:1）⇒ 白底上肉眼几乎看不见，两行像糊在一起。
+ *     ② **没层级** —— 一条套餐纵向堆 6 段（头-名行 / 价格行 / 副信息 / 组头 / 赠送包名 / 项目块），
+ *        实测段高 18 / 19 / 18 / 18 / 18 / 21 px —— **全是同一档视觉重量**，像斑马纹。
+ *     ③ **文字没去重** —— 套餐名 46 字、赠送包名 48 字，而两者的**公共前缀是 45 字**
+ *        ⇒ 重复率 97.8%；同一订单里这串「产品族名」逐字相同，却每条都重写一遍。
+ *   ⇒ 对应三处改法（⛔ 别只改一两处，三个是配套的）：
+ *     · ①→ 每条套餐 = **一张卡片**（1px 边框 + 10px 圆角 + 12px 卡距 + 左侧 3px 琥珀竖条）；
+ *          用 `border-collapse: separate` + `border-spacing: 0 12px` 让 <td> 变成卡片，
+ *          **保留 table/tbody/tr/单 td 结构**（归档验证套件的选择器不用重写）。
+ *     · ②→ 行首加**序号圆牌**（位置锚点）+ 赠送包用**左侧绿色竖线做缩进**（层级）。
+ *     · ③→ 套餐名的共同前缀（≥12 字才认）**提到 meta 顶部只说一次**，行内只留差异段；
+ *          赠送包名与套餐名共有的那截同样不再重复，只显示「赠送包 · N 个项目」。
+ *   效果：单条行高 143px → 约 92px，一屏能多看好几条，且每条有明确的起止。
+ *   ⚠️ 差异段可能很短（本例只剩「男」/「女已婚」）—— 这是**对的**，因为族名已在顶部给出；
+ *     行内真正的身份靠「价格 + PKG 编码」，鼠标悬停套餐名可看全名（title）。
+ *
+ * ── v1.8.0：包内**一列**、包与包**两列并排**（红领巾 2026-09-30）──
+ *   红领巾原话：「同一个加项包的项目不要分两列，因为还会出现一个包里有好几个项目的情况，
+ *   两列不容易分辨。优先按照一列，为了美观可以让不同组的再进行双列排开，确保页面的规整」。
+ *   ⚠️ 动手前先量了数据，发现「组」有歧义，已回问确认 ⇒ **双列落在「赠送包」这一层**：
+ *     订单 SOA37906452851870365：2 条套餐 / 每条 **1 个组(A组)** / 1 个包 / 包内 2 项；
+ *     订单 SOA37906492773140442：4 条套餐 / 每条 **1 个组(A组)** / **4 个包** / 每包 2 项。
+ *     ⇒ 每条套餐都**只有 1 个组**，按「页面的组」并排不生效；真正的重复单位是**赠送包**。
+ *   改法（两层，别只改一层）：
+ *     · 包内：`.hlj-gc-items` 去掉 `columns: 2` → 一列竖排（红领巾的原始诉求）。
+ *     · 包间：组内 ≥2 个包时加 `is-pack2` → `grid` 两列（4 个包排成 2×2）。
+ *       用 **grid 不用 columns**：grid 同行等高（两条绿竖线一样长，像表格）；
+ *       columns 会把一个包**拆到两列之间**（包是多行块，必然被劈开）。
+ *   ⚠️ 包内一列 ⇒ 高度 ↑；包间两列 ⇒ 高度又降回来，且宽度用满（原来右侧空一截）。
+ *   ⚠️ 只有 1 个包时**不加** `is-pack2`（否则包只占半宽，右半空着，反而更乱）。
+ *
+ * ── v1.9.0：面板支持 **ESC 关闭**（红领巾 2026-09-30）──
+ *   四条约定（⛔ 别只留第一条，后三条才是它不惹祸的原因）：
+ *     ① 监听挂在 **document 的捕获阶段**：页面自己也在 document/window 上听键盘，
+ *        捕获阶段先拿到才抢得在前（`{capture:true}`）。
+ *     ② **面板没开就立即 return** —— 一个字节都不干预页面自己的 ESC，
+ *        否则会把页面弹窗/抽屉的 ESC 也吞掉。
+ *     ③ 面板开着时 `preventDefault + stopPropagation` —— 一次 ESC **只关这一层**；
+ *        不挡的话页面会同时关掉它自己的浮层，一下少两层、用户找不回来。
+ *     ④ 用**计算后的 display** 判可见（`getComputedStyle`），别用 `style.display`：
+ *        面板首次创建时 inline style 是空的、可见性来自 CSS，拿 inline 判会误判成「已关」。
+ *   ⚠️ 面板里没有输入控件（开关在页面上，面板内只有按钮）⇒ 不用避让「输入框内 ESC」。
  */
 
 (function () {
@@ -128,7 +175,7 @@
     body: `${NS}_body`,
     footer: `${NS}_footer`,
   };
-  const VERSION = '1.6.0';
+  const VERSION = '1.9.0';
   const SWITCH_LABEL = '加项包核对';
   const POS_KEY = `${NS}_pos`;
 
@@ -264,6 +311,7 @@
     bindTotal: 0, // 本订单绑定的包总数（去重后）
     giveTotal: 0, // 其中赠送包数
     itemTotal: 0, // 赠送包内项目总数
+    commonPrefix: '', // v1.7.0：所有套餐名的**共同前缀** —— 提到顶部只显示一次，行内不再重复
     detailCache: new Map(), // package_code -> detail.data（null = 查询失败）
     err: '',
   };
@@ -273,6 +321,7 @@
     state.bindTotal = 0;
     state.giveTotal = 0;
     state.itemTotal = 0;
+    state.commonPrefix = '';
     state.detailCache = new Map();
     state.err = '';
   }
@@ -403,30 +452,50 @@
         background: #e6f4ff; color: #0958d9; margin-left: 4px;
       }
       #${IDS.meta} .hlj-gc-stat b { color: #0958d9; }
+      /* v1.7.0：把「所有套餐名的共同前缀」提到这里只显示一次，行内不再重复那 45 字。
+       * ⚠️ 保持内联（别写成 block / <details>）—— #meta 是行内流，块级子元素会多出空行盒。 */
+      #${IDS.meta} .hlj-gc-common { color: #8c8c8c; overflow-wrap: anywhere; }
 
-      /* ---------- 表格 ---------- */
+      /* ---------- 列表：每条套餐 = 一张卡片 ----------
+       * v1.7.0（2026-09-30，红领巾：「看着没有终点，一团乱麻」）。乱因与实测数字见文件头。
+       * 关键手法：border-collapse 用 separate（不是 collapse）、border-spacing 用 "0 12px"，
+       * 让每个 <td> 自己变成一个圆角盒子 —— 卡距、圆角全靠它俩。
+       * ⛔ 别再退回 collapse：那样 td 的圆角与卡距全部失效，
+       *   又会回到「只有一条 3px #f0f0f0 分界」的状态（对比度 1.14:1，看不见）。
+       * ⚠️ 卡距由 border-spacing 提供，所以 #body 的上下 padding 给 0（否则顶部会多出 23px）。
+       * 🔴 本段在**模板字符串**里 ⇒ 注释内⛔不许出现反引号（会当场截断整段 CSS，踩过多次）。 */
       #${IDS.body} {
         flex: 1;
         overflow: auto;
         min-height: 140px;
+        padding: 0 12px;
       }
       .hlj-gc-table {
         width: 100%;
-        border-collapse: collapse;
+        border-collapse: separate;
+        border-spacing: 0 12px;
         font-size: 12.5px;
       }
-      /* ⚠️ 没有 thead —— 行内自解释（第四轮改，见下）。 */
+      /* ⚠️ 没有 thead —— 行内自解释。 */
       .hlj-gc-table tbody td {
-        padding: 9px 11px 11px;
-        border-bottom: 0;
+        padding: 9px 12px 11px 13px;
+        background: #fff;
+        border: 1px solid #e8e8e8;
+        border-left: 3px solid #ef9f27; /* 左侧琥珀竖条 = 卡片的「起点」 */
+        border-radius: 10px;
         line-height: 1.55;
         word-break: break-all;
       }
-      /* 行与行之间用一条**留白带**分隔（比 1px 细线更清楚「哪条是哪条」） */
-      .hlj-gc-table tbody tr + tr td { border-top: 3px solid #f0f0f0; }
-      .hlj-gc-table tbody tr:hover { background: #fafafa; }
-      .hlj-gc-table tbody tr.is-voided { background: #f7f7f7; }
-      .hlj-gc-table tbody tr.is-voided td { color: #8c8c8c; }
+      .hlj-gc-table tbody tr:hover td { background: #fafafa; }
+      .hlj-gc-table tbody tr.is-voided td { background: #f7f7f7; color: #8c8c8c; }
+      /* 序号圆牌：给每张卡片一个位置锚点（红领巾 2026-09-30：要「有终点」） */
+      .hlj-gc-no {
+        flex: 0 0 auto; align-self: center;
+        display: inline-block; width: 18px; height: 18px;
+        line-height: 18px; text-align: center;
+        border-radius: 50%; background: #faeeda; color: #633806;
+        font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums;
+      }
 
       /* ── 行头：套餐信息横排一行 ────────────────────────────────────────
        * 第四轮改（2026-09-29，红领巾：「左侧列数据少，在右侧包较多时会有大量空白」）。
@@ -435,8 +504,8 @@
        * 改成「套餐信息一行做头 + 赠送区全宽」后空白归零，行高 315 → 272。
        * ⚠️ 别再退回两列：列宽解决的是**横向**，这个问题是**纵向**的，两回事。 */
       .hlj-gc-head {
-        display: flex; align-items: baseline; gap: 6px 16px; flex-wrap: wrap;
-        padding-bottom: 6px; border-bottom: 1px solid #f0f0f0;
+        display: flex; align-items: baseline; gap: 5px 14px; flex-wrap: wrap;
+        padding-bottom: 7px; border-bottom: 1px dashed #f0f0f0;
       }
       /* 套餐名不硬断（break-all 会把它从任意字拆开），只在真放不下时才折 */
       .hlj-gc-head-main { font-weight: 500; font-size: 13px; word-break: normal; overflow-wrap: anywhere; }
@@ -450,7 +519,7 @@
       .hlj-gc-p1 b { color: #595959; }
       .hlj-gc-p2 b { color: #d46b08; }
       .hlj-gc-sub { color: #8c8c8c; font-size: 11.5px; }
-      .hlj-gc-gives { margin-top: 7px; }
+      .hlj-gc-gives { margin-top: 8px; }
       .hlj-gc-tag {
         display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 11px;
         line-height: 16px; margin-right: 5px; vertical-align: 1px;
@@ -482,25 +551,45 @@
         border-bottom: 1px dashed #ffa39e; cursor: help;
       }
 
-      /* 赠送项目：组内按赠送包分组，包名做小标题，项目用有序列表（每个项目独占一行） */
+      /* 赠送项目：组内按赠送包分组，包名做小标题，项目用有序列表（每个项目独占一行）
+       * v1.7.0：给赠送包加**左侧绿色竖线 + 缩进** —— 层级靠空间表达，不再只靠颜色。
+       * 组头（0 级）→ 赠送包（+9px 缩进、绿线）→ 项目（再 +18px 列表缩进），形成阶梯。 */
+      .hlj-gc-give { padding-left: 9px; border-left: 2px solid #c0dd97; }
       .hlj-gc-give + .hlj-gc-give { margin-top: 6px; padding-top: 6px; border-top: 1px dashed #f0f0f0; }
       .hlj-gc-give-name {
         display: block;
-        color: #389e0d;
+        color: #3b6d11;
         font-size: 11.5px;
         margin-bottom: 2px;
       }
-      /* 项目名按**纵向两列**排 —— columns 是纵向流向（左列排满再到右列），阅读顺序
-       * 1,2 / 3,4 保持自上而下。⚠️ 别换成 grid：grid 是横向铺，序号会变成 1,3 / 2,4。
-       * 两列各约 321px，实测最长项目名（含「原价 498.8」小字）= 296px，余量 25px。 */
+
+      /* v1.8.0：**包与包并排** —— 一个组里有 ≥2 个赠送包时列成 2 列（4 个包 → 2×2）。
+       * 为什么：包内改成一列后高度 ↑，包间并排把宽度用满、高度又降回来（原来右侧空一截）。
+       * ⚠️ 用 grid，不用 columns：grid **同行等高**（两条绿竖线一样长，像表格）；
+       *    columns 会把一个多行包**从中间劈开**分到两列。
+       * ⚠️ 只有 1 个包时不给 is-pack2（否则包只占半宽、右半空着，更乱）。
+       * ⚠️ 行距由 grid 的 row-gap 出，所以并排时**必须**清掉「兄弟包上虚线 + margin」——
+       *    否则同一行右边那个包会凭空低 8px（它是第 2 个兄弟，会命中 + 选择器）。 */
+      .hlj-gc-group.is-pack2 {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        column-gap: 18px;
+        row-gap: 8px;
+      }
+      .hlj-gc-group.is-pack2 > .hlj-gc-group-head { grid-column: 1 / -1; }
+      .hlj-gc-group.is-pack2 .hlj-gc-give + .hlj-gc-give {
+        margin-top: 0; padding-top: 0; border-top: 0;
+      }
+      /* v1.8.0：包内项目**一列**竖排（红领巾 2026-09-30：「一个包里有好几个项目时，
+       * 两列不容易分辨」）。宽度交给**包与包并排**去用（见 .hlj-gc-group.is-pack2）。
+       * ⚠️ 别再加回 columns —— 项目一多，左右两列看不出哪一项属于哪个包。
+       * 宽度实测：最长项目文字 268px + 列表缩进 18px = 286px，并排时单列可用 322px ⇒ 余量 36px。 */
       .hlj-gc-items {
         margin: 0;
         padding-left: 18px;
         color: #262626;
-        columns: 2;
-        column-gap: 20px;
       }
-      .hlj-gc-items li { margin: 1px 0; break-inside: avoid; }
+      .hlj-gc-items li { margin: 1px 0; }
       .hlj-gc-items .hlj-gc-item-p {
         color: #bfbfbf;
         font-size: 11px;
@@ -593,7 +682,7 @@
       <div id="${IDS.head}">
         <span id="${IDS.title}">套餐加项包核对</span>
         <span class="hlj-gc-spacer"></span>
-        <button id="${IDS.close}" type="button" title="关闭">×</button>
+        <button id="${IDS.close}" type="button" title="关闭（ESC）">×</button>
       </div>
       <div id="${IDS.meta}">正在读取…</div>
       <div id="${IDS.body}"></div>
@@ -605,6 +694,7 @@
     document.body.appendChild(p);
 
     $(IDS.close).addEventListener('click', closePanel);
+    bindEscClose();
     p.querySelector(`#${IDS.footer}`).addEventListener('click', (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
@@ -690,10 +780,36 @@
     if (sw) sw.classList.remove('is-active');
   }
 
-  function togglePanel() {
+  /** 面板是否**真的可见** —— 必须看**计算后**的 display。
+   *  ⚠️ 别用 `p.style.display`：面板首次创建时 inline style 是空的、可见性来自 CSS 的
+   *     `display:flex` ⇒ 拿 inline 判会把「刚打开」误判成「已关闭」（ESC 就不会关它）。 */
+  function isPanelOpen() {
     const p = $(IDS.panel);
-    if (p && p.style.display !== 'none') closePanel();
+    return !!p && getComputedStyle(p).display !== 'none';
+  }
+
+  function togglePanel() {
+    if (isPanelOpen()) closePanel();
     else openPanel();
+  }
+
+  let escBound = false;
+
+  /** v1.9.0：**ESC 关闭面板**（红领巾 2026-09-30）。四条约定见文件头「v1.9.0」。 */
+  function bindEscClose() {
+    if (escBound) return; // 幂等：boot 会被 SPA 路由/hashchange 触发多次，别重复挂
+    escBound = true;
+    document.addEventListener(
+      'keydown',
+      (e) => {
+        if (e.key !== 'Escape' && e.key !== 'Esc') return; // 'Esc' 是旧 Edge 的叫法
+        if (!isPanelOpen()) return; // 面板没开 ⇒ 一个字节都不干预页面自己的 ESC
+        e.preventDefault();
+        e.stopPropagation(); // 一次 ESC 只关这一层，别连带关掉页面自己的浮层
+        closePanel();
+      },
+      true // ⭐ 捕获阶段：页面也在 document/window 上听键盘，捕获先拿到才抢得在前
+    );
   }
 
   // ============================================================
@@ -744,6 +860,63 @@
     return out;
   }
 
+  // ============================================================
+  // 8.1 长文本去重（v1.7.0）
+  // ============================================================
+  /**
+   * 为什么要有这一节：实测（订单 SOA37906452851870365）
+   *   套餐名 46 字、赠送包名 48 字 —— 而两者的**公共前缀是 45 字**，重复率 97.8%。
+   * 这串东西是「产品族名」，同一订单里逐字相同 ⇒ 行内写近两遍纯属噪音，
+   * 提到面板顶部说一次就够，行内只留**差异段**。
+   * ⚠️ 差异段可能只有一两个字（本例是「男」/「女已婚」）—— 这是对的，不是 bug：
+   *   族名已在顶部给出，行内的身份由「价格 + PKG 编码」承担，悬停可看全名。
+   */
+
+  /** 最长公共前缀长度 */
+  function lcp(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a.charAt(i) === b.charAt(i)) i++;
+    return i;
+  }
+
+  /** 所有套餐名的共同前缀；不足 2 条、或前缀 < 12 字（区分度不够）时返回 '' */
+  function commonPrefixOf(names) {
+    const list = names.filter(Boolean);
+    if (list.length < 2) return '';
+    let p = list[0];
+    for (let i = 1; i < list.length && p; i++) p = p.slice(0, lcp(p, list[i]));
+    p = p.replace(/[\s\-—–·/、,，:：]+$/, ''); // 尾巴上的分隔符不算前缀
+    return p.length >= 12 ? p : '';
+  }
+
+  /** 行内显示的套餐名：优先「共同前缀之后的差异段」；差异段为空时退回尾部保留 */
+  function shortPkgName(name, prefix) {
+    if (!name) return '';
+    if (prefix && name.indexOf(prefix) === 0) {
+      const rest = name.slice(prefix.length).replace(/^[\s\-—–·/、,，:：]+/, '').trim();
+      if (rest) return rest;
+    }
+    return name.length > 40 ? '…' + name.slice(-38) : name;
+  }
+
+  /** 行内显示的赠送包名：与套餐名**共有的那截不再重复**，只留差异 + 项目数 */
+  function giveLabel(gName, pkgName, n) {
+    const g = gName || '';
+    const p = pkgName ? lcp(g, pkgName) : 0;
+    let label;
+    if (p >= 8) {
+      let extra = g.slice(p).replace(/^[\s\-—–·/、,，:：]+/, '').trim();
+      extra = extra.replace(/^【?赠送包】?/, '').trim(); // 只剩「赠送包」三字 = 没有差异信息
+      if (extra.length > 16) extra = extra.slice(0, 15) + '…';
+      label = extra ? '赠送包 · ' + extra : '赠送包';
+    } else {
+      // 与套餐名无关的包名 ⇒ 原样显示（太长才截，且**保头**：无关包名通常从头就不一样）
+      label = g.length > 24 ? g.slice(0, 22) + '…' : g;
+    }
+    return label + ' · ' + n + ' 个项目';
+  }
+
   function paintMeta() {
     const el = $(IDS.meta);
     if (!el) return;
@@ -759,13 +932,25 @@
       '订单 <b>' + esc(state.orderCode) + '</b>' +
       '<span class="hlj-gc-st">只读</span>' +
       '<br><span class="hlj-gc-stat">' + stat + '</span>' +
+      // v1.7.0：套餐名的共同前缀提到这里说一次（行内只留差异段）。
+      // ⚠️ 必须写成**内联** span —— 试过 <details>（块级），在 #meta 的行内流里会多撑出
+      //    约 40px 的空行盒（实测 192.8→213.2 上下各多一条行盒），面板白白长高。
+      (state.commonPrefix
+        ? '<br><span class="hlj-gc-common"' +
+          (state.commonPrefix.length > 60 ? ' title="' + esc(state.commonPrefix) + '"' : '') +
+          '>套餐名共同部分：' +
+          esc(state.commonPrefix.length > 60 ? state.commonPrefix.slice(0, 60) + '…' : state.commonPrefix) +
+          '（行内已省略）</span>'
+        : '') +
       (state.bindTotal ? '<br><span style="color:#8c8c8c">本订单共绑定 ' + state.bindTotal + ' 个包，其中 ' +
         state.giveTotal + ' 个是赠送包（加项包不展示）</span>' : '') +
       (state.err ? '<br><span style="color:#cf1322">' + esc(state.err) + '</span>' : '');
   }
 
-  /** 一个赠送包：包名 + 包内项目（每项一行，带原价） */
-  function giveHtml(g) {
+  /** 一个赠送包：包名 + 包内项目（每项一行，带原价）
+   *  v1.7.0：包名不再照抄 48 字 —— 与套餐名共有的那截在顶部说过一次了，
+   *  行内只显示「赠送包 · N 个项目」（有差异信息时才追加）。全名放 title 里备查。 */
+  function giveHtml(g, pkgName) {
     const items = g.items.length
       ? '<ol class="hlj-gc-items">' +
         g.items
@@ -780,16 +965,21 @@
           .join('') +
         '</ol>'
       : '<div style="color:#8c8c8c">（该赠送包里没有项目）</div>';
+    const full = g.name || g.code;
     return (
       '<div class="hlj-gc-give">' +
-      '<span class="hlj-gc-give-name">【赠送包】' + esc(g.name || g.code) + '</span>' +
+      '<span class="hlj-gc-give-name" title="' + esc(full) + '">' +
+      esc(giveLabel(full, pkgName, g.items.length)) +
+      '</span>' +
       items +
       '</div>'
     );
   }
 
-  /** 一组：组头（组名 + 几选几）+ 该组下的赠送包 */
-  function groupHtml(gr) {
+  /** 一组：组头（组名 + 几选几）+ 该组下的赠送包
+   *  v1.8.0：组内 **≥2 个包**时给 `is-pack2`，CSS 把包列成两列（4 个包 → 2×2）。
+   *  ⚠️ 1 个包不加 —— 并排会让它只占半宽、右半空着，比不排更乱。 */
+  function groupHtml(gr, pkgName) {
     // 「未分组」不写约束 —— 它本来就不属于任何组，写「无约束数据」是噪音
     const limit = gr.no === 0
       ? ''
@@ -797,25 +987,31 @@
         ? '<span class="hlj-gc-group-limit is-unknown">无约束数据</span>'
         : '<span class="hlj-gc-group-limit">最少选' + esc(gr.min) + '个 最多选' + esc(gr.max) + '个</span>');
     const warn = gr.no === 0 ? '<span class="hlj-gc-group-warn">页面不归此组</span>' : '';
+    const pack2 = gr.gives.length >= 2 ? ' is-pack2' : '';
     return (
-      '<div class="hlj-gc-group">' +
+      '<div class="hlj-gc-group' + pack2 + '">' +
       '<div class="hlj-gc-group-head">' +
       '<span class="hlj-gc-group-name">' + esc(gr.name) + '</span>' +
       limit +
       warn +
       '</div>' +
-      gr.gives.map(giveHtml).join('') +
+      gr.gives.map((g) => giveHtml(g, pkgName)).join('') +
       '</div>'
     );
   }
 
-  function rowHtml(r) {
+  function rowHtml(r, idx) {
     const tags =
       '<span class="hlj-gc-tag t-' + esc(r.type) + '">' + esc(TYPE_CN[r.type] || r.type || '套餐') + '</span>' +
       (r.voided ? '<span class="hlj-gc-tag t-void">' + esc(voidCn(r)) + '</span>' : '');
 
+    // v1.7.0：行内只显示差异段（共同前缀在顶部）
+    const shownName = shortPkgName(r.name, state.commonPrefix);
+
+    // 客户类型/编码：差异段已经把客户类型说出来了（如「男」「女已婚」）就不再重复一遍
     const sub = [];
-    if (r.custType) sub.push(CUST_CN[r.custType] || r.custType);
+    const cust = CUST_CN[r.custType] || r.custType || '';
+    if (cust && shownName.indexOf(cust) < 0) sub.push(cust);
     if (r.code) sub.push(r.code);
 
     const prices =
@@ -824,15 +1020,16 @@
       '<span class="hlj-gc-p2">成交价 <b>' + esc(fmtMoney(r.price)) + '</b></span>' +
       '</span>';
 
-    const givesHtml = r.groups.map(groupHtml).join('');
+    const givesHtml = r.groups.map((gr) => groupHtml(gr, r.name)).join('');
 
     return `
       <tr class="${r.voided ? 'is-voided' : ''}">
         <td>
           <div class="hlj-gc-head">
-            <span class="hlj-gc-head-main">${tags}${esc(r.name)}</span>
+            <span class="hlj-gc-no">${idx + 1}</span>
+            <span class="hlj-gc-head-main"${r.name ? ` title="${esc(r.name)}"` : ''}>${tags}${esc(shownName)}</span>
             ${prices}
-            <span class="hlj-gc-sub">${esc(sub.join(' · '))}</span>
+            ${sub.length ? '<span class="hlj-gc-sub">' + esc(sub.join(' · ')) + '</span>' : ''}
           </div>
           <div class="hlj-gc-gives">${givesHtml}</div>
         </td>
@@ -997,6 +1194,8 @@
       state.rows = rows;
       state.giveTotal = giveTotal;
       state.itemTotal = itemTotal;
+      // v1.7.0：算一次套餐名的**共同前缀** —— 行内渲染要靠它做去重
+      state.commonPrefix = commonPrefixOf(rows.map((r) => r.name));
     } catch (e) {
       state.err = '读取失败：' + (e && e.message ? e.message : e);
       state.rows = [];
