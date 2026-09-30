@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.15
+// @version      2.16
 // @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -38,6 +38,23 @@
  *   同一段代码在没有该权限的扩展世界里则失败 —— 变量是权限，不是写法。
  * - 因此必须 @grant（见元数据块）。@grant none 会让脚本运行在页面世界，
  *   只能拿到页面身份，拿不到扩展权限。
+ *
+ * 关于沙箱世界（v2.16 起）：
+ * - 代价是脚本里的 `window` 变成油猴包装的代理对象。凡是要把 window 当“真 Window
+ *   实例”交给原生 API 的地方，都会在参数校验阶段直接抛错（已实测踩到一处）：
+ *     new MouseEvent(type, { view: window })
+ *       → Failed to read the 'view' property from 'UIEventInit':
+ *         Failed to convert value to 'Window'.
+ *   ⚠️ 其他把 window 当对象参数传的写法（如 KeyboardEvent / DragEvent 的 view）
+ *   属同源风险但**尚未实测**，写新代码时回避即可，别当结论。本脚本当前再无此类写法。
+ * - 下面这些在篡改猴世界实测正常，不必改写：
+ *     element.click()
+ *     dispatchEvent(new Event(...)) / dispatchEvent(new MouseEvent(..., 无 view))
+ *       —— 篡改猴世界 → 页面世界投递，mousedown/mouseup/click 三件全被收到
+ *         （事件对象里 e.view === null，无消费者）
+ *     new File / new DataTransfer / input.files = dt.files
+ *       —— 含 Object.defineProperty(input,"files",...) 兜底与原型 setter 调用，
+ *          三种写法主世界都读得到（length 一致）
  */
 
 (function () {
@@ -2806,15 +2823,47 @@
       "mouseup",
       "click"
     ].forEach(type => {
+      /*
+       * ⛔ 绝对不要传 { view: window }。
+       *
+       * 本脚本以 @grant GM_setClipboard 运行在“油猴沙箱世界”，这里的 window
+       * 是被包装过的代理对象，不是浏览器认可的 Window 实例；WebIDL 转换在
+       * 构造阶段就会抛：
+       *   TypeError: Failed to construct 'MouseEvent': Failed to read the
+       *   'view' property from 'UIEventInit': Failed to convert value to 'Window'.
+       * 而 fireMouseSequence 是合同流程的第一步（选签单主体下拉），
+       * 一抛错整个合同处理就断在这里。
+       *
+       * 真机实测（TM 5.5.0 + Chrome，篡改猴世界 vs 页面世界）：
+       *   view: window(真)     → OK          view: new Proxy(window,{}) → 抛上错
+       *   不传 view            → OK          同上代码在页面世界 @grant none 时也 OK
+       * ⇒ 是“不是真 Window”导致的，不是写法问题。
+       * 点击事件没有任何消费者读 e.view（React / antd 都不读），省略即可。
+       */
+      let event;
+
+      try {
+        event =
+          new MouseEvent(
+            type,
+            {
+              bubbles: true,
+              cancelable: true
+            }
+          );
+      } catch (_) {
+        event =
+          new Event(
+            type,
+            {
+              bubbles: true,
+              cancelable: true
+            }
+          );
+      }
+
       element.dispatchEvent(
-        new MouseEvent(
-          type,
-          {
-            bubbles: true,
-            cancelable: true,
-            view: window
-          }
-        )
+        event
       );
     });
   }
