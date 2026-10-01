@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.16
+// @version      2.17
 // @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_setClipboard
+// @grant        unsafeWindow
 
 // @author       WanXin
 // @publishGroup bianque
@@ -46,7 +47,16 @@
  *       → Failed to read the 'view' property from 'UIEventInit':
  *         Failed to convert value to 'Window'.
  *   ⚠️ 其他把 window 当对象参数传的写法（如 KeyboardEvent / DragEvent 的 view）
- *   属同源风险但**尚未实测**，写新代码时回避即可，别当结论。本脚本当前再无此类写法。
+ *   属同源风险但**尚未实测**，写新代码时回避即可，别当结论。
+ * - 🔴 同一根因的第二处（v2.17 修，2026-10-01）：`window.showOpenFilePicker(...)`
+ *   把**代理当 this** 调原生方法，WebIDL 的**品牌检查**先于手势检查，于是抛
+ *     Failed to execute 'showOpenFilePicker' on 'Window': Illegal invocation
+ *   ⇒ 「选择文件」按钮彻底不可用（红领巾 2026-10-01 15:30 截图）。
+ *   ⭐ 通用规则（v2.17 起，写新代码照此办）：
+ *     **凡是把 window 自己当“真 Window”交给原生 API 的（当参数、或当 this），
+ *       一律不要直接用沙箱的 window**，改用 openFilePickerSafely() 那套候选链
+ *       （unsafeWindow → document.defaultView → window），谁被 WebIDL 接受就用谁。
+ *   ⚠️ 同 v2.16：这类 bug 在**页面主世界**测试 100% 测不出来（主世界 window 是真的）。
  * - 下面这些在篡改猴世界实测正常，不必改写：
  *     element.click()
  *     dispatchEvent(new Event(...)) / dispatchEvent(new MouseEvent(..., 无 view))
@@ -5038,26 +5048,170 @@
     }
   }
 
-  async function bindSharedFile() {
-    if (
-      typeof window
-        .showOpenFilePicker !==
-      "function"
-    ) {
-      throw new Error(
-        "当前浏览器不支持 File System Access API，请使用新版 Chrome/Edge 并确保页面为 HTTPS"
-      );
+  /*
+   * ⭐ 打开系统文件选择器 —— 用一个「真 Window」当接收者（v2.17，2026-10-01）
+   *
+   * 病因（本机实测，与线上报错逐字一致）：
+   *   @grant 让脚本跑在油猴**沙箱世界**，那里的 window 是**被包装过的代理对象**；
+   *   直接把代理当 this 调原生方法，WebIDL 的**品牌检查**阶段就拒：
+   *     Failed to execute 'showOpenFilePicker' on 'Window': Illegal invocation
+   *
+   * 同页面 / 同 Chrome（在篡改猴世界里做对照）实测：
+   *   真 window             → SecurityError: Must be handling a user gesture…（接收者被接受，只差手势）
+   *   new Proxy(window,{})  → Illegal invocation（＝报错原文）
+   * ⇒ 只看**接收者是不是真 Window**，与“在哪个世界”无关；
+   *   且**品牌检查先于手势检查** ⇒ 报它 ≠ 没点按钮 / ≠ 不是 HTTPS / ≠ 浏览器不支持。
+   *   与 v2.16 修的 { view: window } 同一个根因，同属“改 @grant 引入的回归”。
+   *
+   * ⇒ 所以这里不猜、也不写死某一个：按候选顺序**逐个真调**，谁被 WebIDL 接受就用谁。
+   *     unsafeWindow（油猴给的真页面 window，需 @grant）
+   *   → document.defaultView（本世界实测 === 真 window）
+   *   → window（退回 @grant none 的页面世界时它本来就是真的）
+   * ⛔ 只有“接收者不对”这一类错才换下一个候选；用户取消（AbortError）、
+   *   没有手势（SecurityError）都是**真实结果**，原样上抛，绝不重试。
+   *   最坏情况（全都不对）抛的还是原来那句 Illegal invocation ⇒ **不会比修前更糟**。
+   */
+  function getPickerWindowCandidates() {
+    const candidates = [];
+
+    try {
+      if (
+        typeof unsafeWindow !==
+        "undefined" &&
+        unsafeWindow
+      ) {
+        candidates.push({
+          label: "unsafeWindow",
+          target: unsafeWindow
+        });
+      }
+    } catch (_) {
+      /* 未 @grant unsafeWindow 时该标识符不存在 */
     }
 
+    try {
+      if (
+        document &&
+        document.defaultView
+      ) {
+        candidates.push({
+          label: "document.defaultView",
+          target: document.defaultView
+        });
+      }
+    } catch (_) {
+      /* document 万一也被包装，取 defaultView 就可能抛，跳过即可 */
+    }
+
+    try {
+      if (window) {
+        candidates.push({
+          label: "window",
+          target: window
+        });
+      }
+    } catch (_) {
+      /* 同上 */
+    }
+
+    return candidates;
+  }
+
+  async function openFilePickerSafely(options) {
+    const seen = new Set();
+
+    let brandError = null;
+
+    for (
+      const {
+        label,
+        target
+      } of getPickerWindowCandidates()
+    ) {
+      if (
+        !target ||
+        seen.has(target)
+      ) {
+        continue;
+      }
+
+      seen.add(target);
+
+      let picker;
+
+      try {
+        picker =
+          target.showOpenFilePicker;
+      } catch (_) {
+        continue;
+      }
+
+      if (
+        typeof picker !==
+        "function"
+      ) {
+        continue;
+      }
+
+      try {
+        /*
+         * ⛔ 必须 .call(target)：抽出来的函数再裸调，this 又没了。
+         */
+        const handles =
+          await picker.call(
+            target,
+            options
+          );
+
+        log(
+          `✓ 文件选择器接收者：${label}`
+        );
+
+        return handles;
+      } catch (error) {
+        const message =
+          String(
+            error?.message ||
+            error
+          );
+
+        /*
+         * 只把“接收者不是真 Window”当作候选不对；
+         * 其余（AbortError 用户取消 / SecurityError 无手势）都是真实结果，直接上抛。
+         */
+        if (
+          /Illegal invocation|is not a function/i
+            .test(message)
+        ) {
+          brandError = error;
+
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw (
+      brandError ||
+      new Error(
+        "当前浏览器不支持 File System Access API，请使用新版 Chrome/Edge 并确保页面为 HTTPS"
+      )
+    );
+  }
+
+  async function bindSharedFile() {
     /*
      * showOpenFilePicker 必须直接由真实用户点击触发。
      * 本函数在“文件绑定”按钮事件中第一时间调用。
+     *
+     * ⚠️ 接收者一律交给 openFilePickerSafely 解析成“真 Window”，
+     *    不要在这里直接写 window.showOpenFilePicker（沙箱世界里必炸，见该函数注释）。
      */
     const handles =
-      await window
-        .showOpenFilePicker({
-          multiple: false
-        });
+      await openFilePickerSafely({
+        multiple: false
+      });
 
     const handle =
       handles?.[0] ||
