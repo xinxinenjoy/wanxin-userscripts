@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.7订单特殊审批
 // @namespace    https://tampermonkey.net/
-// @version      2.2.1
+// @version      2.2.2
 // @description  SOA特殊审批开关：一键在「特殊审批 开」（业务员报价后不可修改订单=勾选 + 检中修改钉钉审批=不启用）与「特殊审批 关」（反之，已恢复正常）之间切换。直接发请求、不跳转页面、不弹确认框，切完自动回读校验。
 // @match        https://checkup-soa3.health-100.cn/*
 // @match        https://app-fly.health-100.cn/*
@@ -40,9 +40,15 @@
  *
  *   ① POST /soa/api/v1/setup/out/count/update        字段 limit_sale_role_edit_after_confirm_audit
  *      ⚠️ 提交的是**整份配置快照**（20+ 字段），不是单字段！
+ *      🔴 2026-10-16 现场：服务端新增 blacklistWarning / blacklistContractWarning /
+ *         blacklistPaymentWarning 三个字段 —— detail 里有、旧提交体里没有 ⇒
+ *         ConfOverWarnServiceImpl.getConfBaseDO 抛「空访问异常」(NPE) ⇒ result_code=FAIL。
+ *         ⚠️ 该 FAIL **与提交的开关值无关**（写 true / 写 false 一样失败），纯粹是快照缺字段。
+ *         ⇒ buildCountBody 已补上这 3 个字段，并加「未映射字段兜底透传」防日后再犯。
  *      读接口 /setup/out/count/detail 返回的结构与提交体并不一一对应：
  *        - 提交体里的 physicalExamUnpaidAlertValue 等 4 个 **Value 阈值字段**，读接口不返回；
- *        - 读接口里的 limit_free_pack_on / vip_out_count_conf，提交体里没有（前端不提交）；
+ *        - 读接口里的 limit_free_pack_on / vip_out_count_conf，原提交体里没有（前端不提交）；
+ *          2026-10-16 起由「兜底透传」原值带上（实测服务端接受，且快照更完整）。
  *        - 读接口的 over_warn.* / out_count.ruleList 要摊平/改名成 order_end_date_warn / outCount。
  *      照 detail 重建提交体**与页面自己保存的行为一致**（页面也是拿 detail 填 state 再提交），
  *      但 4 个阈值字段读不到 ⇒ 只要「体检应收金额/体检名单预警」有任意一个开着，本脚本**拒绝提交**，
@@ -95,7 +101,7 @@
   // 与 1.4/1.5/1.6 共用的顶部工具组（报表工具创建）。存在就把开关挂进去
   const TOP_TOOL_GROUP_ID = '__hlj_soa_top_tool_group_v1';
 
-  const SCRIPT_VERSION = '2.2.1';
+  const SCRIPT_VERSION = '2.2.2';
   const POS_KEY = `${NS}_pos`;
 
   const CLIENT_ID = 'MN_SOA3';
@@ -231,8 +237,14 @@
     }
     const ow = d.over_warn || {};
     const oc = d.out_count || {};
-    return {
+    const body = {
       region_code: region(),
+      // 2026-10-16 现场实测：服务端新增了下面这 3 个黑名单预警字段，
+      // 请求体里缺任何一个，count/update 内部 ConfOverWarnServiceImpl.getConfBaseDO
+      // 就抛「空访问异常」(NPE) 直接返回 FAIL —— 与提交的开关值无关，整份快照必须带全。
+      blacklistWarning: !!d.blacklistWarning,
+      blacklistContractWarning: !!d.blacklistContractWarning,
+      blacklistPaymentWarning: !!d.blacklistPaymentWarning,
       orderNodeNotificationReview: !!d.orderNodeNotificationReview,
       orderNodeNotificationToExamine: !!d.orderNodeNotificationToExamine,
       physicalExamUnpaidAlert: !!d.physicalExamUnpaidAlert,
@@ -257,6 +269,23 @@
       startSmsDefaultCount: d.startSmsDefaultCount === undefined ? 3 : d.startSmsDefaultCount,
       startSmsDefaultInterval: d.startSmsDefaultInterval === undefined ? 5 : d.startSmsDefaultInterval,
     };
+
+    // 兜底：detail 里出现、但上面没显式映射的【标量 / 数组】字段，原样带上。
+    // 嵌套对象（over_warn / out_count）要改名或摊平，不裸传；服务端日后再加字段会自动跟上，
+    // 不会再像 2026-10-16 这次那样静默 FAIL（那次是服务端加了 3 个 blacklist* 字段）。
+    const passthrough = [];
+    Object.keys(d).forEach((k) => {
+      if (Object.prototype.hasOwnProperty.call(body, k)) return;
+      const v = d[k];
+      if (v !== null && typeof v === 'object' && !Array.isArray(v)) return;
+      body[k] = Array.isArray(v) ? v.slice() : v;
+      passthrough.push(k);
+    });
+    if (passthrough.length) {
+      console.warn('[扁鹊-1.7 特殊审批] count/update 兜底透传 detail 未映射字段：' + passthrough.join(', '));
+    }
+
+    return body;
   }
 
   async function writeCountFlag(countData, limitFlag) {
