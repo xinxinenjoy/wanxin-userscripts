@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         蝶美-1.2套餐危害核对
 // @namespace    https://dime.health-100.cn/
-// @version      4.2.25
-// @description  蝶美套餐危害核对：提供自动化核对、批量处理、自动选择等功能。注意：套餐名称的标准格式应为：XX-危害1+危害2+危害3+岗中+男，不保证能识别其他格式。
+// @version      4.5.0
+// @description  蝶美套餐危害核对：提供自动化核对、批量处理、自动选择等功能。注意：套餐名称的标准格式应为：XX-危害1+危害2+危害3+岗中+男，不保证能识别其他格式。v4.3 起批量与单改默认走"数据层直写"快速通道：跳过搜索与点选，直接写页面表单模型并调页面自带保存，保存结果以接口回执为准。v4.4 起批量处理全程隐身：编辑弹窗整批只开一次且不可见，结束后在工具面板给出逐条核对报告。v4.5 起批量提交为流水线并发：最多 3 个保存请求同时在途，失败项批末自动补试，整批速度提升约 2~3 倍。
 
 // @match        https://dime.health-100.cn/*
 // @run-at       document-idle
@@ -19,8 +19,10 @@
 (function () {
   "use strict";
 
-  const GLOBAL_KEY = "__DIME_HAZARD_PACKAGE_CHECKER_V4215__";
+  const GLOBAL_KEY = "__DIME_HAZARD_PACKAGE_CHECKER_V450__";
   [
+    "__DIME_HAZARD_PACKAGE_CHECKER_V450__",
+    "__DIME_HAZARD_PACKAGE_CHECKER_V440__",
     "__DIME_HAZARD_PACKAGE_CHECKER_V4215__",
     "__DIME_HAZARD_PACKAGE_CHECKER_V4214__",
     "__DIME_HAZARD_PACKAGE_CHECKER_V4213__",
@@ -143,6 +145,67 @@
     verifyFirstCombinedPackage: true,
     auditEveryCombinedPackages: 10
   };
+
+  /*
+   * 数据层直写（快速通道）
+   *
+   * 目标：跳过"点得累"的部分；批量处理连"看得见"的部分也一并隐去。
+   *
+   *   跳过：展开 Treeselect、输入搜索词、等待下拉项、逐项点击、下拉框点选、
+   *         每选中一项都等待稳定、提交前反复比对表单签名。
+   *   隐去（v4.4 起，仅批量）：编辑弹窗整批只在后台打开一次并全程
+   *         visibility:hidden——组件、$refs、校验、保存全部照常工作，
+   *         但屏幕上不出现弹窗、遮罩和逐条换内容的闪烁。
+   *
+   * 做法：把目标值直接写进页面自己的 packageForm，同步刷新只读显示字段，
+   *       再调用页面自己的 submitPackageForm()。表单校验、mnsign 鉴权头、
+   *       PUT 请求、列表就地回写、关闭弹窗全部由页面原有逻辑完成，
+   *       脚本不自己拼请求（这条路实测会被 "mnclientId或mnappid不能为空" 挡住）。
+   *
+   * 是否真的写进后台：直接读页面那一次 PUT 的响应判定，
+   * 因此不再需要"保存后重新打开弹窗复核"这种高成本兜底。
+   */
+  const FAST_PATH = {
+    // 批量与单个"一键补齐"是否走数据层直写。可在工具面板上即时切换并记忆。
+    enabled: true,
+    // 批量处理时整批只开一次编辑弹窗：逐条把内容换进同一个弹窗。
+    // 页面这个弹窗是 destroy-on-close（关掉就整棵销毁、再开重建，还会闪一次
+    // 全屏遮罩），"每条一开一关"正是页面闪烁与卡顿的来源。
+    holdDialogAcrossBatch: true,
+    // 首次打开弹窗后、写数据之前的渲染缓冲（保证弹窗"看得见"）。
+    openSettleMs: 120,
+    // 一条处理完、换下一条之前留给眼睛的短暂停留。
+    // 只影响"看得见"的节奏，不参与任何判定。
+    swapSettleMs: 140,
+    // 调用页面保存后，等待"请求确实发出"的上限。
+    // 页面自身的校验会直接拦截提交，这里用来快速判定而不是干等。
+    requestStartTimeoutMs: 3000,
+    // 请求已发出后，等待响应的上限。
+    submitTimeoutMs: 20000,
+    // 表单校验报错的最早检查时间，避免读到上一次遗留的旧报错。
+    validationCheckDelayMs: 160,
+    // 同一套餐保存失败时的最大尝试次数。
+    maxAttempts: 3,
+    // 流水线并发：同一时刻最多多少个保存请求在途。
+    // 红领巾 2026-10-17 定：批量一般是短时操作，2~3 足够；想更保守改 2。
+    maxInFlight: 3,
+    // 重试前的间隔。
+    retryDelayMs: 600
+  };
+
+  const FAST_PATH_ENABLED_STORAGE_KEY =
+    TOOL_ID + "-fast-path-enabled";
+
+  // 页面"在岗状态"下拉的真实取值（来自页面自身 workStatusList）。
+  const FAST_PATH_STAGE_CODES = [
+    ["上岗前", "1001"],
+    ["在岗期间", "1002"],
+    ["事故照射", "1003"],
+    ["离岗后医学随访", "1004"],
+    ["应急检查", "1005"],
+    ["离岗时", "1006"],
+    ["应急照射", "1007"]
+  ];
 
   [
     ".dime-hazard-autofill-panel-v377",
@@ -2790,10 +2853,21 @@
       margin-top:5px;color:#7254a3;font-size:10px;line-height:1.5;
       white-space:pre-wrap;word-break:break-word
     }
+    #${TOOL_ID} .batch-fast-toggle{
+      display:flex;align-items:flex-start;gap:5px;margin-top:6px;
+      color:#7254a3;font-size:10px;line-height:1.45;cursor:pointer;
+      user-select:none
+    }
+    #${TOOL_ID} .batch-fast-toggle input{
+      margin:1px 0 0;flex:none;cursor:pointer;accent-color:#8b5cf6
+    }
+    #${TOOL_ID} .batch-fast-toggle strong{color:#8b5cf6}
+    #${TOOL_ID} .batch-fast-toggle.is-busy{opacity:.55;cursor:not-allowed}
     #${TOOL_ID} .batch-notice{
       margin-top:7px;padding:7px 8px;border:1px solid #c2e7b0;
       border-radius:6px;background:#f0f9eb;color:#529b2e;
-      font-size:10px;line-height:1.5;white-space:pre-wrap
+      font-size:10px;line-height:1.5;white-space:pre-wrap;
+      max-height:220px;overflow-y:auto
     }
     #${TOOL_ID} [data-result-section]{
       scroll-margin-top:230px
@@ -3168,7 +3242,7 @@
   tool.id = TOOL_ID;
   tool.innerHTML = `
     <div class="tool-header">
-      <strong>套餐危害因素核对工具 v4.2.25</strong>
+      <strong>套餐危害因素核对工具 v4.5.0</strong>
       <div class="tool-header-actions">
         <button class="tool-header-button tool-collapse" type="button" title="折叠工具">−</button>
         <button class="tool-header-button tool-close" type="button" title="收起到快捷按钮">×</button>
@@ -3222,7 +3296,11 @@
           <b>异常结果：</b>“匹配缺失、危害多出、岗位异常、待处理名称”等数字可点击查看对应明细。<br>
           <b>岗位状态：</b>系统岗位为空且套餐状态明确时可辅助补齐；已有岗位与套餐不一致时仅提示，不自动覆盖。<br>
           <b>名称处理：</b>无法直接匹配的名称可建立标准危害映射，或设置为“精确无关 / 关键词无关”，保存后继续复用。<br>
-          <b>自动处理：</b>编辑时可一键补齐明确缺失项；批量安全修复只处理可明确判断的项目，并在操作过程中进行复核。
+          <b>自动处理：</b>编辑时可一键补齐明确缺失项；批量安全修复只处理可明确判断的项目，并在操作过程中进行复核。<br>
+          <b>v4.5 流水线并发：</b>批量提交不再逐条等回执——"换内容→写表单→提交"是唯一串行的临界段，请求一旦发出，表单立即让给下一条，同一时刻最多 3 个保存请求在途（FAST_PATH.maxInFlight 可改 2 更保守）。失败项在批末串行补试到 3 次，仍失败才停批；名称定位不了的错误不重试、直接记入报告继续跑。<br>
+          <b>v4.4 批量静默直写：</b>批量处理时编辑弹窗整批只在后台打开一次，并全程隐身——屏幕上看不到弹窗、遮罩和逐条换内容的闪烁，也没有开窗动画。脚本把目标值直接写进页面表单模型、调用页面自带的保存逻辑，保存成败以页面保存接口的回执为准。整批结束后，工具面板会逐条列出「已保存 / 跳过 / 失败」的清单（含每条新增的危害数与在岗状态），请对照清单自行抽查核对。批量进行中如需停止，点批量按钮或 HUD 上的"停止"即可。若某个套餐的名称在页面危害库里定位不到，会记入报告并继续处理其余套餐。<br>
+          <b>v4.3 数据层直写：</b>批量与单个"一键补齐"不再模拟"展开树→输搜索词→等候选→逐项点选"这套交互，直接写表单模型后调页面保存。单个"一键补齐"仍在弹窗内进行、行为不变。<br>
+          <b>v4.3.1 批量单窗轮播：</b>整批只开一次编辑弹窗、逐条换内容（页面那个弹窗关掉即整棵销毁、再开要重建 680+ 条危害的树），v4.4 在此基础上让弹窗全程不可见。
         </div>
       </details>
     </div>
@@ -3474,10 +3552,25 @@
                   ? "停止批量处理"
                   : `批量安全修复本页（${batchCandidateCount}）`
               }</button>
+              <label class="batch-fast-toggle ${
+                batchRunning ? "is-busy" : ""
+              }" title="勾选后：批量处理全程隐身——编辑弹窗只在后台打开（屏幕上看不到弹窗和遮罩），直接写入表单模型并调用页面自带的保存逻辑，结束后给出逐条核对报告。">
+                <input
+                  type="checkbox"
+                  class="batch-fast-check"
+                  ${fastPathEnabled ? "checked" : ""}
+                  ${batchRunning ? "disabled" : ""}
+                >
+                <span>静默直写：后台隐身处理，流水线并发保存，结束给核对报告（<strong>${
+                  fastPathEnabled ? "已开启" : "已关闭"
+                }</strong>）</span>
+              </label>
               <div class="batch-status">${
                 batchRunning
                   ? "正在准备批量处理……"
-                  : "分组处理：只缺岗位 → 只缺危害 → 两者都缺；组合项岗位后立即补危害并双向复核。"
+                  : fastPathEnabled
+                    ? "分组处理：只缺岗位 → 只缺危害 → 两者都缺；静默直写全程不出现弹窗，最多 3 条保存请求同时在途，失败项批末自动补试，结果以接口回执为准，结束后在下方逐条列出供你核对。"
+                    : "分组处理：只缺岗位 → 只缺危害 → 两者都缺；组合项岗位后立即补危害并双向复核。"
               }</div>
             </div>
           `
@@ -3521,6 +3614,28 @@
   }
 
   function bindBatchAction() {
+    const check = summaryBox.querySelector(".batch-fast-check");
+
+    if (check) {
+      check.addEventListener("change", () => {
+        writeFastPathEnabled(check.checked);
+
+        const marker = check
+          .closest(".batch-fast-toggle")
+          ?.querySelector("strong");
+
+        if (marker) {
+          marker.textContent = fastPathEnabled ? "已开启" : "已关闭";
+        }
+
+        showToast(
+          fastPathEnabled
+            ? "已切换为静默直写：批量全程隐身，后台自动保存"
+            : "已切换为界面模拟：逐步搜索并逐项点选危害"
+        );
+      });
+    }
+
     const button = getBatchActionButton();
     if (!button) return;
 
@@ -6697,6 +6812,65 @@
   }
 
 
+  /*
+   * 单个弹窗内的"一键补齐"：数据层直写版本。
+   *
+   * 与批量版共用同一套写入逻辑，区别是这里不自动提交——
+   * 仍然由使用者检查无误后自己点"确定"，保持单个操作的可控性。
+   *
+   * 返回 null 表示快速通道不适用（找不到组件、名称定位不了、
+   * 弹窗与表单不是同一个套餐等），调用方会回落到界面模拟流程。
+   */
+  async function fillCurrentDialogMissingFast(
+    dialog,
+    initial
+  ) {
+    const vm = getFastPathVm();
+
+    if (!vm || vm.openPackage !== true || !vm.packageForm) {
+      return null;
+    }
+
+    const dialogCode = cleanText(
+      readDialogField(dialog, ["套餐编码"])
+    );
+
+    if (
+      strictKey(dialogCode) !==
+      strictKey(vm.packageForm.packageCode)
+    ) {
+      return null;
+    }
+
+    const stageCode = initial.expectedStage
+      ? getFastPathStageCode(initial.expectedStage)
+      : "";
+
+    if (initial.expectedStage && !stageCode) {
+      return null;
+    }
+
+    const resolution = resolveFastPathHarmIds(
+      vm,
+      initial.pending.map(item => item.canonical || item.raw),
+      vm.packageForm.dimeBaseharmList
+    );
+
+    if (resolution.unresolved.length || resolution.ambiguous.length) {
+      return null;
+    }
+
+    const applied = await applyFastPathFill(vm, {
+      harmIds: resolution.ids,
+      stageCode
+    });
+
+    return {
+      ...applied,
+      pendingCount: initial.pending.length
+    };
+  }
+
   async function fillCurrentDialogMissing(dialog, panel) {
     if (panel.dataset.busy === "1") return;
 
@@ -6711,6 +6885,61 @@
     panel.dataset.busy = "1";
     button.disabled = true;
     setAutoPanelType(panel, "normal");
+
+    if (fastPathEnabled) {
+      button.textContent = "数据层直写中……";
+      status.textContent =
+        "正在直接写入页面表单模型（不模拟搜索与逐项点选）……";
+
+      let applied = null;
+
+      try {
+        applied = await fillCurrentDialogMissingFast(
+          dialog,
+          initial
+        );
+      } catch (error) {
+        applied = null;
+      }
+
+      if (applied) {
+        const existedCount = Math.max(
+          0,
+          applied.pendingCount - applied.additions
+        );
+
+        setAutoPanelType(panel, "success");
+        status.textContent = [
+          `危害新增：${applied.additions} 项` +
+            `${existedCount ? `；原本已存在：${existedCount} 项` : ""}`,
+          applied.stageChanged
+            ? `在岗状态：已设为“${initial.expectedStage}”`
+            : initial.expectedStage
+              ? `在岗状态：已是“${initial.expectedStage}”`
+              : "",
+          "已通过页面表单模型直接写入，弹窗内显示即为保存后的内容。",
+          "请检查无误后手动点击“确定”。"
+        ].filter(Boolean).join("\n");
+
+        button.textContent = "补齐完成";
+        button.disabled = true;
+        panel.dataset.busy = "0";
+
+        setTimeout(() => {
+          if (
+            panel.isConnected &&
+            panel.dataset.busy !== "1"
+          ) {
+            renderAutoPanel(dialog, panel);
+          }
+        }, 2800);
+
+        return;
+      }
+
+      // 快速通道不适用，回落到界面模拟流程，不打断使用者。
+      button.textContent = "回落到界面模拟……";
+    }
 
     const result = await executeDialogFillSequence(
       dialog,
@@ -7379,11 +7608,1600 @@
     return result;
   }
 
+  /* ===================================================================
+   * 数据层直写（快速通道）
+   *
+   * 这一整段只做一件事：把"补齐危害 / 设置岗状态"从模拟界面操作，
+   * 改成直接写页面的表单模型 + 调页面自己的保存方法。
+   *
+   * 它不自己发请求，也不绕过页面的校验与鉴权；只是不再陪着
+   * Treeselect 一个一个地搜、等、点。
+   * =================================================================== */
+
+  let fastPathEnabled = readFastPathEnabled();
+  let fastPathVmCache = null;
+  let fastPathHarmIndexCache = null;
+  let fastPathHarmIndexSource = null;
+
+  function readFastPathEnabled() {
+    try {
+      const stored = localStorage.getItem(
+        FAST_PATH_ENABLED_STORAGE_KEY
+      );
+
+      if (stored === null) return FAST_PATH.enabled;
+
+      return stored === "1";
+    } catch (_) {
+      return FAST_PATH.enabled;
+    }
+  }
+
+  function writeFastPathEnabled(value) {
+    fastPathEnabled = Boolean(value);
+
+    try {
+      localStorage.setItem(
+        FAST_PATH_ENABLED_STORAGE_KEY,
+        fastPathEnabled ? "1" : "0"
+      );
+    } catch (_) {}
+  }
+
+  /*
+   * 找到页面的套餐管理组件。
+   *
+   * 定位链： #app 的 Vue 根 → 逐层 $children → $options.name === "basecompany"。
+   * 这条路在 v4.2.x 一直稳定；找不到就整体退回界面模拟模式。
+   */
+  function getFastPathVm() {
+    if (
+      fastPathVmCache &&
+      fastPathVmCache.$el &&
+      fastPathVmCache.$el.isConnected
+    ) {
+      return fastPathVmCache;
+    }
+
+    fastPathVmCache = null;
+
+    const appElement = document.querySelector("#app");
+    if (!appElement) return null;
+
+    const queue = [
+      appElement.__vue__,
+      appElement.__vueParentComponent?.proxy
+    ].filter(Boolean);
+
+    const visited = new Set();
+
+    while (queue.length && visited.size < 800) {
+      const vm = queue.shift();
+      if (!vm || visited.has(vm)) continue;
+      visited.add(vm);
+
+      if (
+        vm.$options?.name === "basecompany" &&
+        vm.$el?.isConnected
+      ) {
+        fastPathVmCache = vm;
+        return vm;
+      }
+
+      if (Array.isArray(vm.$children)) {
+        queue.push(...vm.$children);
+      }
+    }
+
+    return null;
+  }
+
+  /*
+   * 危害名称 → 页面危害 id 的索引。
+   *
+   * 页面自己的危害库在组件上（originalHarmData，按类型分组）。
+   * 这里把 680+ 个危害压成三张表：
+   *   1) 原始名称精确表（strictKey 归一后）
+   *   2) 标准名表（先过脚本自己的 resolveCanonical，覆盖别名差异）
+   *   3) 吞逗号表（页面与标准名偶有"、"多一个少一个的写法差异，
+   *      例如页面写"铝尘（铝金属、铝合金粉尘、氧化铝粉尘）"、
+   *      标准名写"铝尘（铝金属、铝合金粉尘氧化铝粉尘）"）
+   * 表按 originalHarmData 的引用缓存，批量跑一整轮只建一次。
+   */
+  const commaStrippedKey = value =>
+    strictKey(value).replace(/,/g, "");
+
+  function getFastPathHarmIndex(vm) {
+    const source = vm.originalHarmData;
+
+    if (
+      fastPathHarmIndexCache &&
+      fastPathHarmIndexSource === source
+    ) {
+      return fastPathHarmIndexCache;
+    }
+
+    const entries = [];
+
+    (Array.isArray(source) ? source : []).forEach(group => {
+      (group?.harms || []).forEach(harm => {
+        const name = cleanText(harm?.hamName);
+
+        if (!name || harm?.id === null || harm?.id === undefined) {
+          return;
+        }
+
+        const resolved = resolveCanonical(name);
+        const canonical = resolved?.canonical || name;
+
+        entries.push({
+          id: harm.id,
+          name,
+          key: strictKey(name),
+          canonical,
+          canonicalKey: strictKey(canonical),
+          commaKey: commaStrippedKey(name),
+          group: cleanText(group?.harmTypeName)
+        });
+      });
+    });
+
+    const byKey = new Map();
+    const byCanonical = new Map();
+    const byComma = new Map();
+
+    const indexInto = (map, key, entry) => {
+      if (!key) return;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(entry);
+    };
+
+    entries.forEach(entry => {
+      indexInto(byKey, entry.key, entry);
+      indexInto(byCanonical, entry.canonicalKey, entry);
+      indexInto(byComma, entry.commaKey, entry);
+
+      // 标准名的吞逗号写法与页面名称相同时，不要重复塞进同一个桶，
+      // 否则唯一命中会被自己算成"两个候选"。
+      const canonicalCommaKey = commaStrippedKey(entry.canonical);
+
+      if (canonicalCommaKey && canonicalCommaKey !== entry.commaKey) {
+        indexInto(byComma, canonicalCommaKey, entry);
+      }
+    });
+
+    fastPathHarmIndexSource = source;
+    fastPathHarmIndexCache = { entries, byKey, byCanonical, byComma };
+
+    return fastPathHarmIndexCache;
+  }
+
+  /*
+   * 把一串危害名称解析成页面危害 id。
+   *
+   * 四级匹配，宁可报"没匹配上"也不猜：
+   *   1) 页面名称精确相同（页面字典里存在同名重复项时取第一条，
+   *      并优先沿用已选中的那一条，不因此中断整批）
+   *   2) 归一后的标准名唯一命中
+   *   3) 标准名对应多个页面项时，只在其中找名称完全等于标准名的那个
+   *   4) 末级兜底：只差逗号/顿号写法
+   * 仍然定不下来就归入 unresolved / ambiguous，由调用方中止该套餐。
+   */
+  function resolveFastPathHarmIds(vm, names, currentIds = []) {
+    const index = getFastPathHarmIndex(vm);
+    const selected = new Set(
+      (Array.isArray(currentIds) ? currentIds : []).map(id =>
+        String(id)
+      )
+    );
+
+    const ids = [];
+    const matched = [];
+    const unresolved = [];
+    const ambiguous = [];
+    const duplicates = [];
+    const seen = new Set();
+
+    const push = entry => {
+      if (entry && !seen.has(entry.id)) {
+        seen.add(entry.id);
+        ids.push(entry.id);
+      }
+    };
+
+    names.forEach(raw => {
+      const name = cleanText(raw);
+      if (!name) return;
+
+      const key = strictKey(name);
+      const exact = index.byKey.get(key);
+
+      if (exact && exact.length) {
+        if (exact.length > 1) duplicates.push(name);
+
+        push(
+          exact.find(entry => selected.has(String(entry.id))) ||
+          exact[0]
+        );
+        matched.push(name);
+        return;
+      }
+
+      const resolved = resolveCanonical(name);
+      const canonicalKey = strictKey(resolved?.canonical || name);
+      const bucket = index.byCanonical.get(canonicalKey) || [];
+
+      if (bucket.length === 1) {
+        push(bucket[0]);
+        matched.push(name);
+        return;
+      }
+
+      if (bucket.length > 1) {
+        const sameAsCanonical = bucket.find(
+          entry => entry.key === canonicalKey
+        );
+
+        if (sameAsCanonical) {
+          push(sameAsCanonical);
+          matched.push(name);
+          return;
+        }
+      }
+
+      const looseKey =
+        commaStrippedKey(name) ||
+        commaStrippedKey(resolved?.canonical || name);
+      const loose = index.byComma.get(looseKey) || [];
+
+      if (loose.length === 1) {
+        push(loose[0]);
+        matched.push(name);
+        return;
+      }
+
+      if (loose.length > 1 || bucket.length > 1) {
+        ambiguous.push({
+          name,
+          candidates: (loose.length > 1 ? loose : bucket).map(
+            entry => entry.name
+          )
+        });
+        return;
+      }
+
+      unresolved.push(name);
+    });
+
+    return { ids, matched, unresolved, ambiguous, duplicates };
+  }
+
+  /*
+   * 在岗状态名称 → 页面下拉取值。
+   * 先按标准名直查，再兼容脚本里的简称（岗前 / 岗中 / 岗后 / 在岗 / 离岗 / 应急）。
+   */
+  function getFastPathStageCode(stageName) {
+    const wanted = strictKey(stageName);
+    if (!wanted) return "";
+
+    for (const [name, code] of FAST_PATH_STAGE_CODES) {
+      if (strictKey(name) === wanted) return code;
+    }
+
+    for (const [source, target] of DIALOG_STAGE_SOURCE_ENTRIES) {
+      if (strictKey(source) !== wanted) continue;
+
+      const found = FAST_PATH_STAGE_CODES.find(
+        ([name]) => strictKey(name) === strictKey(target)
+      );
+
+      if (found) return found[1];
+    }
+
+    return "";
+  }
+
+  function findFastPathPackageIndex(vm, code) {
+    const wanted = strictKey(code);
+    if (!wanted) return -1;
+
+    const list = Array.isArray(vm.basepackageList)
+      ? vm.basepackageList
+      : [];
+
+    for (let index = 0; index < list.length; index++) {
+      if (strictKey(list[index]?.packageCode) === wanted) {
+        return index;
+      }
+    }
+
+    return -1;
+  }
+
+  /*
+   * 等一轮 Vue 渲染完成。
+   * 比固定毫秒稳，也不受"后台标签页定时器降频"影响（降频时 setTimeout
+   * 可能变成 1 秒以上，而渲染微任务不受影响）。
+   */
+  function waitFastPathRender(vm) {
+    try {
+      const tick = vm?.$nextTick?.();
+
+      if (tick && typeof tick.then === "function") {
+        return tick;
+      }
+    } catch (_) {}
+
+    return sleep(0);
+  }
+
+  async function waitForFastPathFormReady(vm, timeoutMs = 4000) {
+    const isReady = () =>
+      vm.openPackage === true && Boolean(vm.$refs?.packageForm);
+
+    if (isReady()) return true;
+
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeoutMs) {
+      // 先让渲染跑一轮：弹窗内容是在 openPackage 置位后的那一轮渲染里建起来的，
+      // 正常情况下一轮 nextTick 之后就已经就绪，不必消耗任何定时器。
+      await waitFastPathRender(vm);
+
+      if (isReady()) return true;
+
+      await sleep(16);
+    }
+
+    throw new Error(
+      "编辑弹窗未在预期时间内就绪（$refs.packageForm 未建立）"
+    );
+  }
+
+  /*
+   * "给眼睛留的时间"。
+   *
+   * 只在页面看得见时才真的等：页面切到后台时浏览器会把定时器压到 1 秒以上
+   * （挂久了甚至一分钟才跑一次），这时候既没人看，也不该被它拖慢整批。
+   */
+  function waitForFastPathVisibilityPause(ms) {
+    if (!ms || document.hidden) return Promise.resolve();
+
+    return sleep(ms);
+  }
+
+  function getFastPathValidationError(vm) {
+    const formElement = vm.$refs?.packageForm?.$el;
+    if (!formElement) return "";
+
+    return [...formElement.querySelectorAll(".el-form-item__error")]
+      .filter(isVisibleElement)
+      .map(element => cleanText(element.textContent))
+      .filter(Boolean)
+      .join("；");
+  }
+
+  /*
+   * PUT /…/api/basepackage 的响应探针。
+   *
+   * 页面把"保存成功"完全交给 axios 响应拦截器，表单自己在发请求后会立刻
+   * 乐观关窗，所以只看弹窗是否关闭是判不出真实结果的。这里直接读那一次
+   * PUT 的原始响应，作为唯一判据。
+   *
+   * 只被动记录，不发请求、不改写响应；用固定形参个数包装，避免影响
+   * 依赖 arity 判断的第三方代码。
+   */
+  const fastPathTap = {
+    installed: false,
+    // 每发出一次保存请求就 +1，作为这一次请求的编号。
+    seq: 0,
+    // 编号 → 响应结果。等结果时直接等事件，不做定时轮询
+    // （页面被切到后台时浏览器会把定时器压到 1 秒以上，轮询会变成"干等"）。
+    results: new Map(),
+    // 最近一次保存请求的编号，用来精确对上"这一次"的响应。
+    lastSentId: 0,
+    lastResult: null,
+    listeners: new Set()
+  };
+
+  function notifyFastPathTap() {
+    [...fastPathTap.listeners].forEach(listener => {
+      try {
+        listener();
+      } catch (_) {}
+    });
+  }
+
+  /*
+   * 等到某个条件成立（或超时）。
+   * 条件不成立时不消耗任何定时器，由探针事件主动唤醒。
+   */
+  function waitFastPathCondition(predicate, timeoutMs) {
+    return new Promise(resolve => {
+      let settled = false;
+      let timer = null;
+
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        fastPathTap.listeners.delete(listener);
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      };
+
+      const listener = () => {
+        if (predicate()) finish(true);
+      };
+
+      fastPathTap.listeners.add(listener);
+      timer = setTimeout(
+        () => finish(predicate()),
+        Math.max(1, timeoutMs)
+      );
+
+      // 条件可能在我们订阅之前就已经成立。
+      listener();
+    });
+  }
+
+  function installFastPathTap() {
+    if (fastPathTap.installed) return;
+
+    const proto = XMLHttpRequest.prototype;
+    const originalOpen = proto.open;
+    const originalSend = proto.send;
+
+    fastPathTap.installed = true;
+
+    proto.open = function (method, url, async, user, password) {
+      try {
+        this.__dimeFastPathRequest = {
+          method: String(method || "").toUpperCase(),
+          url: String(url || "")
+        };
+      } catch (_) {}
+
+      return originalOpen.apply(this, arguments);
+    };
+
+    proto.send = function (body) {
+      const info = this.__dimeFastPathRequest;
+
+      if (info && info.method === "PUT") {
+        const cleanUrl = info.url.split("#")[0].split("?")[0];
+
+        if (cleanUrl.endsWith("/basepackage")) {
+          const xhr = this;
+          const startedAt = Date.now();
+          const id = ++fastPathTap.seq;
+
+          fastPathTap.lastSentId = id;
+
+          xhr.addEventListener("loadend", () => {
+            let payload = null;
+
+            try {
+              payload = JSON.parse(xhr.responseText || "null");
+            } catch (_) {
+              payload = xhr.responseText || "";
+            }
+
+            const result = {
+              id,
+              status: xhr.status,
+              payload,
+              elapsedMs: Date.now() - startedAt
+            };
+
+            fastPathTap.lastResult = result;
+            fastPathTap.results.set(id, result);
+
+            // 只留最近若干条，避免长时间挂着页面时无限增长。
+            if (fastPathTap.results.size > 20) {
+              const oldest = [...fastPathTap.results.keys()].sort(
+                (a, b) => a - b
+              )[0];
+              fastPathTap.results.delete(oldest);
+            }
+
+            notifyFastPathTap();
+          });
+
+          notifyFastPathTap();
+        }
+      }
+
+      return originalSend.apply(this, arguments);
+    };
+  }
+
+  function getFastPathPageMessage() {
+    const messages = [
+      ...document.querySelectorAll(".el-message, .el-notification")
+    ].filter(isVisibleElement);
+
+    const last = messages[messages.length - 1];
+
+    return last ? cleanText(last.textContent) : "";
+  }
+
+  function evaluateFastPathPutResult(result) {
+    if (!result) {
+      return {
+        ok: false,
+        reason:
+          "保存请求已发出，但在限定时间内没有收到响应"
+      };
+    }
+
+    if (result.status < 200 || result.status >= 300) {
+      return {
+        ok: false,
+        reason: `保存请求返回 HTTP ${result.status}`
+      };
+    }
+
+    const payload = result.payload;
+    const isObject = payload && typeof payload === "object";
+
+    // 页面拦截器：code 缺失时按 200 处理，000000 视为成功。
+    const code = isObject
+      ? (payload.code ?? payload.status ?? payload.resultCode)
+      : null;
+
+    const text = isObject
+      ? (payload.errorMsg || payload.msg || payload.message || "")
+      : "";
+
+    if (code === null || code === undefined || code === "") {
+      return { ok: true, code: "", elapsedMs: result.elapsedMs };
+    }
+
+    const normalized = String(code);
+
+    if (normalized === "000000" || normalized === "200") {
+      return {
+        ok: true,
+        code: normalized,
+        elapsedMs: result.elapsedMs
+      };
+    }
+
+    return {
+      ok: false,
+      code: normalized,
+      reason:
+        `接口返回 ${normalized}` +
+        `${text ? `：${cleanText(text)}` : ""}`
+    };
+  }
+
+  /*
+   * 把目标值写进页面表单。
+   *
+   * 只动两个字段：
+   *   dimeBaseharmList —— 危害因素（存的是危害 id 数组）
+   *   worktype         —— 在岗状态（1001~1007）
+   * 写完调用页面自己的 updateTouchHarms() 刷新"接害因素"只读字段，
+   * 再用一小段渲染缓冲让 Treeselect 标签与下拉显示跟上。
+   */
+  async function applyFastPathFill(vm, plan) {
+    const form = vm.packageForm;
+
+    if (!form) {
+      throw new Error("页面编辑表单尚未就绪");
+    }
+
+    const existing = Array.isArray(form.dimeBaseharmList)
+      ? form.dimeBaseharmList.slice()
+      : [];
+
+    const existingKeys = new Set(existing.map(item => String(item)));
+
+    const additions = plan.harmIds.filter(
+      id => !existingKeys.has(String(id))
+    );
+
+    if (additions.length) {
+      form.dimeBaseharmList = [...existing, ...additions];
+    }
+
+    let stageChanged = false;
+
+    if (plan.stageCode && form.worktype !== plan.stageCode) {
+      form.worktype = plan.stageCode;
+      stageChanged = true;
+    }
+
+    if (typeof vm.updateTouchHarms === "function") {
+      vm.updateTouchHarms();
+    }
+
+    // 页面自己 watch 了 packageForm.dimeBaseharmList，写入后会在同一轮渲染里
+    // 刷新标签与"接触危害"只读框。弹窗可见时等 DOM 真正更新完，不用固定毫秒数；
+    // ghost 模式下没人看界面，提交读的又是数据模型而非 DOM，渲染等待整段跳过。
+    if (!fastPathGhost.active) {
+      await waitFastPathRender(vm);
+      await waitFastPathRender(vm);
+    }
+
+    return {
+      additions: additions.length,
+      totalHazards: Array.isArray(form.dimeBaseharmList)
+        ? form.dimeBaseharmList.length
+        : 0,
+      stageChanged,
+      stageCode: form.worktype
+    };
+  }
+
+  /*
+   * 调页面自己的 submitPackageForm()，然后等那一次 PUT 的结果。
+   *
+   * 分两步，避免"请求根本没发出去"时白等一整个超时：
+   *   1) 先确认请求确实发出去了（表单校验不过时页面会直接拦截）
+   *   2) 再等这一次请求的响应，以接口回执判定成败
+   */
+  function describeFastPathNoRequest(vm) {
+    const validationError = getFastPathValidationError(vm);
+    const pageMessage = getFastPathPageMessage();
+
+    return [
+      "页面没有发出保存请求",
+      validationError
+        ? `：表单校验未通过（${validationError}）`
+        : "：多半被页面自身的校验拦下",
+      pageMessage ? `（页面提示：${pageMessage}）` : ""
+    ].join("");
+  }
+
+  async function submitFastPathPackageForm(vm, code) {
+    const seqBefore = fastPathTap.seq;
+    const lastSentIdBefore = fastPathTap.lastSentId;
+
+    // 先挂好探针再触发提交（提交是异步的：页面要先过表单校验）。
+    const sentPromise = waitFastPathCondition(
+      () => fastPathTap.seq > seqBefore,
+      FAST_PATH.requestStartTimeoutMs
+    );
+
+    try {
+      vm.submitPackageForm();
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `调用页面保存出错：${
+          error?.message || String(error)
+        }`,
+        code
+      };
+    }
+
+    // 两条线赛跑：请求真的发出去 vs 校验当场拦下。
+    // 校验拦下时请求永远不会发出，不必干等到请求超时。
+    const reached = await Promise.race([
+      sentPromise.then(() => "sent"),
+      sleep(FAST_PATH.validationCheckDelayMs).then(() => "check")
+    ]);
+
+    if (reached === "check") {
+      const validationError = getFastPathValidationError(vm);
+
+      if (validationError) {
+        // 极少数情况下"校验报错"与"请求已发出"同时发生，再确认一次。
+        const lateSent = await Promise.race([
+          sentPromise,
+          sleep(FAST_PATH.validationCheckDelayMs).then(() => false)
+        ]);
+
+        if (!lateSent) {
+          return {
+            ok: false,
+            reason: `表单校验未通过：${validationError}`,
+            code
+          };
+        }
+      }
+
+      const sent = await sentPromise;
+
+      if (!sent) {
+        return {
+          ok: false,
+          reason: describeFastPathNoRequest(vm),
+          code
+        };
+      }
+    }
+
+    // 只认"这一次"的响应，避免把上一次的残留响应算成成功。
+    const requestId =
+      fastPathTap.lastSentId > lastSentIdBefore
+        ? fastPathTap.lastSentId
+        : seqBefore + 1;
+
+    const done = await waitFastPathCondition(
+      () => fastPathTap.results.has(requestId),
+      FAST_PATH.submitTimeoutMs
+    );
+
+    return {
+      ...evaluateFastPathPutResult(
+        done ? fastPathTap.results.get(requestId) : null
+      ),
+      code
+    };
+  }
+
+  async function closeFastPathDialog(vm) {
+    try {
+      if (vm?.openPackage) {
+        vm.cancelPackage?.();
+      }
+    } catch (_) {}
+
+    await waitFastPathRender(vm);
+  }
+
+  /* ===================================================================
+   * 批量"单窗轮播"
+   *
+   * 页面这个编辑弹窗是 destroy-on-close + 全屏模态遮罩：
+   * 每关一次就整棵销毁，再开一次就重建（680+ 条危害的选择树跟着重建），
+   * 而且遮罩和弹窗各闪一次淡入淡出——一个页面有几个套餐就闪几次。
+   *
+   * 做法：整批只开一次窗，把每一条的内容换进同一个弹窗。
+   * 页面自己的 editPackage 本来就是"深拷贝这一行 → 赋给 packageForm"，
+   * 弹窗开着时这一步只会原地更新内容，不重建任何组件（实测 DOM 只改值、
+   * 组件实例与 $refs 都保持不变）。
+   *
+   * 页面保存成功后会把 openPackage 置回 false，这里在整批期间暂时"接住"
+   * 这次置位，等整批结束再真正关窗；同时接管弹窗里的"取消"按钮，
+   * 避免它在保存过程中清空表单（页面保存是乐观提交，清空可能写坏数据），
+   * 并把点击解释为"停止批量处理"。
+   * =================================================================== */
+  const fastPathHold = {
+    active: false,
+    vm: null,
+    descriptor: null,
+    blockedCloses: 0,
+    handler: null
+  };
+
+  /* ------------------------------------------------------------------
+   * 弹窗隐身（ghost）
+   *
+   * 弹窗组件必须真实存在（$refs、校验、保存都依赖它），但不需要被看见。
+   * 整批期间给 body 挂一个标记类，用一条 CSS 把页面的 el-dialog 遮罩层
+   * 整体挪出屏幕（top:-9999px）——组件照常渲染、照常提交，屏幕上却什么
+   * 都不出现，也就没有了开窗动画、逐条换内容的闪烁和全屏遮罩。
+   *
+   * 不用 visibility:hidden / opacity:0：脚本对"可见"的判定
+   * （isVisibleElement）会把这两种状态当成不可见，导致保存失败时读不出
+   * 表单校验报错、定位不到弹窗内容；挪出屏幕则一切判定照旧。
+   *
+   * ⚠️ Element UI 的黑色半透明模态背景（v-modal）是独立挂在 body 上的
+   * 兄弟节点，不在 .el-dialog__wrapper 里 —— 只挪 wrapper 的话，屏幕上会
+   * 剩下"整页变灰但什么都没有"的一层黑幕，还挡住所有点击。
+   * 所以 ghost 期间必须把它一并 display:none，做到真正的零视觉痕迹。
+   *
+   * 用 body 标记类而不是给某个 wrapper 加类，是因为这个弹窗是
+   * destroy-on-close：首次打开之前 wrapper 根本不存在，无法提前定位；
+   * 而"隐身"必须赶在第一次开窗之前生效，否则开窗动画会闪一下。
+   * 批量期间页面自己也不会开别的弹窗，影响范围可控。
+   * ------------------------------------------------------------------ */
+  const FAST_PATH_GHOST_BODY_CLASS = "dime-fastpath-ghost-on";
+  const FAST_PATH_GHOST_STYLE_ID = "dime-fastpath-ghost-style";
+  const fastPathGhost = { active: false };
+
+  function beginFastPathGhost() {
+    if (fastPathGhost.active) return;
+
+    let style = document.getElementById(FAST_PATH_GHOST_STYLE_ID);
+
+    if (!style) {
+      style = document.createElement("style");
+      style.id = FAST_PATH_GHOST_STYLE_ID;
+      style.textContent =
+        "body." + FAST_PATH_GHOST_BODY_CLASS +
+        " .el-dialog__wrapper{top:-9999px!important}" +
+        "body." + FAST_PATH_GHOST_BODY_CLASS +
+        " .v-modal{display:none!important}" +
+        // 页面自己的全屏白色加载层（每次请求都闪一下）批量期间也隐掉，
+        // 否则就是"盯着白屏转圈等"——进度一律看悬浮 HUD。
+        "body." + FAST_PATH_GHOST_BODY_CLASS +
+        " .el-loading-mask{display:none!important}";
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    document.body.classList.add(FAST_PATH_GHOST_BODY_CLASS);
+    fastPathGhost.active = true;
+  }
+
+  function endFastPathGhost() {
+    if (!fastPathGhost.active) return;
+
+    document.body.classList.remove(FAST_PATH_GHOST_BODY_CLASS);
+    fastPathGhost.active = false;
+  }
+
+  /* ------------------------------------------------------------------
+   * 批量进度 HUD（悬浮卡片）
+   *
+   * 弹窗隐身后，屏幕上没有任何动静，"看着空白屏幕等"体验很差。
+   * 这张毛玻璃小卡片就是批量期间唯一的动态元素：
+   *   渐变进度条 + 已处理计数 + 当前套餐 + 已保存/跳过/失败 实时计数，
+   *   卡片上的"停止"按钮与批量按钮等效（置 batchCancelRequested）。
+   * 批量结束（完成/停止/报错都算）后变正负零状态展示几秒，自动淡出。
+   * ------------------------------------------------------------------ */
+  const BATCH_HUD_ID = "dime-batch-hud";
+  const batchHud = { el: null, total: 0 };
+
+  function ensureBatchHudStyle() {
+    if (document.getElementById(BATCH_HUD_ID + "-style")) return;
+
+    const style = document.createElement("style");
+    style.id = BATCH_HUD_ID + "-style";
+    style.textContent = [
+      `#${BATCH_HUD_ID}{position:fixed;right:20px;bottom:20px;z-index:2147483647;`,
+      "width:264px;padding:14px 16px 12px;border-radius:14px;",
+      "background:rgba(255,255,255,.85);",
+      "backdrop-filter:blur(14px) saturate(1.4);",
+      "-webkit-backdrop-filter:blur(14px) saturate(1.4);",
+      "border:1px solid rgba(255,255,255,.65);",
+      "box-shadow:0 12px 40px rgba(31,45,61,.18),0 2px 8px rgba(31,45,61,.08);",
+      "color:#303133;font-size:12px;",
+      "animation:dimeHudIn .35s cubic-bezier(.22,1,.36,1)}",
+      `#${BATCH_HUD_ID}.is-leaving{opacity:0;transform:translateY(8px);`,
+      "transition:opacity .45s ease,transform .45s ease}",
+      "@keyframes dimeHudIn{from{opacity:0;transform:translateY(10px) scale(.97)}",
+      "to{opacity:1;transform:none}}",
+      ".dime-hud-title{display:flex;align-items:center;gap:6px;",
+      "font-size:12px;font-weight:600;color:#1f2d3d}",
+      ".dime-hud-dot{width:8px;height:8px;border-radius:50%;flex:none;",
+      "background:#8b5cf6;animation:dimeHudPulse 1.2s ease-in-out infinite}",
+      ".dime-hud-dot.is-done{background:#67c23a;animation:none}",
+      ".dime-hud-dot.is-stopped{background:#909399;animation:none}",
+      ".dime-hud-dot.is-failed{background:#f56c6c;animation:none}",
+      "@keyframes dimeHudPulse{0%,100%{opacity:1;transform:scale(1)}",
+      "50%{opacity:.45;transform:scale(.8)}}",
+      ".dime-hud-stop{margin-left:auto;border:none;background:transparent;",
+      "color:#909399;font-size:11px;cursor:pointer;padding:2px 6px;",
+      "border-radius:4px}",
+      ".dime-hud-stop:hover{color:#f56c6c;background:rgba(245,108,108,.08)}",
+      ".dime-hud-count{margin-top:8px;font-size:22px;font-weight:700;",
+      "color:#1f2d3d;font-variant-numeric:tabular-nums;line-height:1.1}",
+      ".dime-hud-count small{font-size:12px;color:#909399;font-weight:500}",
+      ".dime-hud-bar{margin-top:8px;height:6px;border-radius:3px;",
+      "background:rgba(31,45,61,.08);overflow:hidden}",
+      ".dime-hud-bar-fill{height:100%;width:0;border-radius:3px;",
+      "background:linear-gradient(90deg,#8b5cf6,#3b82f6);",
+      "transition:width .45s cubic-bezier(.22,1,.36,1)}",
+      ".dime-hud-current{margin-top:8px;font-size:11px;color:#606266;",
+      "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dime-hud-stats{display:flex;gap:12px;margin-top:6px;",
+      "font-size:11px;color:#909399}",
+      ".dime-hud-stats b{font-weight:600;color:inherit}",
+      ".dime-hud-stats .s-ok b{color:#67c23a}",
+      ".dime-hud-stats .s-skip b{color:#e6a23c}",
+      ".dime-hud-stats .s-fail b{color:#f56c6c}"
+    ].join("");
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function batchHudText(key, value) {
+    const node = batchHud.el?.querySelector(`[data-hud="${key}"]`);
+    if (node && node.textContent !== value) node.textContent = value;
+  }
+
+  function showBatchHud(total) {
+    ensureBatchHudStyle();
+
+    if (batchHud.el?.isConnected) batchHud.el.remove();
+    batchHud.total = total;
+
+    const el = document.createElement("div");
+    el.id = BATCH_HUD_ID;
+    el.innerHTML = [
+      '<div class="dime-hud-title">',
+      '<span class="dime-hud-dot" data-hud="dot"></span>',
+      '<span data-hud="title">静默修复中</span>',
+      '<button class="dime-hud-stop" type="button" data-hud="stop">停止</button>',
+      "</div>",
+      '<div class="dime-hud-count"><span data-hud="done">0</span>',
+      `<small> / ${total}</small></div>`,
+      '<div class="dime-hud-bar"><div class="dime-hud-bar-fill" data-hud="bar"></div></div>',
+      '<div class="dime-hud-current" data-hud="current">正在准备……</div>',
+      '<div class="dime-hud-stats">',
+      '<span class="s-ok">已保存 <b data-hud="saved">0</b></span>',
+      '<span class="s-skip">跳过 <b data-hud="skipped">0</b></span>',
+      '<span class="s-fail">失败 <b data-hud="failed">0</b></span>',
+      "</div>"
+    ].join("");
+
+    el.querySelector('[data-hud="stop"]').addEventListener("click", () => {
+      if (!batchRunning || batchCancelRequested) return;
+
+      batchCancelRequested = true;
+      batchHudText("title", "正在停止……");
+    });
+
+    document.body.appendChild(el);
+    batchHud.el = el;
+  }
+
+  function updateBatchHudCurrent(candidate, index, phase) {
+    if (!batchHud.el) return;
+
+    batchHudText(
+      "current",
+      [
+        `#${index} ${candidate.sequence || "-"} · ${candidate.code}`,
+        phase ? `｜${phase}` : ""
+      ].join("")
+    );
+  }
+
+  function bumpBatchHudProgress(status) {
+    if (!batchHud.el) return;
+
+    const done = Number(
+      batchHud.el.querySelector('[data-hud="done"]').textContent
+    ) + 1;
+
+    batchHudText("done", String(done));
+
+    const saved = Number(
+      batchHud.el.querySelector('[data-hud="saved"]').textContent
+    );
+    const skipped = Number(
+      batchHud.el.querySelector('[data-hud="skipped"]').textContent
+    );
+    const failed = Number(
+      batchHud.el.querySelector('[data-hud="failed"]').textContent
+    );
+
+    if (status === "saved") batchHudText("saved", String(saved + 1));
+    else if (status === "skipped") batchHudText("skipped", String(skipped + 1));
+    else batchHudText("failed", String(failed + 1));
+
+    const bar = batchHud.el.querySelector('[data-hud="bar"]');
+    bar.style.width = `${Math.min(
+      100,
+      (done / Math.max(1, batchHud.total || done)) * 100
+    )}%`;
+  }
+
+  function finishBatchHud(title, summary) {
+    if (!batchHud.el) return;
+
+    batchHudText("title", title);
+    if (summary) batchHudText("current", summary);
+
+    const dot = batchHud.el.querySelector('[data-hud="dot"]');
+    const stop = batchHud.el.querySelector('[data-hud="stop"]');
+
+    if (dot) {
+      dot.classList.add(
+        title.includes("完成")
+          ? "is-done"
+          : title.includes("失败") ||
+              title.includes("错误") ||
+              title.includes("出错")
+            ? "is-failed"
+            : "is-stopped"
+      );
+    }
+
+    if (stop) stop.remove();
+
+    const el = batchHud.el;
+    setTimeout(() => {
+      el.classList.add("is-leaving");
+      setTimeout(() => {
+        el.remove();
+        if (batchHud.el === el) batchHud.el = null;
+      }, 500);
+    }, 3600);
+  }
+
+  function findFastPathDialogCancelButton() {
+    const dialog = findVisibleEditDialogs()[0];
+    if (!dialog) return null;
+
+    const wanted = strictKey("取消");
+
+    return (
+      [...dialog.querySelectorAll("button")].find(button =>
+        strictKey(button.innerText || button.textContent).includes(wanted)
+      ) || null
+    );
+  }
+
+  function handleFastPathHoldClick(event) {
+    if (!fastPathHold.active) return;
+
+    const button = event.target?.closest?.("button");
+    if (!button || button !== findFastPathDialogCancelButton()) return;
+
+    // 在捕获阶段拦下，页面自己的"取消"处理不会执行，
+    // 因此不会在保存途中把表单清空。
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (batchRunning && !batchCancelRequested) {
+      batchCancelRequested = true;
+
+      updateBatchProgress(
+        "正在停止，请等待当前套餐结束",
+        [
+          "已收到停止请求（来自弹窗里的“取消”）",
+          "当前套餐完成或报错后停止。"
+        ].join("\n")
+      );
+    }
+  }
+
+  function beginFastPathHold(vm) {
+    if (fastPathHold.active || !FAST_PATH.holdDialogAcrossBatch) return;
+
+    const descriptor = Object.getOwnPropertyDescriptor(vm, "openPackage");
+
+    if (!descriptor || !descriptor.get || !descriptor.set) return;
+
+    fastPathHold.active = true;
+    fastPathHold.vm = vm;
+    fastPathHold.descriptor = descriptor;
+    fastPathHold.blockedCloses = 0;
+
+    Object.defineProperty(vm, "openPackage", {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get() {
+        return descriptor.get.call(vm);
+      },
+      set(value) {
+        if (fastPathHold.active && value === false) {
+          fastPathHold.blockedCloses++;
+          return;
+        }
+
+        descriptor.set.call(vm, value);
+      }
+    });
+
+    fastPathHold.handler = handleFastPathHoldClick;
+    document.addEventListener("click", fastPathHold.handler, true);
+  }
+
+  async function endFastPathHold(vm) {
+    if (!fastPathHold.active) return;
+
+    const heldVm = fastPathHold.vm || vm;
+
+    fastPathHold.active = false;
+
+    try {
+      if (heldVm && fastPathHold.descriptor) {
+        Object.defineProperty(
+          heldVm,
+          "openPackage",
+          fastPathHold.descriptor
+        );
+      }
+    } catch (_) {}
+
+    if (fastPathHold.handler) {
+      document.removeEventListener("click", fastPathHold.handler, true);
+      fastPathHold.handler = null;
+    }
+
+    fastPathHold.vm = null;
+    fastPathHold.descriptor = null;
+
+    // 整批结束才真正关窗，整批过程中一次都不关。
+    await closeFastPathDialog(heldVm);
+  }
+
+  /*
+   * 换到下一个套餐后清一次表单校验状态。
+   * 弹窗被复用，上一次的红色报错会留在 DOM 里，既影响观感，
+   * 也会被"校验是否拦截了请求"的判定误读成这一次的报错。
+   */
+  async function resetFastPathFormValidation(vm) {
+    try {
+      vm.$refs?.packageForm?.clearValidate?.();
+    } catch (_) {}
+
+    await waitFastPathRender(vm);
+  }
+
+  function describeFastPathFailure(resolution) {
+    const lines = [];
+
+    if (resolution.unresolved.length) {
+      lines.push(
+        `页面危害库里找不到：${resolution.unresolved.join("、")}`
+      );
+    }
+
+    resolution.ambiguous.forEach(item => {
+      lines.push(
+        `“${item.name}”在页面里对应多个危害（${item.candidates.join(" / ")}），无法自动确定`
+      );
+    });
+
+    return lines.join("\n");
+  }
+
+  /*
+   * 批量修复的快速通道：流水线并发版（v4.5）。
+   *
+   * 与界面模拟版共享同一套候选筛选与队列顺序；提交从"逐条等回执"
+   * 改成流水线：同一时刻最多 FAST_PATH.maxInFlight 个保存请求在途。
+   *
+   * 关键约束：页面的 packageForm 是单例，所有条目共用。
+   * "editPackage 换内容 → 写表单 → 提交到请求真正发出"这一段是临界区
+   * （表单校验是异步的，PUT 的 payload 在请求发出那一刻才序列化），
+   * 必须串行；请求一旦发出，payload 已定型，表单立刻让给下一条，
+   * 响应在途等待不占临界区。用一把 promise 锁保护临界区，
+   * 并发度实际由"在途响应数"决定。
+   *
+   * 失败策略（红领巾 2026-10-17 拍板"批末汇总重试"）：
+   *   主扫掠每条只提交一次，失败记入批末重试队列；重试阶段串行逐条
+   *   补足到 FAST_PATH.maxAttempts 次，仍失败才停批（首错即停保留在
+   *   重试阶段，避免系统性故障时白跑整批）。点了停止则跳过重试。
+   *   名称定位不了的确定性错误不重试，直接记入报告继续跑。
+   */
+
+  function createFastPathFormLock() {
+    let tail = Promise.resolve();
+
+    return function runExclusive(fn) {
+      const result = tail.then(fn, fn);
+      tail = result.then(() => {}, () => {});
+      return result;
+    };
+  }
+
+  /*
+   * 定位 + 解析：把一个候选变成"要写什么"的计划。
+   * 只读数据，不碰表单；返回 null 表示本来就不缺，无需动表单。
+   */
+  async function prepareFastPathCandidate(vm, candidate) {
+    const stageCode = candidate.expectedStage
+      ? getFastPathStageCode(candidate.expectedStage)
+      : "";
+
+    if (candidate.expectedStage && !stageCode) {
+      throw new Error(
+        `套餐 ${candidate.code} 的在岗状态“${candidate.expectedStage}”` +
+        "没有对应的页面取值，已中止"
+      );
+    }
+
+    const missingNames = (candidate.missing || [])
+      .map(item => item?.canonical || item?.raw)
+      .filter(Boolean);
+
+    const rowIndex = findFastPathPackageIndex(vm, candidate.code);
+
+    if (rowIndex < 0) {
+      throw new Error(`列表中找不到套餐编码 ${candidate.code}`);
+    }
+
+    const resolution = resolveFastPathHarmIds(
+      vm,
+      missingNames,
+      vm.basepackageList[rowIndex]?.dimeBaseharmList
+    );
+
+    if (resolution.unresolved.length || resolution.ambiguous.length) {
+      throw new Error(
+        [
+          `套餐 ${candidate.code} 的危害名称无法在页面危害库中唯一定位：`,
+          describeFastPathFailure(resolution)
+        ].filter(Boolean).join("\n")
+      );
+    }
+
+    const plan = {
+      harmIds: resolution.ids,
+      stageCode,
+      duplicateNames: resolution.duplicates
+    };
+
+    if (!plan.harmIds.length && !plan.stageCode) return null;
+
+    return plan;
+  }
+
+  /*
+   * 临界区：换内容 → 写表单 → 提交并等到请求真正发出。
+   * 必须在表单锁内执行；返回 skip 表示无需提交。
+   */
+  async function commitFastPathCandidate(vm, candidate, plan) {
+    const currentIndex = findFastPathPackageIndex(vm, candidate.code);
+
+    if (currentIndex < 0) {
+      throw new Error(`列表中找不到套餐编码 ${candidate.code}`);
+    }
+
+    const reuseDialog =
+      fastPathHold.active && Boolean(vm.$refs?.packageForm);
+
+    vm.editPackage({
+      row: vm.basepackageList[currentIndex],
+      $index: currentIndex
+    });
+
+    if (reuseDialog) {
+      await resetFastPathFormValidation(vm);
+    }
+
+    await waitForFastPathFormReady(vm, 4000);
+
+    // 护栏：弹窗里的套餐名称与核对时的名称不一致，说明中途被人改过，
+    // 缺失清单可能已失效，跳过而不是覆盖。
+    const liveName = cleanText(vm.packageForm?.packageName);
+
+    if (
+      candidate.packageName &&
+      liveName &&
+      strictKey(liveName) !== strictKey(candidate.packageName)
+    ) {
+      return {
+        kind: "skip",
+        note: "名称与核对时不一致，为避免写错已跳过"
+      };
+    }
+
+    const applied = await applyFastPathFill(vm, plan);
+
+    if (!applied.additions && !applied.stageChanged) {
+      return { kind: "skip", note: "无需修改" };
+    }
+
+    const fired = await fireFastPathSubmit(vm, candidate.code);
+
+    return { ...fired, applied };
+  }
+
+  /*
+   * 触发页面保存并等到"请求确实发出"（payload 在这一刻已序列化定型）。
+   * 不等响应——响应在锁外等，这就是流水线能并起来的原因。
+   */
+  async function fireFastPathSubmit(vm, code) {
+    const seqBefore = fastPathTap.seq;
+    const lastSentIdBefore = fastPathTap.lastSentId;
+
+    const sentPromise = waitFastPathCondition(
+      () => fastPathTap.seq > seqBefore,
+      FAST_PATH.requestStartTimeoutMs
+    );
+
+    try {
+      vm.submitPackageForm();
+    } catch (error) {
+      return {
+        kind: "blocked",
+        reason: `调用页面保存出错：${error?.message || String(error)}`
+      };
+    }
+
+    // 两条线赛跑：请求真的发出去 vs 校验当场拦下。
+    const reached = await Promise.race([
+      sentPromise.then(() => "sent"),
+      sleep(FAST_PATH.validationCheckDelayMs).then(() => "check")
+    ]);
+
+    if (reached === "check") {
+      const validationError = getFastPathValidationError(vm);
+
+      if (validationError) {
+        const lateSent = await Promise.race([
+          sentPromise,
+          sleep(FAST_PATH.validationCheckDelayMs).then(() => false)
+        ]);
+
+        if (!lateSent) {
+          return {
+            kind: "blocked",
+            reason: `表单校验未通过：${validationError}`
+          };
+        }
+      }
+
+      const sent = await sentPromise;
+
+      if (!sent) {
+        return { kind: "blocked", reason: describeFastPathNoRequest(vm) };
+      }
+    }
+
+    return {
+      kind: "sent",
+      sentId:
+        fastPathTap.lastSentId > lastSentIdBefore
+          ? fastPathTap.lastSentId
+          : seqBefore + 1
+    };
+  }
+
+  async function awaitFastPathResponse(sentId, code) {
+    const done = await waitFastPathCondition(
+      () => fastPathTap.results.has(sentId),
+      FAST_PATH.submitTimeoutMs
+    );
+
+    return {
+      ...evaluateFastPathPutResult(
+        done ? fastPathTap.results.get(sentId) : null
+      ),
+      code
+    };
+  }
+
+  /*
+   * 流水线主入口。返回 stopMessage（空串 = 全部处理完且重试全过）。
+   */
+  async function runFastPathPipeline(queue, applyResult) {
+    const vm = getFastPathVm();
+
+    if (!vm) {
+      return "找不到页面的套餐管理组件，数据层直写不可用；" +
+        "请改用界面模拟模式";
+    }
+
+    installFastPathTap();
+    beginFastPathHold(vm);
+    beginFastPathGhost();
+
+    const runExclusive = createFastPathFormLock();
+    const retryQueue = [];
+    let cursor = 0;
+    let inFlight = 0;
+    let stopMessage = "";
+
+    const describeItem = candidate =>
+      `${candidate.sequence || "-"} · ${candidate.code}`;
+
+    const describeApplied = applied => {
+      if (!applied) return "内容已更新";
+
+      const stageLabel = FAST_PATH_STAGE_CODES.find(
+        ([, code]) => code === applied.stageCode
+      )?.[0];
+
+      return [
+        applied.additions ? `新增危害 ${applied.additions} 项` : "",
+        applied.stageChanged && stageLabel
+          ? `在岗状态 → ${stageLabel}`
+          : ""
+      ].filter(Boolean).join("，") || "内容已更新";
+    };
+
+    const finishOutcome = (candidate, evaluation, applied, attempts) => {
+      if (!evaluation.ok) return false;
+
+      batchVerifiedCodes.add(strictKey(candidate.code));
+
+      applyResult(candidate, {
+        status: "saved",
+        attempts,
+        verificationMode: "network",
+        detail: describeApplied(applied)
+      });
+
+      return true;
+    };
+
+    /* ---- 主扫掠：每条一次，最多 maxInFlight 个请求在途 ---- */
+    const worker = async () => {
+      while (!batchCancelRequested && !stopMessage) {
+        const index = cursor++;
+
+        if (index >= queue.length) return;
+
+        const candidate = queue[index];
+
+        // 定位/解析类错误（名称定位不了、列表里没这个编码）重试也不会
+        // 变好：直接记入报告继续跑，不进重试队列。
+        let plan;
+
+        try {
+          plan = await prepareFastPathCandidate(vm, candidate);
+        } catch (error) {
+          applyResult(candidate, {
+            status: "failed",
+            reason: error?.message || String(error)
+          });
+          continue;
+        }
+
+        if (!plan) {
+          applyResult(candidate, {
+            status: "skipped",
+            attempts: 1,
+            verificationMode: "none",
+            note: "无需修改"
+          });
+          continue;
+        }
+
+        try {
+          updateBatchHudCurrent(candidate, index + 1, "写入表单并提交……");
+
+          const committed = await runExclusive(() =>
+            commitFastPathCandidate(vm, candidate, plan)
+          );
+
+          if (committed.kind === "skip") {
+            applyResult(candidate, {
+              status: "skipped",
+              attempts: 1,
+              verificationMode: "none",
+              note: committed.note
+            });
+            continue;
+          }
+
+          if (committed.kind === "blocked") {
+            retryQueue.push({
+              candidate,
+              lastReason: committed.reason || "未知原因"
+            });
+            continue;
+          }
+
+          inFlight++;
+          updateBatchHudCurrent(
+            candidate,
+            index + 1,
+            `已提交，等待回执（在途 ${inFlight}）`
+          );
+
+          const evaluation = await awaitFastPathResponse(
+            committed.sentId,
+            candidate.code
+          );
+
+          inFlight--;
+
+          if (finishOutcome(candidate, evaluation, committed.applied, 1)) {
+            continue;
+          }
+
+          retryQueue.push({
+            candidate,
+            lastReason: evaluation.reason || "未知原因"
+          });
+        } catch (error) {
+          // 提交环节的瞬时错误（弹窗未就绪、表单被占用等）：交给批末重试。
+          retryQueue.push({
+            candidate,
+            lastReason: error?.message || String(error)
+          });
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from(
+        { length: Math.min(FAST_PATH.maxInFlight, queue.length) },
+        () => worker()
+      )
+    );
+
+    /* ---- 批末重试：串行逐条补足次数；仍失败则停批 ---- */
+    if (!batchCancelRequested && !stopMessage && retryQueue.length) {
+      for (const item of retryQueue) {
+        if (batchCancelRequested || stopMessage) break;
+
+        const candidate = item.candidate;
+        let resolved = false;
+        let lastReason = item.lastReason;
+
+        for (
+          let attempt = 2;
+          attempt <= FAST_PATH.maxAttempts && !resolved;
+          attempt++
+        ) {
+          try {
+            updateBatchHudCurrent(
+              candidate,
+              "重试",
+              `第 ${attempt - 1}/${FAST_PATH.maxAttempts - 1} 次补试……`
+            );
+
+            const plan = await prepareFastPathCandidate(vm, candidate);
+
+            if (!plan) {
+              applyResult(candidate, {
+                status: "skipped",
+                attempts: attempt,
+                verificationMode: "none",
+                note: "无需修改"
+              });
+              resolved = true;
+              break;
+            }
+
+            const committed = await runExclusive(() =>
+              commitFastPathCandidate(vm, candidate, plan)
+            );
+
+            if (committed.kind === "skip") {
+              applyResult(candidate, {
+                status: "skipped",
+                attempts: attempt,
+                verificationMode: "none",
+                note: committed.note
+              });
+              resolved = true;
+              break;
+            }
+
+            if (committed.kind === "blocked") {
+              lastReason = committed.reason || "未知原因";
+            } else {
+              const evaluation = await awaitFastPathResponse(
+                committed.sentId,
+                candidate.code
+              );
+
+              if (
+                finishOutcome(
+                  candidate,
+                  evaluation,
+                  committed.applied,
+                  attempt
+                )
+              ) {
+                resolved = true;
+                break;
+              }
+
+              lastReason = evaluation.reason || "未知原因";
+            }
+          } catch (error) {
+            lastReason = error?.message || String(error);
+            break;
+          }
+
+          if (attempt < FAST_PATH.maxAttempts) {
+            await sleep(FAST_PATH.retryDelayMs);
+          }
+        }
+
+        if (!resolved) {
+          applyResult(candidate, {
+            status: "failed",
+            reason: lastReason
+          });
+
+          stopMessage = [
+            `套餐 ${describeItem(candidate)} 已自动尝试 ` +
+              `${FAST_PATH.maxAttempts} 次仍未保存成功。`,
+            `最后一次原因：${lastReason}`,
+            "批量处理已停止，请检查该套餐。"
+          ].join("\n");
+
+          break;
+        }
+      }
+    }
+
+    return stopMessage;
+  }
+
   async function processOneBatchCandidate(
     candidate,
     itemIndex,
     totalItems
   ) {
+    // 快速通道已升级为流水线并发（runFastPathPipeline），
+    // 由 startBatchRepair 直接分流，不再经过这里。
     let lastVerification = null;
 
     for (
@@ -7699,9 +9517,13 @@
       ].join("\n")
     );
 
+    showBatchHud(queue.length);
+
     let savedCount = 0;
     let skippedCount = 0;
+    let failedCount = 0;
     let retryCount = 0;
+    let networkCount = 0;
     let fastCount = 0;
     let combinedFastCount = 0;
     let reopenedCount = 0;
@@ -7710,73 +9532,128 @@
     let completedHazardOnly = 0;
     let completedCombined = 0;
     let failedMessage = "";
+    const batchLog = [];
+
+    let doneCount = 0;
+
+    // 两条处理路径（流水线 / 界面模拟）共用的结果归账：
+    // 计数、HUD、按钮进度、逐条报告都在这里。
+    const applyBatchResult = (candidate, result) => {
+      doneCount++;
+      updateBatchProgress(
+        `停止批量处理（${doneCount}/${queue.length}）`
+      );
+
+      if (result.status === "saved") {
+        savedCount++;
+        bumpBatchHudProgress("saved");
+        batchLog.push(
+          [
+            `已保存｜${candidate.sequence || "-"} · ${candidate.code}`,
+            result.detail ? `（${result.detail}）` : ""
+          ].filter(Boolean).join("")
+        );
+
+        if (candidate.batchType === "stage-only") {
+          completedStageOnly++;
+        } else if (
+          candidate.batchType === "hazard-only"
+        ) {
+          completedHazardOnly++;
+        } else if (
+          candidate.batchType === "combined"
+        ) {
+          completedCombined++;
+        }
+
+        retryCount += Math.max(
+          0,
+          (result.attempts || 1) - 1
+        );
+
+        if (
+          result.verificationMode === "network"
+        ) {
+          networkCount++;
+        } else if (
+          result.verificationMode === "fast"
+        ) {
+          fastCount++;
+        } else if (
+          result.verificationMode ===
+          "combined-fast"
+        ) {
+          combinedFastCount++;
+        } else {
+          reopenedCount++;
+
+          if (
+            result.verificationMode ===
+            "combined-audit"
+          ) {
+            combinedAuditCount++;
+          }
+        }
+      } else if (result.status === "skipped") {
+        skippedCount++;
+        bumpBatchHudProgress("skipped");
+        batchLog.push(
+          [
+            `跳过｜${candidate.sequence || "-"} · ${candidate.code}`,
+            result.note ? `（${result.note}）` : ""
+          ].filter(Boolean).join("")
+        );
+      } else {
+        failedCount++;
+        bumpBatchHudProgress("failed");
+        batchLog.push(
+          [
+            `失败｜${candidate.sequence || "-"} · ${candidate.code}`,
+            result.reason ? `（${result.reason}）` : ""
+          ].filter(Boolean).join("")
+        );
+      }
+    };
 
     try {
-      for (let index = 0; index < queue.length; index++) {
-        if (batchCancelRequested) break;
+      if (fastPathEnabled) {
+        // 流水线并发：最多 maxInFlight 个保存请求同时在途，
+        // 失败项批末串行重试；stopMessage 非空 = 重试仍失败已停批。
+        failedMessage = await runFastPathPipeline(
+          queue,
+          applyBatchResult
+        );
+      } else {
+        for (let index = 0; index < queue.length; index++) {
+          if (batchCancelRequested) break;
 
-        const candidate = queue[index];
+          const candidate = queue[index];
 
-        try {
-          const result = await processOneBatchCandidate(
-            candidate,
-            index + 1,
-            queue.length
-          );
+          updateBatchHudCurrent(candidate, index + 1);
 
-          if (result.status === "saved") {
-            savedCount++;
-
-            if (candidate.batchType === "stage-only") {
-              completedStageOnly++;
-            } else if (
-              candidate.batchType === "hazard-only"
-            ) {
-              completedHazardOnly++;
-            } else if (
-              candidate.batchType === "combined"
-            ) {
-              completedCombined++;
-            }
-
-            retryCount += Math.max(
-              0,
-              (result.attempts || 1) - 1
+          try {
+            const result = await processOneBatchCandidate(
+              candidate,
+              index + 1,
+              queue.length
             );
 
-            if (
-              result.verificationMode === "fast"
-            ) {
-              fastCount++;
-            } else if (
-              result.verificationMode ===
-              "combined-fast"
-            ) {
-              combinedFastCount++;
-            } else {
-              reopenedCount++;
-
-              if (
-                result.verificationMode ===
-                "combined-audit"
-              ) {
-                combinedAuditCount++;
-              }
-            }
-          } else {
-            skippedCount++;
+            applyBatchResult(candidate, result);
+          } catch (error) {
+            bumpBatchHudProgress("failed");
+            failedMessage = [
+              `停止于第 ${index + 1}/${queue.length} 个套餐`,
+              `${candidate.sequence || "-"} · ${candidate.code}`,
+              error.message || String(error)
+            ].join("\n");
+            break;
           }
-        } catch (error) {
-          failedMessage = [
-            `停止于第 ${index + 1}/${queue.length} 个套餐`,
-            `${candidate.sequence || "-"} · ${candidate.code}`,
-            error.message || String(error)
-          ].join("\n");
-          break;
         }
       }
     } finally {
       const batchElapsedMs = Date.now() - batchStartedAt;
+      // 整批共用的那一个弹窗，替页面省下了多少次"关窗→整棵重建"。
+      const heldDialogCount = fastPathHold.blockedCloses;
       const processedCount = savedCount + skippedCount;
       const elapsedText =
         `总耗时 ${(batchElapsedMs / 1000).toFixed(1)} 秒` +
@@ -7811,6 +9688,12 @@
         completedCombined
           ? `岗位和危害都缺：完成 ${completedCombined} 个`
           : "",
+        networkCount
+          ? `数据层直写保存并经接口回执确认 ${networkCount} 个套餐`
+          : "",
+        networkCount && heldDialogCount
+          ? `整批共用一个编辑弹窗，省下 ${heldDialogCount} 次弹窗关闭与重建`
+          : "",
         fastCount
           ? `单项修改快速通过 ${fastCount} 个套餐`
           : "",
@@ -7829,15 +9712,49 @@
         retryCount
           ? `保存不完整时自动重试 ${retryCount} 次`
           : "",
+        failedCount
+          ? `自动补试后仍失败 ${failedCount} 个套餐（见逐条结果）`
+          : "",
         skippedCount
           ? `无需修改并跳过 ${skippedCount} 个套餐`
           : "",
         failedMessage,
+        batchLog.length
+          ? [
+              "逐条核对（按完成顺序）：",
+              ...batchLog,
+              failedMessage
+                ? "（停止后未处理项不在列表中）"
+                : ""
+            ].filter(Boolean).join("\n")
+          : "",
         elapsedText,
-        "队列按“只缺岗位 → 只缺危害 → 两者都缺”处理；组合套餐岗位选中后只留短缓冲，再补危害并在提交前双向复核。"
+        "队列按“只缺岗位 → 只缺危害 → 两者都缺”处理。",
+        networkCount
+          ? `本次为静默直写＋流水线并发（最多 ${FAST_PATH.maxInFlight} 条请求同时在途）：编辑弹窗整批只在后台开一次（全程不可见），每条套餐一次保存请求、成败以接口回执为准；失败项批末自动补试。请对照逐条结果自行抽查核对。`
+          : "组合套餐岗位选中后只留短缓冲，再补危害并在提交前双向复核。"
       ].filter(Boolean).join("\n");
 
       batchCancelRequested = false;
+
+      // 整批结束（正常结束、停止或报错都走这里）：
+      // 恢复弹窗的关闭能力，把整批共用着的那一次弹窗真正关掉，
+      // 并解除弹窗隐身（先关窗再解除，关窗动画也不会被看见）。
+      await endFastPathHold(getFastPathVm());
+      endFastPathGhost();
+
+      finishBatchHud(
+        failedMessage
+          ? "批量已停止（出错）"
+          : stoppedByUser
+            ? "已按要求停止"
+            : "批量修复完成",
+        [
+          `已保存 ${savedCount} · 跳过 ${skippedCount}`,
+          failedCount ? ` · 失败 ${failedCount}` : "",
+          ` · 用时 ${(batchElapsedMs / 1000).toFixed(1)} 秒`
+        ].join("")
+      );
 
       try {
         await waitForNoVisibleEditDialog(2500);
@@ -8883,5 +10800,5 @@
     hideToolPanel();
     enhanceVisibleEditDialogs();
   });
-  console.log("套餐危害因素核对工具 v4.2.25 已加载。");
+  console.log("套餐危害因素核对工具 v4.5.0 已加载。");
 })();
