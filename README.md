@@ -8,7 +8,7 @@
 
 GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动更新。
 
-当前正式发布 **16** 个脚本 · 最近修改 **2026-10-01 15:44**
+当前正式发布 **16** 个脚本 · 最近修改 **2026-10-16 15:23**
 
 </div>
 
@@ -61,7 +61,7 @@ GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动�
 | **扁鹊-1.4对账报表导出** | `1.10` | 2026-09-24 17:29 | SOA对账报表：支持自定义日期区间，突破3年的时间段限制，自动分段查询、导出。并自动对比报表与订单内的数据差异。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-duizhangbaobiao.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-duizhangbaobiao.user.js) |
 | **扁鹊-1.5业绩报表辅助** | `1.1.6` | 2026-09-24 17:29 | SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-baobiaodaochu.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-baobiaodaochu.user.js) |
 | **扁鹊-1.6制卡管理查询** | `0.5.8` | 2026-09-26 11:50 | 查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-zhikaguanli.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-zhikaguanli.user.js) |
-| **扁鹊-1.7订单特殊审批** | `2.2.1` | 2026-09-24 17:29 | SOA特殊审批开关：一键在「特殊审批 开」（业务员报价后不可修改订单=勾选 + 检中修改钉钉审批=不启用）与「特殊审批 关」（反之，已恢复正常）之间切换。直接发请求、不跳转页面、不弹确认框，切完自动回读校验。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-neiqinshenpi.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-neiqinshenpi.user.js) |
+| **扁鹊-1.7订单特殊审批** | `2.2.2` | 2026-10-16 15:23 | SOA特殊审批开关：一键在「特殊审批 开」（业务员报价后不可修改订单=勾选 + 检中修改钉钉审批=不启用）与「特殊审批 关」（反之，已恢复正常）之间切换。直接发请求、不跳转页面、不弹确认框，切完自动回读校验。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-neiqinshenpi.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-neiqinshenpi.user.js) |
 | **扁鹊-1.8套餐批量删除** | `1.1.1` | 2026-09-24 17:29 | SOA 订单页：列出当前订单的全部套餐/加项包，勾选后批量删除。只在「未落单」或「已落单+检中修改」时加载；自动识别并灰显已作废套餐、已体检人员所在套餐、绑定关系复杂的加项包/赠送包。直接调接口（package/query + package/delete），不模拟点击。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-shanchutaocan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-shanchutaocan.user.js) |
 | **扁鹊-1.9套餐加项核对** | `1.9.0` | 2026-09-30 09:05 | SOA 订单页：核对「套餐 ↔ 绑定的赠送包 ↔ 包内项目」。只看赠送包(GIVEPKG)、不看加项包；按组展示、组头标注该组「几选几」（最少选N个/最多选N个）；每条套餐 = 一张独立卡片（序号 + 套餐信息头 + 赠送区），长套餐名/包名的共同前缀提到顶部只说一次；包内项目**一列**竖排、**包与包之间两列并排**；面板支持 **ESC 关闭**。纯只读，不发起任何写请求。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-jiaxiangbaohedui.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-jiaxiangbaohedui.user.js) |
 | **蝶美-1.1单位信息填充** | `7.8.6` | 2026-09-24 17:29 | 蝶美自动填充单位信息：按输入字段自适应填写，支持重复运行跳过、缺失字段跳过、行业/经济末级匹配、地区、单位类型、社会信用代码、企业规模及人数等字段。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/diemei/diemei-danweixinxi.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/diemei/diemei-danweixinxi.user.js) |
