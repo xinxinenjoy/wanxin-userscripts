@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.2套餐危害核对
 // @namespace    https://dime.health-100.cn/
-// @version      4.2.19
+// @version      4.2.25
 // @description  蝶美套餐危害核对：提供自动化核对、批量处理、自动选择等功能。注意：套餐名称的标准格式应为：XX-危害1+危害2+危害3+岗中+男，不保证能识别其他格式。
 
 // @match        https://dime.health-100.cn/*
@@ -97,20 +97,42 @@
 
   // 批量处理优先保证一次完成，而不是追求最快速度。
   // 每个套餐保存后都会重新打开编辑弹窗，确认数据已经真正写入。
+  //
+  // λ 定位（v4.2.25 起）：这里的数值只作为"两次状态检测之间的最小间隔"。
+  //   真正决定何时继续的，是各处 waitUntil / waitForDialog*Stable 的状态判定；
+  //   固定睡眠只负责给浏览器渲染与 Vue 更新留一点收尾时间，所以都压到很小。
+  //   "数据是否真的到位" 一律由状态判定负责，不再靠"睡够久"。
   const BATCH_RELIABILITY = {
-    dialogLoadDelayMs: 650,
-    selectionStableMs: 650,
-    beforeSubmitStableMs: 750,
+    // 弹窗出现后的收尾缓冲。原为 650，但它后面紧跟着状态驱动的
+    // waitForDialogSnapshotStable —— 属于同一件事做两次，故压到 100。
+    dialogLoadDelayMs: 100,
+    // 弹窗内容签名需连续不变这么久才算"载入完成"。
+    // 实测单次采样成本 <1ms（中位 0.1ms），250ms 内已能拿到 3~4 次一致采样。
+    snapshotStableMs: 250,
+    // 每个危害选中之后的"稳定窗"：实测组件 select 后 100ms 内标签与表单模型就同步完毕，
+    // 300ms 已有 3 倍余量；真正确认写入由提交前的双向复核兜底。
+    selectionStableMs: 300,
+    // 提交前"危害/岗位齐备且签名不变"的确认窗（状态驱动；原 750）。
+    beforeSubmitStableMs: 400,
+    // 提交前最后一个固定缓冲（原为硬编码在 commit 里的 300）。
+    beforeSubmitTailMs: 150,
 
     // 组合操作采用“岗位优先”。
     // selectDialogStage 已经确认岗位值写入，因此只留很短时间关闭下拉，
     // 随后立即开始危害选择；准确性由提交前双向复核保证。
     combinedStageToHazardDelayMs: 120,
-    combinedFinalStableMs: 1000,
-    combinedBeforeSubmitStableMs: 700,
+    // 组合流程中"岗位+全部危害同时复核"的稳定窗（状态驱动；原 1000）。
+    combinedFinalStableMs: 600,
+    combinedBeforeSubmitStableMs: 400,
 
-    afterSubmitCooldownMs: 750,
-    verifyOpenDelayMs: 650,
+    // 保存后冷却：弹窗关闭即代表保存请求已完成，这里只是等页面刷新列表。
+    // 紧接着定位列表行时还有等待重试兜底，因此可以压得很短（原 750）。
+    afterSubmitCooldownMs: 300,
+    // 按套餐编码在列表里定位那一行：先立即找，找不到再轮询等待。
+    rowLookupRetryMs: 120,
+    rowLookupTimeoutMs: 3000,
+
+    verifyOpenDelayMs: 250,
     retryDelayMs: 900,
     maxPackageAttempts: 3
   };
@@ -3146,7 +3168,7 @@
   tool.id = TOOL_ID;
   tool.innerHTML = `
     <div class="tool-header">
-      <strong>套餐危害因素核对工具 v4.2.19</strong>
+      <strong>套餐危害因素核对工具 v4.2.25</strong>
       <div class="tool-header-actions">
         <button class="tool-header-button tool-collapse" type="button" title="折叠工具">−</button>
         <button class="tool-header-button tool-close" type="button" title="收起到快捷按钮">×</button>
@@ -4421,20 +4443,28 @@
   }
 
   async function waitUntil(check, timeout = 3500, interval = 60, description = "条件") {
+    // 无条件真判断两次以上，避免"一次没轮到就直接判超时"。
+    const budget = Math.max(timeout, 1);
     const startedAt = Date.now();
     let lastError = null;
-    while (Date.now() - startedAt < timeout) {
+    let attempts = 0;
+
+    while (true) {
+      attempts += 1;
       try {
         const result = check();
         if (result) return result;
       } catch (error) {
         lastError = error;
       }
+      if (attempts >= 2 && Date.now() - startedAt >= budget) break;
       await sleep(interval);
     }
+
     const suffix = lastError ? `；最后错误：${lastError.message || lastError}` : "";
     throw new Error(`等待${description}超时${suffix}`);
   }
+
 
   function getElementZIndex(element) {
     let current = element;
@@ -5320,7 +5350,7 @@
     );
 
     // 再留一个短缓冲，让 Vue 表单模型和保存参数完全同步。
-    await sleep(300);
+    await sleep(BATCH_RELIABILITY.beforeSubmitTailMs);
   }
 
 
@@ -5786,6 +5816,232 @@
   }
 
 
+  /* ===== 直选快速通道（v4.2.21）=============================================
+     组件源码里「按 Enter」分支的最后一步就是 select(node)，
+     所以这里直接调同一个方法 —— 与"精确高亮后按 Enter"是**同一条内部路径**，
+     但省掉了 waitForTreeselectSearchSettled + 逐项 ↓ 的多次等待。
+
+     前提全部读自组件自身状态（visibleOptionIds / getNode），不依赖 DOM 高亮：
+       · 只认**叶子节点**（681/688）⇒ 绝不把"整类"当成危害选中；
+       · 要求严格名称匹配且**全树唯一**（真实数据 686/688 个标签唯一）⇒ 不猜、不近似；
+       · 任一前提不成立（拿不到实例 / select 不存在 / 候选不唯一 / 组件报错）
+         ⇒ 返回 "fallback"，交回上面的原键盘流程，行为与旧版逐字一致。
+     调用过组件选择后**不再重试**：多选组件重复选中同一个节点会把标签取消掉。
+     ======================================================================== */
+  // 组件实例缓存：取实例需要 DOM 查询 + 向上遍历祖先（最多 240 层），
+  // 而免搜索定位是按 40ms 轮询的，重复查找纯属浪费。
+  // 缓存挂在弹窗元素上，弹窗一重建缓存自然失效；实例被销毁时 $el 也会脱离文档。
+  function getHazardTreeselectVm(dialog) {
+    const cached = dialog && dialog.__dimeHazardVm;
+
+    if (
+      cached &&
+      cached.$el &&
+      cached.$el.isConnected &&
+      typeof cached.select === "function" &&
+      cached.forest?.nodeMap
+    ) {
+      return cached;
+    }
+
+    const vm = getHazardSelectContext(dialog).vueInstance || null;
+
+    if (dialog && vm) {
+      try { dialog.__dimeHazardVm = vm; } catch (_) {}
+    }
+
+    return vm;
+  }
+
+  function readTreeselectVmCandidates(dialog, name) {
+    const vm = getHazardTreeselectVm(dialog);
+
+    if (
+      !vm ||
+      typeof vm.select !== "function" ||
+      typeof vm.getNode !== "function" ||
+      !Array.isArray(vm.visibleOptionIds)
+    ) {
+      return null;
+    }
+
+    const items = [];
+
+    vm.visibleOptionIds.forEach(id => {
+      let node = null;
+      try { node = vm.getNode(id); } catch (_) { node = null; }
+      if (!node || node.isDisabled) return;
+
+      const text = cleanText(
+        node.label ||
+        node.raw?.label ||
+        node.raw?.name ||
+        ""
+      );
+      if (!text) return;
+
+      items.push({
+        node,
+        text,
+        isLeaf: !node.children || node.children.length === 0
+      });
+    });
+
+    const wantedKey = strictKey(name);
+
+    return {
+      vm,
+      items,
+      exact: items.filter(item =>
+        item.isLeaf && strictKey(item.text) === wantedKey
+      ),
+      compatible: items.filter(item =>
+        item.isLeaf && matchHazards(name, item.text).matched
+      )
+    };
+  }
+
+
+  /* 免搜索直选：不输入任何搜索词，直接在组件自己的候选里找"唯一的叶子精确匹配"并选中。
+     依据（实测）：未输入搜索词时组件候选就是全量 —— 真实危害树 688 个节点全部可读，
+     而"合成键盘输入搜索词 + 等 Vue 重算过滤结果"是整条补齐流程里最慢的一段。
+     返回值：true = 已选中；"fallback" = 没拿到唯一候选（没动过组件，可安全走搜索流程）；
+             false = 已经调用过组件 select 但没确认成功（绝不能再试一次）。 */
+  async function selectTreeselectDirectly(dialog, name, updateStep) {
+    try {
+      if (localStorage.getItem("dimeFastHazardSelect") === "off") return "fallback";
+    } catch (_) {}
+
+    if (!strictKey(name)) return "fallback";
+
+    let snapshot = null;
+
+    try {
+      snapshot = await waitUntil(
+        () => {
+          const current = readTreeselectVmCandidates(dialog, name);
+          if (!current) return null;
+          const list = current.exact.length ? current.exact : current.compatible;
+          // 0 个（组件还没就绪 / 不在全量候选里）或重名 → 交给"输入搜索词"的流程去试
+          if (list.length !== 1) return null;
+          return current;
+        },
+        1200,
+        40,
+        `“${name}”候选就绪（免搜索）`
+      );
+    } catch (_) {
+      return "fallback";
+    }
+
+    const targets = snapshot.exact.length ? snapshot.exact : snapshot.compatible;
+
+    updateStep?.(`步骤 2/3：免搜索直接命中\n${targets[0].text}`);
+
+    try {
+      snapshot.vm.select(targets[0].node);
+    } catch (error) {
+      console.warn(
+        `[危害补齐-免搜索] ${name}：调用组件 select 失败，回落搜索流程：`,
+        error
+      );
+      return "fallback";
+    }
+
+    if (
+      await waitForHazardSelected(
+        dialog,
+        name,
+        AUTOFILL_TIMING.selectionTimeout
+      )
+    ) {
+      console.log(`[危害补齐-免搜索] ${name}：一步选中成功`);
+      return true;
+    }
+
+    console.warn(
+      `[危害补齐-免搜索] ${name}：已调用组件 select，但未确认标签生成`
+    );
+    return false;
+  }
+
+
+  async function selectTreeselectThroughVm(dialog, name, updateStep) {
+    // 现场开关：控制台执行 localStorage.setItem("dimeFastHazardSelect","off") 后刷新，
+    // 即可整体退回旧的 ↓ + Enter 流程（用于对比速度或应急）。
+    try {
+      if (localStorage.getItem("dimeFastHazardSelect") === "off") {
+        return "fallback";
+      }
+    } catch (_) {}
+
+    const wantedKey = strictKey(name);
+    if (!wantedKey) return "fallback";
+
+    let snapshot = null;
+
+    try {
+      await waitUntil(
+        () => {
+          const current = readTreeselectVmCandidates(dialog, name);
+          if (!current) return false;
+          if (!current.exact.length && !current.compatible.length) return false;
+
+          snapshot = current;
+          return true;
+        },
+        AUTOFILL_TIMING.searchTimeout,
+        40,
+        `“${name}”组件候选就绪`
+      );
+    } catch (_) {
+      console.log(`[危害补齐-直选] ${name}：组件候选未就绪，回落键盘流程`);
+      return "fallback";
+    }
+
+    const targets = snapshot.exact.length
+      ? snapshot.exact
+      : snapshot.compatible;
+
+    if (targets.length !== 1) {
+      console.log(
+        `[危害补齐-直选] ${name}：精确候选 ${targets.length} 个，回落键盘流程`
+      );
+      return "fallback";
+    }
+
+    updateStep?.(
+      `步骤 3/3：直接选中唯一精确候选\n${targets[0].text}`
+    );
+
+    try {
+      snapshot.vm.select(targets[0].node);
+    } catch (error) {
+      console.warn(
+        `[危害补齐-直选] ${name}：调用组件 select 失败，回落键盘流程：`,
+        error
+      );
+      return "fallback";
+    }
+
+    if (
+      await waitForHazardSelected(
+        dialog,
+        name,
+        AUTOFILL_TIMING.selectionTimeout
+      )
+    ) {
+      console.log(`[危害补齐-直选] ${name}：一步选中成功`);
+      return true;
+    }
+
+    console.warn(
+      `[危害补齐-直选] ${name}：已调用组件 select，但未确认标签生成`
+    );
+    return false;
+  }
+
+
   async function activateHazardSearch(context) {
     const { type, select, trigger, input, vueInstance } = context;
     select.scrollIntoView({ block: "center", inline: "nearest" });
@@ -6029,7 +6285,8 @@
     const context =
       getHazardSelectContext(dialog);
 
-    updateStep?.(
+    // 这段文案只出现在"真的需要输入搜索词"的兜底路径上（免搜索命中时另有提示）。
+    const searchStepText =
       originalName &&
       strictKey(originalName) !==
         strictKey(searchName)
@@ -6040,31 +6297,74 @@
         : (
             "步骤 1/3：输入危害并触发搜索\n" +
             searchName
-          )
-    );
-
-    await activateHazardSearch(context);
-
-    // 所有实际输入统一使用映射后的标准危害名称。
-    await insertSearchText(
-      context,
-      searchName,
-      dialog
-    );
+          );
 
     let selected = false;
 
     if (context.type === "treeselect") {
-      // 精确键盘流程：
-      // 输入搜索 → 读取当前候选名称 → 用 ↓ 逐项移动到完全一致的候选 → Enter。
-      // 不使用鼠标点击，也不直接调用组件节点选择；候选 DOM 无法读取时才兼容旧流程。
-      selected = await selectTreeselectByOwnEnterHandler(
+      // ① 免搜索直选（v4.2.24 新增）：危害树全量在本地，绝大多数情况根本不需要搜索词，
+      //    而"合成键盘输入搜索词 + 等 Vue 重算过滤结果"是整条流程里最慢的一段。
+      const direct = await selectTreeselectDirectly(
         dialog,
-        context,
         searchName,
         updateStep
       );
+
+      if (direct === true) {
+        selected = true;
+      } else if (direct === "fallback") {
+        // 免搜索没拿到唯一候选（没有动过组件），才走需要搜索词的流程。
+        updateStep?.(searchStepText);
+
+        await activateHazardSearch(context);
+
+        // 所有实际输入统一使用映射后的标准危害名称。
+        await insertSearchText(
+          context,
+          searchName,
+          dialog
+        );
+
+        // ② 输入搜索词后再直选一次（原有快路径，保留）：
+        //    直接调用组件自身的选择方法（与按 Enter 同一条内部路径），
+        //    拿到"唯一精确候选"就一步选中，省掉逐项 ↓。
+        const fast = await selectTreeselectThroughVm(
+          dialog,
+          searchName,
+          updateStep
+        );
+
+        if (fast === true) {
+          selected = true;
+        } else if (fast === "fallback") {
+          // ③ 精确键盘流程（保持原样）：
+          //    读取当前候选名称 → 用 ↓ 逐项移动到完全一致的候选 → Enter。
+          selected = await selectTreeselectByOwnEnterHandler(
+            dialog,
+            context,
+            searchName,
+            updateStep
+          );
+        } else {
+          // 已经调用过组件选择，绝不再试一次（重复选中会把标签取消）。
+          selected = false;
+        }
+      } else {
+        // 免搜索时已经调用过组件 select 但没确认标签生成 —— 绝不再试一次。
+        selected = false;
+      }
     } else {
+      updateStep?.(searchStepText);
+
+      await activateHazardSearch(context);
+
+      // 所有实际输入统一使用映射后的标准危害名称。
+      await insertSearchText(
+        context,
+        searchName,
+        dialog
+      );
+
       const dropdown = await openDropdownAfterTyping(context, searchName);
       await waitUntil(
         () => getSelectableOptions(dropdown).length,
@@ -6093,7 +6393,7 @@
 
     if (!selected) {
       throw new Error(
-        `已执行精确候选定位并按 Enter，但未确认“${searchName}”被选中`
+        `已执行精确候选定位并选择，但未确认“${searchName}”被选中`
       );
     }
 
@@ -6564,10 +6864,27 @@
     );
   }
 
+  // 按套餐编码在列表里定位那一行。
+  // 保存后页面会重新拉取列表，行元素可能正处于重建过程中；
+  // 这里先立即找一次，找不到再短间隔轮询，避免"恰好撞上刷新"就中断整批处理。
+  async function waitForPackageRowRecord(
+    code,
+    timeout = BATCH_RELIABILITY.rowLookupTimeoutMs
+  ) {
+    const startedAt = Date.now();
+
+    for (;;) {
+      const record = findPackageRowRecordByCode(code);
+      if (record) return record;
+      if (Date.now() - startedAt >= timeout) return null;
+      await sleep(BATCH_RELIABILITY.rowLookupRetryMs);
+    }
+  }
+
   async function openEditDialogForBatch(candidate) {
     await waitForNoVisibleEditDialog(4500);
 
-    const record = findPackageRowRecordByCode(candidate.code);
+    const record = await waitForPackageRowRecord(candidate.code);
     if (!record) {
       throw new Error(
         `列表中找不到套餐编码 ${candidate.code}`
@@ -6622,9 +6939,14 @@
     ensureAutoPanel(dialog);
 
     // 页面弹窗出现不代表标签和表单数据已经全部载入。
-    // 先等待一次固定缓冲，再确认套餐编码、名称、岗位和危害标签均停止变化。
+    // 先给渲染留一个很短的收尾缓冲，再由"内容签名连续稳定"来判定载入完成。
+    // （原先这里"先固定睡 650ms、再等 500ms 稳定"，等于同一件事做了两遍。）
     await sleep(BATCH_RELIABILITY.dialogLoadDelayMs);
-    await waitForDialogSnapshotStable(dialog, 500, 6000);
+    await waitForDialogSnapshotStable(
+      dialog,
+      BATCH_RELIABILITY.snapshotStableMs,
+      6000
+    );
 
     return dialog;
   }
@@ -7024,7 +7346,8 @@
     const dialog =
       await openEditDialogForBatch(candidate);
 
-    await waitForDialogSnapshotStable(dialog, 600, 6500);
+    // 复核路径要求更严：必须确认后台已真正写入，稳定窗比常规路径略长。
+    await waitForDialogSnapshotStable(dialog, 350, 6500);
 
     const context = getDialogMissingContext(dialog);
 
@@ -7354,6 +7677,8 @@
     const queueCounts =
       countBatchQueueTypes(queue);
 
+    const batchStartedAt = Date.now();
+
     batchRunning = true;
     batchCancelRequested = false;
     batchVerifiedCodes.clear();
@@ -7451,6 +7776,18 @@
         }
       }
     } finally {
+      const batchElapsedMs = Date.now() - batchStartedAt;
+      const processedCount = savedCount + skippedCount;
+      const elapsedText =
+        `总耗时 ${(batchElapsedMs / 1000).toFixed(1)} 秒` +
+        (processedCount
+          ? `（已处理 ${processedCount} 个套餐，平均 ${(
+              batchElapsedMs /
+              processedCount /
+              1000
+            ).toFixed(2)} 秒/个）`
+          : "");
+
       batchRunning = false;
       runButton.disabled = false;
       clearButton.disabled = false;
@@ -7496,6 +7833,7 @@
           ? `无需修改并跳过 ${skippedCount} 个套餐`
           : "",
         failedMessage,
+        elapsedText,
         "队列按“只缺岗位 → 只缺危害 → 两者都缺”处理；组合套餐岗位选中后只留短缓冲，再补危害并在提交前双向复核。"
       ].filter(Boolean).join("\n");
 
@@ -8545,5 +8883,5 @@
     hideToolPanel();
     enhanceVisibleEditDialogs();
   });
-  console.log("套餐危害因素核对工具 v4.2.19 已加载。");
+  console.log("套餐危害因素核对工具 v4.2.25 已加载。");
 })();
