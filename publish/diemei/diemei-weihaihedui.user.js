@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         蝶美-1.2套餐危害核对
 // @namespace    https://dime.health-100.cn/
-// @version      4.5.0
-// @description  蝶美套餐危害核对：提供自动化核对、批量处理、自动选择等功能。注意：套餐名称的标准格式应为：XX-危害1+危害2+危害3+岗中+男，不保证能识别其他格式。v4.3 起批量与单改默认走"数据层直写"快速通道：跳过搜索与点选，直接写页面表单模型并调页面自带保存，保存结果以接口回执为准。v4.4 起批量处理全程隐身：编辑弹窗整批只开一次且不可见，结束后在工具面板给出逐条核对报告。v4.5 起批量提交为流水线并发：最多 3 个保存请求同时在途，失败项批末自动补试，整批速度提升约 2~3 倍。
+// @version      4.6.3
+// @description  蝶美套餐危害核对：核对套餐名称里的危害因素、在岗状态同系统实际值是否一致，差异批量补齐，结束给出逐条报告。详细用法与更新记录见工具面板里的"使用说明"。
 
 // @match        https://dime.health-100.cn/*
 // @run-at       document-idle
@@ -19,8 +19,9 @@
 (function () {
   "use strict";
 
-  const GLOBAL_KEY = "__DIME_HAZARD_PACKAGE_CHECKER_V450__";
+  const GLOBAL_KEY = "__DIME_HAZARD_PACKAGE_CHECKER_V451__";
   [
+    "__DIME_HAZARD_PACKAGE_CHECKER_V451__",
     "__DIME_HAZARD_PACKAGE_CHECKER_V450__",
     "__DIME_HAZARD_PACKAGE_CHECKER_V440__",
     "__DIME_HAZARD_PACKAGE_CHECKER_V4215__",
@@ -172,11 +173,6 @@
     // 页面这个弹窗是 destroy-on-close（关掉就整棵销毁、再开重建，还会闪一次
     // 全屏遮罩），"每条一开一关"正是页面闪烁与卡顿的来源。
     holdDialogAcrossBatch: true,
-    // 首次打开弹窗后、写数据之前的渲染缓冲（保证弹窗"看得见"）。
-    openSettleMs: 120,
-    // 一条处理完、换下一条之前留给眼睛的短暂停留。
-    // 只影响"看得见"的节奏，不参与任何判定。
-    swapSettleMs: 140,
     // 调用页面保存后，等待"请求确实发出"的上限。
     // 页面自身的校验会直接拦截提交，这里用来快速判定而不是干等。
     requestStartTimeoutMs: 3000,
@@ -188,7 +184,14 @@
     maxAttempts: 3,
     // 流水线并发：同一时刻最多多少个保存请求在途。
     // 红领巾 2026-10-17 定：批量一般是短时操作，2~3 足够；想更保守改 2。
+    // ⚠️ 复用同一个编辑弹窗时，页面自己的"保存中"状态会把并发提交静默挡掉
+    //   （请求根本不发出）⇒ v4.5.2 起一旦发现首轮没拿到结果，就自动降级为
+    //   "等上一条回执落地再提交下一条"，这个值随即失效。
     maxInFlight: 3,
+    // 降级为逐条提交后，等上一条回执落地的上限。
+    serializeWaitMs: 2500,
+    // 回执落地后，页面收加载态还需要一点时间，动同一个弹窗前留的缓冲。
+    serializeSettleMs: 100,
     // 重试前的间隔。
     retryDelayMs: 600
   };
@@ -2853,16 +2856,6 @@
       margin-top:5px;color:#7254a3;font-size:10px;line-height:1.5;
       white-space:pre-wrap;word-break:break-word
     }
-    #${TOOL_ID} .batch-fast-toggle{
-      display:flex;align-items:flex-start;gap:5px;margin-top:6px;
-      color:#7254a3;font-size:10px;line-height:1.45;cursor:pointer;
-      user-select:none
-    }
-    #${TOOL_ID} .batch-fast-toggle input{
-      margin:1px 0 0;flex:none;cursor:pointer;accent-color:#8b5cf6
-    }
-    #${TOOL_ID} .batch-fast-toggle strong{color:#8b5cf6}
-    #${TOOL_ID} .batch-fast-toggle.is-busy{opacity:.55;cursor:not-allowed}
     #${TOOL_ID} .batch-notice{
       margin-top:7px;padding:7px 8px;border:1px solid #c2e7b0;
       border-radius:6px;background:#f0f9eb;color:#529b2e;
@@ -3242,7 +3235,7 @@
   tool.id = TOOL_ID;
   tool.innerHTML = `
     <div class="tool-header">
-      <strong>套餐危害因素核对工具 v4.5.0</strong>
+      <strong>套餐危害因素核对工具 v4.6.3</strong>
       <div class="tool-header-actions">
         <button class="tool-header-button tool-collapse" type="button" title="折叠工具">−</button>
         <button class="tool-header-button tool-close" type="button" title="收起到快捷按钮">×</button>
@@ -3291,16 +3284,30 @@
       <details class="tool-help">
         <summary>使用说明（点击展开）</summary>
         <div class="tool-tip">
-          <b>核对：</b>点击“开始核对”，脚本会比较套餐名称与系统危害因素，并检查在岗状态。<br>
-          <b>套餐名称：</b>建议使用“XX-危害1+危害2+危害3+岗中+性别”等标准格式；常见其他分隔符和岗位简称也可识别。<br>
-          <b>异常结果：</b>“匹配缺失、危害多出、岗位异常、待处理名称”等数字可点击查看对应明细。<br>
-          <b>岗位状态：</b>系统岗位为空且套餐状态明确时可辅助补齐；已有岗位与套餐不一致时仅提示，不自动覆盖。<br>
-          <b>名称处理：</b>无法直接匹配的名称可建立标准危害映射，或设置为“精确无关 / 关键词无关”，保存后继续复用。<br>
-          <b>自动处理：</b>编辑时可一键补齐明确缺失项；批量安全修复只处理可明确判断的项目，并在操作过程中进行复核。<br>
-          <b>v4.5 流水线并发：</b>批量提交不再逐条等回执——"换内容→写表单→提交"是唯一串行的临界段，请求一旦发出，表单立即让给下一条，同一时刻最多 3 个保存请求在途（FAST_PATH.maxInFlight 可改 2 更保守）。失败项在批末串行补试到 3 次，仍失败才停批；名称定位不了的错误不重试、直接记入报告继续跑。<br>
-          <b>v4.4 批量静默直写：</b>批量处理时编辑弹窗整批只在后台打开一次，并全程隐身——屏幕上看不到弹窗、遮罩和逐条换内容的闪烁，也没有开窗动画。脚本把目标值直接写进页面表单模型、调用页面自带的保存逻辑，保存成败以页面保存接口的回执为准。整批结束后，工具面板会逐条列出「已保存 / 跳过 / 失败」的清单（含每条新增的危害数与在岗状态），请对照清单自行抽查核对。批量进行中如需停止，点批量按钮或 HUD 上的"停止"即可。若某个套餐的名称在页面危害库里定位不到，会记入报告并继续处理其余套餐。<br>
-          <b>v4.3 数据层直写：</b>批量与单个"一键补齐"不再模拟"展开树→输搜索词→等候选→逐项点选"这套交互，直接写表单模型后调页面保存。单个"一键补齐"仍在弹窗内进行、行为不变。<br>
-          <b>v4.3.1 批量单窗轮播：</b>整批只开一次编辑弹窗、逐条换内容（页面那个弹窗关掉即整棵销毁、再开要重建 680+ 条危害的树），v4.4 在此基础上让弹窗全程不可见。
+          <b>它做什么：</b>把"套餐名称里写的危害因素与在岗状态"跟系统里实际存的值对一遍，不一致的批量补齐。<br>
+          <b>怎么用：</b>打开体检套餐列表页 → 点「开始核对」→ 等进度走完 → 看结果。核对完成后按钮会变成「批量核对补齐本页（N）」，点它才会真正改数据；只想看不想改，停在核对这步就行。<br>
+          <b>三种结论：</b>已补齐 = 脚本改过来了；无需动 = 本来就一致；失败 = 没改成，报告里写原因（多是名称在危害库里定位不到，或保存接口回执不通过）。<br>
+          <b>套餐名称格式：</b>建议「XX-危害1+危害2+危害3+岗中+性别」，常见其他分隔符与岗位简称也能识别；识别不了的会归到「待处理名称」，可用下面的匹配规则人工指定。<br>
+          <b>处理方式：</b>默认「静默直写」——编辑弹窗整批只在后台打开一次并全程隐身，屏幕上看不到弹窗、遮罩和逐条换内容的闪烁，也没有开窗动画；脚本把目标值直接写进页面表单模型、调页面自带的保存逻辑，成败以保存接口的回执为准，最快。若首轮提交被页面的"保存中"状态挡下（请求根本没发出），会自动降级成逐条提交，并在报告里说明。想改用「界面模拟」（逐项点选，慢但完全走人手路径，可肉眼对照）时，按住 <code>Alt</code> 点「批量核对补齐本页」即可来回切换，状态会记住。<br>
+          <b>进度背景怎么读：</b>百分比按"已结案 + 在途/待补试各计半格"算，所以提交中也在往前走。「在途 N」= 已发出请求、等回执；「待补试 M」= 首轮没成、排队等批末重试；「正在处理」是当前这一条，「最近完成」是最后 4 条的去向。整批跑到 100% 会原地停 2 秒显示处理结果，再交回右下角小卡片。中途想停点「停止」，已发出的那几条仍会落地。<br>
+          <b>报告怎么读：</b>逐条列出每条的结论与改动内容（新增了几项危害、在岗状态改成了什么）；开头若出现「首轮有 N 条…」，说明那 N 条是被自动降级后补成的，数据没问题、只是慢一点。请对照清单自行抽查。<br>
+          <b>人工兜底：</b>匹配不上的名称用「匹配规则」建立标准危害映射；确认与危害无关的用「排除项 / 无关内容 / 无关关键词」，保存后长期复用。系统岗位为空且套餐状态明确时可辅助补齐；已有岗位与套餐不一致时只提示、不自动覆盖。<br>
+          <b>边界：</b>只处理可明确判断的项，判断不了的一律留给人；批量改动前建议先小范围试一批。
+      </details>
+
+      <details class="tool-help">
+        <summary>更新记录（点击展开）</summary>
+        <div class="tool-tip">
+          <b>v4.6.3</b> 去掉常驻的「静默直写」勾选框和那四行实现说明：它本来就是默认值，不需要每次点开确认，模式从"有没有弹窗、有没有进度背景"一眼就能看出来。真要肉眼对照时，按住 <code>Alt</code> 点「批量核对补齐本页」切换，状态记在本地，切换结果只用一句短提示告知。<br>
+          <b>v4.6.2</b> 收尾不再"啪"一下消失：跑到 100% 后进度背景先切成完成态（标题换成结果、收起停止按钮、圆点由呼吸变定格、原「正在处理」那一行换成本次汇总），原地停 2 秒再淡出，把汇总交回右下角小卡片；「在途 / 待补试」在收尾时换成一句定论。同时精简脚本开头的说明，清掉 2 个早就没人调用的死函数与 2 个没用上的配置项。<br>
+          <b>v4.6.1</b> 文案统一改成业务说法：按钮「批量核对补齐本页（N）」、进行中「正在静默核对补齐」、结束「批量核对补齐完成」，结果状态统一为「已补齐 / 无需动 / 失败」（原来的"批量修复 / 已保存 / 跳过"是工程词，我们处理的是危害因素与在岗状态，不是修 bug）。进度背景补上「正在处理」（第几条 · 套餐编码 · 套餐名称 ｜ 当前阶段）与「最近完成」最后 4 条。<br>
+          <b>v4.6</b> 静默直写跑批量时页面本来是一片白（弹窗被挪走、加载层被隐掉），盯白屏太干。现在整页换成"极光毛玻璃"进度背景：两团缓慢漂移的光晕 + 一道竖向扫描光带 + 顶部流光进度条 + 中央毛玻璃卡片，批量结束淡出。这层只做展示（<code>pointer-events:none</code>，只有"停止"可点），不挡你同时操作页面；也只在静默直写模式出现——界面模拟要看得见弹窗。<br>
+          <b>v4.5.2</b> 进度条不再"运行期间一条不动、结束才跳满"：批量期间主线程几乎被页面的列表/危害树重绘占满，浏览器拿不到渲染时机；现在每结案一条主动让出一帧（<code>yieldToPaintFrame</code>），进度改用合成器动画（<code>transform:scaleX</code> 而非 <code>width</code>），并把在途/待补试按半格计入进度。另外复用同一个弹窗时，页面的"保存中"状态会把并发提交静默挡掉（请求根本没发出，首轮全落进批末补试），现在一旦发现首轮没拿到结果就自动降级为逐条提交。<br>
+          <b>v4.5</b> 流水线并发：提交不再逐条等回执——"换内容 → 写表单 → 提交"是唯一串行的临界段，请求一旦发出，表单立即让给下一条，同一时刻最多 3 个保存请求在途（<code>FAST_PATH.maxInFlight</code> 可改 2 更保守）；失败项在批末串行补试到 3 次，仍失败才停批。<br>
+          <b>v4.4</b> 批量静默直写：弹窗整批只在后台开一次并全程隐身，看不到弹窗、遮罩和逐条换内容的闪烁，成败以页面保存接口的回执为准；结束后逐条列出清单供抽查。若某套餐的名称在危害库里定位不到，记入报告并继续处理其余套餐。<br>
+          <b>v4.3.1</b> 批量单窗轮播：整批只开一次编辑弹窗、逐条换内容（页面那个弹窗关掉即整棵销毁，再开要重建 680+ 条危害的树）。<br>
+          <b>v4.3</b> 数据层直写：批量与单个"一键补齐"不再模拟"展开树 → 输搜索词 → 等候选 → 逐项点选"这套交互，直接写表单模型后调页面保存；单个"一键补齐"仍在弹窗内进行、行为不变。
+        </div>
         </div>
       </details>
     </div>
@@ -3547,30 +3554,18 @@
               <button
                 class="batch-action ${batchRunning ? "is-running" : ""}"
                 type="button"
+                title="默认静默直写（后台隐身处理）。按住 Alt 点击可切换为界面模拟。"
               >${
                 batchRunning
                   ? "停止批量处理"
-                  : `批量安全修复本页（${batchCandidateCount}）`
+                  : `批量核对补齐本页（${batchCandidateCount}）`
               }</button>
-              <label class="batch-fast-toggle ${
-                batchRunning ? "is-busy" : ""
-              }" title="勾选后：批量处理全程隐身——编辑弹窗只在后台打开（屏幕上看不到弹窗和遮罩），直接写入表单模型并调用页面自带的保存逻辑，结束后给出逐条核对报告。">
-                <input
-                  type="checkbox"
-                  class="batch-fast-check"
-                  ${fastPathEnabled ? "checked" : ""}
-                  ${batchRunning ? "disabled" : ""}
-                >
-                <span>静默直写：后台隐身处理，流水线并发保存，结束给核对报告（<strong>${
-                  fastPathEnabled ? "已开启" : "已关闭"
-                }</strong>）</span>
-              </label>
               <div class="batch-status">${
                 batchRunning
                   ? "正在准备批量处理……"
                   : fastPathEnabled
-                    ? "分组处理：只缺岗位 → 只缺危害 → 两者都缺；静默直写全程不出现弹窗，最多 3 条保存请求同时在途，失败项批末自动补试，结果以接口回执为准，结束后在下方逐条列出供你核对。"
-                    : "分组处理：只缺岗位 → 只缺危害 → 两者都缺；组合项岗位后立即补危害并双向复核。"
+                    ? "分组：只缺岗位 → 只缺危害 → 两者都缺。"
+                    : "当前为界面模拟（逐项点选），速度较慢；按住 Alt 点按钮可切回静默直写。"
               }</div>
             </div>
           `
@@ -3614,38 +3609,41 @@
   }
 
   function bindBatchAction() {
-    const check = summaryBox.querySelector(".batch-fast-check");
-
-    if (check) {
-      check.addEventListener("change", () => {
-        writeFastPathEnabled(check.checked);
-
-        const marker = check
-          .closest(".batch-fast-toggle")
-          ?.querySelector("strong");
-
-        if (marker) {
-          marker.textContent = fastPathEnabled ? "已开启" : "已关闭";
-        }
-
-        showToast(
-          fastPathEnabled
-            ? "已切换为静默直写：批量全程隐身，后台自动保存"
-            : "已切换为界面模拟：逐步搜索并逐项点选危害"
-        );
-      });
-    }
-
     const button = getBatchActionButton();
     if (!button) return;
 
-    button.addEventListener("click", () => {
+    button.addEventListener("click", event => {
       if (batchRunning) {
         batchCancelRequested = true;
         updateBatchProgress(
           "正在停止，请等待当前套餐结束",
           "已收到停止请求；当前套餐完成或报错后停止。"
         );
+        return;
+      }
+
+      /*
+       * 模式切换不再占界面位置（默认就是静默直写）：按住 Alt 点按钮切一次。
+       * 保留这个口子不是为了给日常用，而是页面的表单结构一旦变动，
+       * 直写可能"回执通过但内容不对"，那时只有肉眼能看见的界面模拟能对照。
+       */
+      if (event.altKey) {
+        writeFastPathEnabled(!fastPathEnabled);
+
+        const status = summaryBox.querySelector(".batch-status");
+
+        if (status) {
+          status.textContent = fastPathEnabled
+            ? "分组：只缺岗位 → 只缺危害 → 两者都缺。"
+            : "当前为界面模拟（逐项点选），速度较慢；按住 Alt 点按钮可切回静默直写。";
+        }
+
+        showToast(
+          fastPathEnabled
+            ? "已切回静默直写：批量全程隐身，后台自动保存"
+            : "已切为界面模拟：逐步搜索并逐项点选危害"
+        );
+
         return;
       }
 
@@ -4548,6 +4546,36 @@
 
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  /*
+   * 主动让出一帧给浏览器渲染。
+   *
+   * 批量跑起来后，主线程几乎全被"页面自己的重绘"占着（一条套餐一次列表回写、
+   * 一次 Treeselect 重建），浏览器一直拿不到渲染时机 ⇒ 悬浮 HUD 的进度条
+   * 全程看不出变化，直到整批结束才一次性跳到 100%。
+   * 每条处理完主动等一次 rAF（并等到这一帧真的画完），进度才会实时走动。
+   *
+   * ⚠️ 后台标签页不触发 rAF ⇒ 不能干等，退化成让出一轮宏任务；
+   *    再加一个超时兜底，避免窗口被遮挡时把整批卡死。
+   */
+  function yieldToPaintFrame(timeoutMs = 250) {
+    if (document.hidden) return sleep(0);
+
+    return new Promise(resolve => {
+      let settled = false;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+
+      const timer = setTimeout(finish, timeoutMs);
+
+      requestAnimationFrame(() => setTimeout(finish, 0));
+    });
+  }
 
   function isVisibleElement(element) {
     if (!element || !element.isConnected) return false;
@@ -7958,18 +7986,6 @@
     );
   }
 
-  /*
-   * "给眼睛留的时间"。
-   *
-   * 只在页面看得见时才真的等：页面切到后台时浏览器会把定时器压到 1 秒以上
-   * （挂久了甚至一分钟才跑一次），这时候既没人看，也不该被它拖慢整批。
-   */
-  function waitForFastPathVisibilityPause(ms) {
-    if (!ms || document.hidden) return Promise.resolve();
-
-    return sleep(ms);
-  }
-
   function getFastPathValidationError(vm) {
     const formElement = vm.$refs?.packageForm?.$el;
     if (!formElement) return "";
@@ -8255,84 +8271,6 @@
     ].join("");
   }
 
-  async function submitFastPathPackageForm(vm, code) {
-    const seqBefore = fastPathTap.seq;
-    const lastSentIdBefore = fastPathTap.lastSentId;
-
-    // 先挂好探针再触发提交（提交是异步的：页面要先过表单校验）。
-    const sentPromise = waitFastPathCondition(
-      () => fastPathTap.seq > seqBefore,
-      FAST_PATH.requestStartTimeoutMs
-    );
-
-    try {
-      vm.submitPackageForm();
-    } catch (error) {
-      return {
-        ok: false,
-        reason: `调用页面保存出错：${
-          error?.message || String(error)
-        }`,
-        code
-      };
-    }
-
-    // 两条线赛跑：请求真的发出去 vs 校验当场拦下。
-    // 校验拦下时请求永远不会发出，不必干等到请求超时。
-    const reached = await Promise.race([
-      sentPromise.then(() => "sent"),
-      sleep(FAST_PATH.validationCheckDelayMs).then(() => "check")
-    ]);
-
-    if (reached === "check") {
-      const validationError = getFastPathValidationError(vm);
-
-      if (validationError) {
-        // 极少数情况下"校验报错"与"请求已发出"同时发生，再确认一次。
-        const lateSent = await Promise.race([
-          sentPromise,
-          sleep(FAST_PATH.validationCheckDelayMs).then(() => false)
-        ]);
-
-        if (!lateSent) {
-          return {
-            ok: false,
-            reason: `表单校验未通过：${validationError}`,
-            code
-          };
-        }
-      }
-
-      const sent = await sentPromise;
-
-      if (!sent) {
-        return {
-          ok: false,
-          reason: describeFastPathNoRequest(vm),
-          code
-        };
-      }
-    }
-
-    // 只认"这一次"的响应，避免把上一次的残留响应算成成功。
-    const requestId =
-      fastPathTap.lastSentId > lastSentIdBefore
-        ? fastPathTap.lastSentId
-        : seqBefore + 1;
-
-    const done = await waitFastPathCondition(
-      () => fastPathTap.results.has(requestId),
-      FAST_PATH.submitTimeoutMs
-    );
-
-    return {
-      ...evaluateFastPathPutResult(
-        done ? fastPathTap.results.get(requestId) : null
-      ),
-      code
-    };
-  }
-
   async function closeFastPathDialog(vm) {
     try {
       if (vm?.openPackage) {
@@ -8430,18 +8368,34 @@
    *
    * 弹窗隐身后，屏幕上没有任何动静，"看着空白屏幕等"体验很差。
    * 这张毛玻璃小卡片就是批量期间唯一的动态元素：
-   *   渐变进度条 + 已处理计数 + 当前套餐 + 已保存/跳过/失败 实时计数，
+   *   渐变进度条 + 已处理计数 + 当前套餐 + 已补齐/无需动/失败 实时计数，
    *   卡片上的"停止"按钮与批量按钮等效（置 batchCancelRequested）。
    * 批量结束（完成/停止/报错都算）后变正负零状态展示几秒，自动淡出。
    * ------------------------------------------------------------------ */
   const BATCH_HUD_ID = "dime-batch-hud";
-  const batchHud = { el: null, total: 0 };
+  const batchHud = {
+    el: null,
+    veil: null,
+    total: 0,
+    doneCount: 0,
+    saved: 0,
+    skipped: 0,
+    failed: 0,
+    inFlight: 0,
+    pending: 0
+  };
 
   function ensureBatchHudStyle() {
-    if (document.getElementById(BATCH_HUD_ID + "-style")) return;
+    let style = document.getElementById(BATCH_HUD_ID + "-style");
 
-    const style = document.createElement("style");
-    style.id = BATCH_HUD_ID + "-style";
+    if (!style) {
+      style = document.createElement("style");
+      style.id = BATCH_HUD_ID + "-style";
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    // 样式每次都重写：同页二次注入（脚本热更新）时，上一版留在页面里的
+    // 旧样式（比如进度条还在用 width:0）会盖住新规则，导致进度条整条不显示。
     style.textContent = [
       `#${BATCH_HUD_ID}{position:fixed;right:20px;bottom:20px;z-index:2147483647;`,
       "width:264px;padding:14px 16px 12px;border-radius:14px;",
@@ -8474,11 +8428,17 @@
       ".dime-hud-count small{font-size:12px;color:#909399;font-weight:500}",
       ".dime-hud-bar{margin-top:8px;height:6px;border-radius:3px;",
       "background:rgba(31,45,61,.08);overflow:hidden}",
-      ".dime-hud-bar-fill{height:100%;width:0;border-radius:3px;",
+      // 进度用 scaleX 而不是 width：width 是布局属性，每次变化都要主线程
+      // 重新排版+重绘，主线程被页面重绘占满时进度条会长时间"看不出动"；
+      // scaleX 走合成器，主线程再忙也能滑过去。
+      ".dime-hud-bar-fill{height:100%;width:100%;border-radius:3px;",
+      "transform:scaleX(0);transform-origin:left center;will-change:transform;",
       "background:linear-gradient(90deg,#8b5cf6,#3b82f6);",
-      "transition:width .45s cubic-bezier(.22,1,.36,1)}",
+      "transition:transform .35s cubic-bezier(.22,1,.36,1)}",
       ".dime-hud-current{margin-top:8px;font-size:11px;color:#606266;",
       "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dime-hud-pipeline{margin-top:4px;font-size:11px;color:#909399;",
+      "font-variant-numeric:tabular-nums}",
       ".dime-hud-stats{display:flex;gap:12px;margin-top:6px;",
       "font-size:11px;color:#909399}",
       ".dime-hud-stats b{font-weight:600;color:inherit}",
@@ -8486,36 +8446,381 @@
       ".dime-hud-stats .s-skip b{color:#e6a23c}",
       ".dime-hud-stats .s-fail b{color:#f56c6c}"
     ].join("");
-    (document.head || document.documentElement).appendChild(style);
+  }
+
+  /* ------------------------------------------------------------------
+   * 批量进度背景（全屏"极光玻璃"层）
+   *
+   * 批量期间页面自己会铺一层白（列表重渲染 + 页面加载层），盯着一片白屏
+   * 既没有信息也没有反馈。这一层把它接手过来：毛玻璃底 + 两团缓慢漂移的
+   * 光晕 + 一道扫描光带 + 顶部流光进度条 + 中央进度环（百分比 / 已完成
+   * 条数 / 当前套餐 / 在途与待补试 / 成败统计 / 停止按钮）。
+   *
+   * 三个必须守住的点：
+   *   1) pointer-events:none —— 只有"停止"按钮单独开启点击。界面模拟模式
+   *      要点真实元素、用户也可能想同时操作页面，绝不能被这层挡住。
+   *   2) z-index 低于工具面板与 HUD 卡片 —— 面板要一直看得见。
+   *   3) 只在"静默直写"模式出现 —— 界面模拟模式要看得见弹窗，不能被盖住。
+   * ------------------------------------------------------------------ */
+  const BATCH_VEIL_ID = "dime-batch-veil";
+  const BATCH_VEIL_STYLE_ID = "dime-batch-veil-style";
+  const BATCH_VEIL_RING_CIRCUMFERENCE = 2 * Math.PI * 52;
+  // 跑完之后进度背景原地停留多久（看清结果再收场）。
+  const BATCH_VEIL_FINISH_HOLD_MS = 2000;
+
+  function ensureBatchVeilStyle() {
+    let style = document.getElementById(BATCH_VEIL_STYLE_ID);
+
+    if (!style) {
+      style = document.createElement("style");
+      style.id = BATCH_VEIL_STYLE_ID;
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    style.textContent = [
+      `#${BATCH_VEIL_ID}{position:fixed;inset:0;z-index:2147483640;`,
+      "overflow:hidden;pointer-events:none;",
+      "background:linear-gradient(155deg,rgba(246,244,255,.94),",
+      "rgba(238,244,255,.94) 42%,rgba(238,250,247,.94));",
+      "backdrop-filter:blur(10px) saturate(1.2);",
+      "-webkit-backdrop-filter:blur(10px) saturate(1.2);",
+      "opacity:1;transition:opacity .45s ease}",
+      `#${BATCH_VEIL_ID}.is-leaving{opacity:0}`,
+      // 两团漂移光晕：只用 transform 动画，走合成器，不占主线程。
+      ".dime-veil-blob{position:absolute;border-radius:50%;filter:blur(60px);",
+      "opacity:.55;will-change:transform}",
+      ".dime-veil-blob.b1{width:46vw;height:46vw;left:-10vw;top:-14vw;",
+      "background:radial-gradient(circle,#c7b9ff,rgba(199,185,255,0) 70%);",
+      "animation:dimeBlob1 22s ease-in-out infinite alternate}",
+      ".dime-veil-blob.b2{width:40vw;height:40vw;right:-8vw;bottom:-16vw;",
+      "background:radial-gradient(circle,#9ad9ff,rgba(154,217,255,0) 70%);",
+      "animation:dimeBlob2 26s ease-in-out infinite alternate}",
+      "@keyframes dimeBlob1{from{transform:translate3d(0,0,0) scale(1)}",
+      "to{transform:translate3d(12vw,10vh,0) scale(1.18)}}",
+      "@keyframes dimeBlob2{from{transform:translate3d(0,0,0) scale(1.1)}",
+      "to{transform:translate3d(-10vw,-8vh,0) scale(.95)}}",
+      // 淡淡的网格 + 竖向扫描光带：一眼看出"在跑"。
+      ".dime-veil-grid{position:absolute;inset:0;",
+      "background-image:linear-gradient(rgba(31,45,61,.035) 1px,transparent 1px),",
+      "linear-gradient(90deg,rgba(31,45,61,.035) 1px,transparent 1px);",
+      "background-size:44px 44px;",
+      "-webkit-mask-image:radial-gradient(circle at 50% 50%,#000 0,transparent 74%);",
+      "mask-image:radial-gradient(circle at 50% 50%,#000 0,transparent 74%)}",
+      ".dime-veil-scan{position:absolute;left:0;right:0;height:130px;",
+      "background:linear-gradient(180deg,rgba(139,92,246,0),",
+      "rgba(139,92,246,.12),rgba(59,130,246,0));",
+      "animation:dimeScan 5.5s linear infinite;will-change:transform}",
+      "@keyframes dimeScan{from{transform:translate3d(0,-25vh,0)}",
+      "to{transform:translate3d(0,110vh,0)}}",
+      ".dime-veil-topbar{position:absolute;top:0;left:0;right:0;height:3px;",
+      "background:rgba(31,45,61,.07)}",
+      ".dime-veil-topbar-fill{height:100%;width:100%;",
+      "transform:scaleX(0);transform-origin:left center;will-change:transform;",
+      "background:linear-gradient(90deg,#8b5cf6,#3b82f6,#22d3ee);",
+      "box-shadow:0 0 14px rgba(99,102,241,.55);",
+      "transition:transform .35s cubic-bezier(.22,1,.36,1)}",
+      ".dime-veil-card{position:absolute;left:50%;top:50%;",
+      "width:min(640px,88vw);max-height:84vh;",
+      "display:flex;flex-direction:column;",
+      "padding:20px 30px 22px;border-radius:22px;",
+      "transform:translate(-50%,-50%);text-align:center;color:#303133;",
+      "background:rgba(255,255,255,.74);",
+      "backdrop-filter:blur(18px) saturate(1.6);",
+      "-webkit-backdrop-filter:blur(18px) saturate(1.6);",
+      "border:1px solid rgba(255,255,255,.9);",
+      "box-shadow:0 24px 70px rgba(31,45,61,.14),0 2px 10px rgba(31,45,61,.06);",
+      "animation:dimeVeilCardIn .55s cubic-bezier(.22,1,.36,1) both}",
+      "@keyframes dimeVeilCardIn{",
+      "from{opacity:0;transform:translate(-50%,calc(-50% + 14px)) scale(.97)}",
+      "to{opacity:1;transform:translate(-50%,-50%)}}",
+      ".dime-veil-head{display:flex;align-items:center;gap:9px;",
+      "padding-bottom:15px;margin-bottom:18px;",
+      "border-bottom:1px solid rgba(31,45,61,.07)}",
+      ".dime-veil-dot{width:9px;height:9px;border-radius:50%;flex:none;",
+      "background:#8b5cf6;animation:dimeHudPulse 1.2s ease-in-out infinite}",
+      ".dime-veil-dot.is-done{background:#67c23a;animation:none}",
+      ".dime-veil-dot.is-stopped{background:#909399;animation:none}",
+      ".dime-veil-dot.is-failed{background:#f56c6c;animation:none}",
+      ".dime-veil-title{font-size:15px;font-weight:600;color:#1f2d3d;",
+      "flex:none}",
+      ".dime-veil-compose{font-size:12px;color:#909399;min-width:0;",
+      "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dime-veil-body{flex:1;min-height:0;display:flex;",
+      "flex-direction:column}",
+      ".dime-veil-ring-wrap{position:relative;width:134px;height:134px;",
+      "margin:0 auto}",
+      ".dime-veil-ring{width:134px;height:134px;transform:rotate(-90deg)}",
+      ".dime-veil-ring circle{fill:none;stroke-width:9;stroke-linecap:round}",
+      ".dime-veil-ring-track{stroke:rgba(31,45,61,.08)}",
+      ".dime-veil-ring-fill{stroke:url(#dime-veil-ring-grad);",
+      `stroke-dasharray:${BATCH_VEIL_RING_CIRCUMFERENCE.toFixed(2)};`,
+      `stroke-dashoffset:${BATCH_VEIL_RING_CIRCUMFERENCE.toFixed(2)};`,
+      "transition:stroke-dashoffset .5s cubic-bezier(.22,1,.36,1)}",
+      ".dime-veil-pct{position:absolute;inset:0;display:flex;",
+      "align-items:center;justify-content:center;font-size:30px;",
+      "font-weight:700;color:#1f2d3d;letter-spacing:-.02em;",
+      "font-variant-numeric:tabular-nums}",
+      ".dime-veil-count{margin-top:8px;font-size:20px;font-weight:700;",
+      "color:#1f2d3d;font-variant-numeric:tabular-nums;line-height:1.1}",
+      ".dime-veil-count small{font-size:12px;color:#909399;font-weight:500}",
+      ".dime-veil-pipeline{margin-top:4px;font-size:11px;color:#909399;",
+      "font-variant-numeric:tabular-nums}",
+      ".dime-veil-stats{display:flex;gap:16px;justify-content:center;",
+      "margin-top:9px;font-size:12px;color:#909399}",
+      ".dime-veil-stats b{font-weight:600}",
+      ".dime-veil-stats .s-ok b{color:#67c23a}",
+      ".dime-veil-stats .s-skip b{color:#e6a23c}",
+      ".dime-veil-stats .s-fail b{color:#f56c6c}",
+      ".dime-veil-now{margin-top:16px;padding:9px 13px;border-radius:12px;",
+      "background:rgba(139,92,246,.06);",
+      "border:1px solid rgba(139,92,246,.14);text-align:left}",
+      ".dime-veil-now-k{display:block;font-size:11px;color:#8b5cf6;",
+      "font-weight:600;letter-spacing:.04em}",
+      ".dime-veil-now-v{display:block;margin-top:4px;font-size:13px;",
+      "color:#1f2d3d;white-space:nowrap;overflow:hidden;",
+      "text-overflow:ellipsis}",
+      ".dime-veil-now-v.is-idle{color:#909399;font-size:12px}",
+      ".dime-veil-listhead{display:flex;justify-content:space-between;",
+      "margin:14px 3px 6px;font-size:11px;color:#909399}",
+      ".dime-veil-log{text-align:left;padding:2px 0}",
+      ".dime-veil-row{display:flex;align-items:center;gap:9px;",
+      "padding:6px 3px;font-size:12px;color:#606266;",
+      "animation:dimeVeilRowIn .3s ease both}",
+      "@keyframes dimeVeilRowIn{from{opacity:0;transform:translateY(-4px)}",
+      "to{opacity:1;transform:none}}",
+      ".dime-veil-row+.dime-veil-row{",
+      "border-top:1px solid rgba(31,45,61,.05)}",
+      ".dime-veil-row .mark{flex:none;width:15px;text-align:center;",
+      "font-weight:700}",
+      ".dime-veil-row .code{color:#1f2d3d;font-weight:500;",
+      "font-variant-numeric:tabular-nums;white-space:nowrap;",
+      "overflow:hidden;text-overflow:ellipsis}",
+      ".dime-veil-row .info{margin-left:auto;flex:none;max-width:54%;",
+      "color:#909399;font-size:11px;white-space:nowrap;",
+      "overflow:hidden;text-overflow:ellipsis}",
+      ".dime-veil-row.is-saved .mark{color:#67c23a}",
+      ".dime-veil-row.is-skipped .mark{color:#e6a23c}",
+      ".dime-veil-row.is-failed .mark{color:#f56c6c}",
+      ".dime-veil-empty{padding:10px 3px;font-size:12px;color:#c0c4cc}",
+      ".dime-veil-stop{pointer-events:auto;margin-left:auto;flex:none;",
+      "padding:8px 18px;border:none;border-radius:10px;cursor:pointer;",
+      "font-size:13px;font-weight:600;color:#fff;",
+      "background:linear-gradient(135deg,#8b5cf6,#3b82f6);",
+      "box-shadow:0 8px 22px rgba(99,102,241,.32);",
+      "transition:transform .18s ease,box-shadow .18s ease}",
+      ".dime-veil-stop:hover{transform:translateY(-1px);",
+      "box-shadow:0 12px 28px rgba(99,102,241,.42)}",
+      ".dime-veil-stop:active{transform:translateY(0)}"
+    ].join("");
+  }
+
+  function showBatchVeil(total, composeText) {
+    ensureBatchVeilStyle();
+
+    if (batchHud.veil?.isConnected) batchHud.veil.remove();
+
+    const el = document.createElement("div");
+    const head = [
+      '<div class="dime-veil-blob b1"></div>',
+      '<div class="dime-veil-blob b2"></div>',
+      '<div class="dime-veil-grid"></div>',
+      '<div class="dime-veil-scan"></div>',
+      '<div class="dime-veil-topbar">',
+      '<div class="dime-veil-topbar-fill" data-hud="bar"></div>',
+      "</div>",
+      '<div class="dime-veil-card">',
+      '<div class="dime-veil-head">',
+      '<span class="dime-veil-dot"></span>',
+      '<span class="dime-veil-title" data-hud="title">正在静默核对补齐</span>',
+      `<span class="dime-veil-compose" data-hud="compose">${composeText || ""}</span>`,
+      '<button class="dime-veil-stop" type="button" data-hud="stop">',
+      "停止批量处理",
+      "</button>",
+      "</div>"
+    ];
+
+    const body = [
+      '<div class="dime-veil-body">',
+      '<div class="dime-veil-ring-wrap">',
+      '<svg class="dime-veil-ring" viewBox="0 0 120 120">',
+      "<defs>",
+      '<linearGradient id="dime-veil-ring-grad" x1="0" y1="0" x2="1" y2="1">',
+      '<stop offset="0%" stop-color="#8b5cf6"></stop>',
+      '<stop offset="55%" stop-color="#3b82f6"></stop>',
+      '<stop offset="100%" stop-color="#22d3ee"></stop>',
+      "</linearGradient>",
+      "</defs>",
+      '<circle class="dime-veil-ring-track" cx="60" cy="60" r="52"></circle>',
+      '<circle class="dime-veil-ring-fill" data-hud="ring" cx="60" cy="60" r="52"></circle>',
+      "</svg>",
+      '<div class="dime-veil-pct" data-hud="pct">0%</div>',
+      "</div>",
+      `<div class="dime-veil-count"><span data-hud="done">0</span>`,
+      `<small> / ${total} 已完成</small></div>`,
+      '<div class="dime-veil-pipeline" data-hud="pipeline">在途 0 ｜ 待补试 0</div>',
+      '<div class="dime-veil-stats">',
+      '<span class="s-ok">已补齐 <b data-hud="saved">0</b></span>',
+      '<span class="s-skip">无需动 <b data-hud="skipped">0</b></span>',
+      '<span class="s-fail">失败 <b data-hud="failed">0</b></span>',
+      "</div>",
+      '<div class="dime-veil-now">',
+      '<span class="dime-veil-now-k">正在处理</span>',
+      '<span class="dime-veil-now-v" data-hud="current">正在准备……</span>',
+      "</div>",
+      '<div class="dime-veil-listhead">',
+      "<span>最近完成</span>",
+      '<span data-hud="logcount">进行中</span>',
+      "</div>",
+      '<div class="dime-veil-log" data-hud="log">',
+      '<div class="dime-veil-empty">刚提交第一批，完成的条目会一条条出现在这里。</div>',
+      "</div>",
+      "</div>"
+    ];
+
+    el.id = BATCH_VEIL_ID;
+    el.innerHTML = head.concat(body).join("");
+
+    el.querySelector('[data-hud="stop"]').addEventListener("click", () => {
+      if (!batchRunning || batchCancelRequested) return;
+
+      batchCancelRequested = true;
+      batchHudText("title", "正在停止，等当前套餐结束……");
+    });
+
+    document.body.appendChild(el);
+    batchHud.veil = el;
+  }
+
+  /*
+   * 往"最近完成"里追加一条（只挂全屏进度背景，角落小卡片吃不下列表）。
+   *
+   * 只留最近 4 条：这层是"进度背景"，不是日志窗口 —— 屏幕上有少量正在
+   * 发生的事就有高级感，堆一屏反而吵。完整逐条清单仍在工具面板的报告里。
+   */
+  const BATCH_VEIL_LOG_ROWS = 4;
+
+  function pushBatchHudItem(candidate, result) {
+    const list = batchHud.veil?.querySelector('[data-hud="log"]');
+
+    if (!list) return;
+
+    const status = result?.status || "failed";
+    const className =
+      status === "saved"
+        ? "is-saved"
+        : status === "skipped"
+          ? "is-skipped"
+          : "is-failed";
+    const mark = status === "saved" ? "✓" : status === "skipped" ? "–" : "✗";
+    const info =
+      status === "saved"
+        ? result.detail || "内容已更新"
+        : status === "skipped"
+          ? result.note || "无需修改"
+          : result.reason || "未知原因";
+
+    list.querySelector(".dime-veil-empty")?.remove();
+
+    const row = document.createElement("div");
+    row.className = `dime-veil-row ${className}`;
+
+    const markEl = document.createElement("span");
+    markEl.className = "mark";
+    markEl.textContent = mark;
+
+    const codeEl = document.createElement("span");
+    codeEl.className = "code";
+    codeEl.textContent = `${candidate.sequence || "-"} · ${candidate.code}`;
+
+    const infoEl = document.createElement("span");
+    infoEl.className = "info";
+    infoEl.textContent = info;
+    infoEl.title = info;
+
+    row.append(markEl, codeEl, infoEl);
+    list.appendChild(row);
+
+    while (list.children.length > BATCH_VEIL_LOG_ROWS) {
+      list.removeChild(list.firstChild);
+    }
+
+    batchHudText("logcount", `共 ${batchHud.doneCount} 条`);
+  }
+
+  function finishBatchVeil() {
+    const el = batchHud.veil;
+
+    if (!el) return;
+
+    batchHud.veil = null;
+    el.classList.add("is-leaving");
+    setTimeout(() => el.remove(), 520);
+  }
+
+  /* 卡片与全屏进度背景共用同一份数值，所以统一在这里取 DOM 结点。 */
+  function batchHudRoots() {
+    return [batchHud.veil, batchHud.el].filter(root => root?.isConnected);
   }
 
   function batchHudText(key, value) {
-    const node = batchHud.el?.querySelector(`[data-hud="${key}"]`);
-    if (node && node.textContent !== value) node.textContent = value;
+    for (const root of batchHudRoots()) {
+      const node = root.querySelector(`[data-hud="${key}"]`);
+      if (node && node.textContent !== value) node.textContent = value;
+    }
   }
 
-  function showBatchHud(total) {
+  function showBatchHud(total, composeText) {
+    ensureBatchHudStyle();
+    ensureBatchVeilStyle();
+
+    for (const root of [batchHud.el, batchHud.veil]) {
+      if (root?.isConnected) root.remove();
+    }
+
+    batchHud.el = null;
+    batchHud.veil = null;
+    batchHud.total = total;
+    batchHud.doneCount = 0;
+    batchHud.saved = 0;
+    batchHud.skipped = 0;
+    batchHud.failed = 0;
+    batchHud.inFlight = 0;
+    batchHud.pending = 0;
+
+    if (fastPathEnabled) {
+      // 静默直写：页面全程不可见地干活，全屏进度背景就是唯一的信息来源。
+      showBatchVeil(total, composeText);
+    } else {
+      // 界面模拟模式要看得见弹窗，只能给角落那张小卡片。
+      showBatchHudCard("核对补齐中", "正在准备……");
+    }
+  }
+
+  /* 角落小卡片：界面模拟模式的主力，静默直写模式下只在批量结束后出场。 */
+  function showBatchHudCard(title, summary) {
     ensureBatchHudStyle();
 
     if (batchHud.el?.isConnected) batchHud.el.remove();
-    batchHud.total = total;
 
+    const total = batchHud.total || 0;
     const el = document.createElement("div");
+
     el.id = BATCH_HUD_ID;
     el.innerHTML = [
       '<div class="dime-hud-title">',
       '<span class="dime-hud-dot" data-hud="dot"></span>',
-      '<span data-hud="title">静默修复中</span>',
+      `<span data-hud="title">${title}</span>`,
       '<button class="dime-hud-stop" type="button" data-hud="stop">停止</button>',
       "</div>",
-      '<div class="dime-hud-count"><span data-hud="done">0</span>',
+      `<div class="dime-hud-count"><span data-hud="done">${batchHud.doneCount}</span>`,
       `<small> / ${total}</small></div>`,
       '<div class="dime-hud-bar"><div class="dime-hud-bar-fill" data-hud="bar"></div></div>',
-      '<div class="dime-hud-current" data-hud="current">正在准备……</div>',
+      `<div class="dime-hud-current" data-hud="current">${summary || "正在准备……"}</div>`,
+      '<div class="dime-hud-pipeline" data-hud="pipeline">在途 0 ｜ 待补试 0</div>',
       '<div class="dime-hud-stats">',
-      '<span class="s-ok">已保存 <b data-hud="saved">0</b></span>',
-      '<span class="s-skip">跳过 <b data-hud="skipped">0</b></span>',
-      '<span class="s-fail">失败 <b data-hud="failed">0</b></span>',
+      `<span class="s-ok">已补齐 <b data-hud="saved">${batchHud.saved}</b></span>`,
+      `<span class="s-skip">无需动 <b data-hud="skipped">${batchHud.skipped}</b></span>`,
+      `<span class="s-fail">失败 <b data-hud="failed">${batchHud.failed}</b></span>`,
       "</div>"
     ].join("");
 
@@ -8528,74 +8833,175 @@
 
     document.body.appendChild(el);
     batchHud.el = el;
+
+    // 只有"结束态"才换点色：批量中的标题不能落成灰点。
+    if (/完成|停止|失败|错误|出错/.test(title)) {
+      const dot = el.querySelector('[data-hud="dot"]');
+
+      if (dot) {
+        dot.classList.add(
+          title.includes("完成")
+            ? "is-done"
+            : title.includes("失败") ||
+                title.includes("错误") ||
+                title.includes("出错")
+              ? "is-failed"
+              : "is-stopped"
+        );
+      }
+    }
+
+    refreshBatchHudBar();
   }
 
   function updateBatchHudCurrent(candidate, index, phase) {
-    if (!batchHud.el) return;
+    if (!batchHudRoots().length) return;
+
+    // index 可能是序号，也可能是"重试"这种文字标签。
+    const position =
+      typeof index === "number" && batchHud.total
+        ? `#${index}/${batchHud.total}`
+        : `#${index}`;
 
     batchHudText(
       "current",
       [
-        `#${index} ${candidate.sequence || "-"} · ${candidate.code}`,
+        `${position} ${candidate.sequence || "-"} · ${candidate.code}`,
+        candidate.packageName ? ` · ${candidate.packageName}` : "",
         phase ? `｜${phase}` : ""
       ].join("")
     );
   }
 
-  function bumpBatchHudProgress(status) {
-    if (!batchHud.el) return;
-
-    const done = Number(
-      batchHud.el.querySelector('[data-hud="done"]').textContent
-    ) + 1;
-
-    batchHudText("done", String(done));
-
-    const saved = Number(
-      batchHud.el.querySelector('[data-hud="saved"]').textContent
-    );
-    const skipped = Number(
-      batchHud.el.querySelector('[data-hud="skipped"]').textContent
-    );
-    const failed = Number(
-      batchHud.el.querySelector('[data-hud="failed"]').textContent
+  /*
+   * 进度几何：已结案的算满格，还在途/待补试的算半格。
+   *
+   * 只按"已结案"画条会出现这种情况：扫掠阶段请求全部在途、一条结果都没回来，
+   * 条就一直钉在 0，等到最后一批回执同时落地才一次性跳满（正是用户报的现象）。
+   * 把"处理中"按半格计入，条和进度环才会随着提交持续推进。
+   */
+  function refreshBatchHudBar() {
+    const total = Math.max(1, batchHud.total || batchHud.doneCount || 1);
+    const ongoing = (batchHud.inFlight || 0) + (batchHud.pending || 0);
+    const ratio = Math.min(
+      1,
+      (batchHud.doneCount + ongoing * 0.5) / total
     );
 
-    if (status === "saved") batchHudText("saved", String(saved + 1));
-    else if (status === "skipped") batchHudText("skipped", String(skipped + 1));
-    else batchHudText("failed", String(failed + 1));
+    for (const root of batchHudRoots()) {
+      const bar = root.querySelector('[data-hud="bar"]');
+      if (bar) bar.style.transform = `scaleX(${ratio})`;
 
-    const bar = batchHud.el.querySelector('[data-hud="bar"]');
-    bar.style.width = `${Math.min(
-      100,
-      (done / Math.max(1, batchHud.total || done)) * 100
-    )}%`;
-  }
+      const ring = root.querySelector('[data-hud="ring"]');
 
-  function finishBatchHud(title, summary) {
-    if (!batchHud.el) return;
-
-    batchHudText("title", title);
-    if (summary) batchHudText("current", summary);
-
-    const dot = batchHud.el.querySelector('[data-hud="dot"]');
-    const stop = batchHud.el.querySelector('[data-hud="stop"]');
-
-    if (dot) {
-      dot.classList.add(
-        title.includes("完成")
-          ? "is-done"
-          : title.includes("失败") ||
-              title.includes("错误") ||
-              title.includes("出错")
-            ? "is-failed"
-            : "is-stopped"
-      );
+      if (ring) {
+        ring.style.strokeDashoffset = String(
+          (BATCH_VEIL_RING_CIRCUMFERENCE * (1 - ratio)).toFixed(2)
+        );
+      }
     }
 
-    if (stop) stop.remove();
+    batchHudText("pct", `${Math.round(ratio * 100)}%`);
+  }
 
+  /*
+   * 流水线状态：在途（已提交、等回执）+ 待补试（首轮没成、进了批末重试队列）。
+   * 这两个数既让用户看得出"它在动"，也是排障的第一手线索。
+   */
+  function updateBatchHudPipeline(inFlight, pending) {
+    batchHud.inFlight = Math.max(0, Number(inFlight) || 0);
+    batchHud.pending = Math.max(0, Number(pending) || 0);
+
+    if (!batchHudRoots().length) return;
+
+    batchHudText(
+      "pipeline",
+      `在途 ${batchHud.inFlight} ｜ 待补试 ${batchHud.pending}`
+    );
+    refreshBatchHudBar();
+  }
+
+  function bumpBatchHudProgress(status) {
+    // 计数走内存状态而不是 DOM：批量结束那一刻卡片是新建的，
+    // 从 DOM 里读会把总账算丢。
+    batchHud.doneCount += 1;
+
+    if (status === "saved") batchHud.saved += 1;
+    else if (status === "skipped") batchHud.skipped += 1;
+    else batchHud.failed += 1;
+
+    if (!batchHudRoots().length) return;
+
+    batchHudText("done", String(batchHud.doneCount));
+    batchHudText("saved", String(batchHud.saved));
+    batchHudText("skipped", String(batchHud.skipped));
+    batchHudText("failed", String(batchHud.failed));
+    refreshBatchHudBar();
+  }
+
+  /*
+   * 整批收尾。v4.6.2：跑到 100% 不再"啪"一下收场。
+   *
+   * 先把进度背景切成"完成态"（标题换成结果、收起停止按钮、把"正在处理"
+   * 那一行换成本次汇总、圆点由呼吸变定格），原地停 2 秒让人看清结果，
+   * 再淡出并把汇总交回右下角小卡片。
+   */
+  function finishBatchHud(title, summary) {
+    const veil = batchHud.veil;
+
+    if (veil) {
+      const isFailed = /失败|错误|出错/.test(title);
+      const dot = veil.querySelector(".dime-veil-dot");
+      const nowKey = veil.querySelector(".dime-veil-now-k");
+
+      batchHudText("title", title);
+      if (summary) batchHudText("current", summary);
+
+      veil.querySelector('[data-hud="stop"]')?.remove();
+
+      if (dot) {
+        dot.classList.add(
+          title.includes("完成") ? "is-done" : isFailed ? "is-failed" : "is-stopped"
+        );
+      }
+
+      if (nowKey) nowKey.textContent = "处理结果";
+
+      // 收尾了，"在途/待补试"已经没有意义：正常收场就是两个 0，
+      // 中途叫停则更糟——会挂着上一批的残数。这里统一换成一句定论。
+      batchHud.inFlight = 0;
+      batchHud.pending = 0;
+
+      const total = batchHud.total || batchHud.doneCount;
+
+      batchHudText(
+        "pipeline",
+        title.includes("完成")
+          ? `本批 ${total} 个已全部过完`
+          : `已处理 ${batchHud.doneCount}/${total} 个，其余未动`
+      );
+
+      setTimeout(() => {
+        finishBatchVeil();
+        showBatchHudCard(title, summary);
+        scheduleBatchHudCardDismiss();
+      }, BATCH_VEIL_FINISH_HOLD_MS);
+
+      return;
+    }
+
+    showBatchHudCard(title, summary);
+    scheduleBatchHudCardDismiss();
+  }
+
+  /* 结果汇总卡片：收起"停止"按钮，留 3.6 秒看清后自己淡掉。 */
+  function scheduleBatchHudCardDismiss() {
     const el = batchHud.el;
+
+    if (!el) return;
+
+    el.querySelector('[data-hud="stop"]')?.remove();
+
     setTimeout(() => {
       el.classList.add("is-leaving");
       setTimeout(() => {
@@ -8735,7 +9141,7 @@
   }
 
   /*
-   * 批量修复的快速通道：流水线并发版（v4.5）。
+   * 批量核对补齐的快速通道：流水线并发版（v4.5）。
    *
    * 与界面模拟版共享同一套候选筛选与队列顺序；提交从"逐条等回执"
    * 改成流水线：同一时刻最多 FAST_PATH.maxInFlight 个保存请求在途。
@@ -8943,14 +9349,25 @@
   }
 
   /*
-   * 流水线主入口。返回 stopMessage（空串 = 全部处理完且重试全过）。
+   * 流水线主入口。返回 { stopMessage, deferredCount, serialFallback }
+   * （stopMessage 空串 = 全部处理完且重试全过；后两项用于报告与排障）。
+   *
+   * applyResult 是"归账 + 让出一帧渲染"的异步回调（v4.5.1）：调用方对它 await，
+   * 保证每条结束后浏览器真的画过一帧，HUD 进度才会实时走动。
+   *
+   * v4.5.2：并发提交一旦在首轮拿不到结果（复用弹窗被页面"保存中"状态占着，
+   * 请求根本没发出），自动降级为逐条提交 —— 见 FAST_PATH.maxInFlight 注释。
    */
   async function runFastPathPipeline(queue, applyResult) {
     const vm = getFastPathVm();
 
     if (!vm) {
-      return "找不到页面的套餐管理组件，数据层直写不可用；" +
-        "请改用界面模拟模式";
+      return {
+        stopMessage:
+          "找不到页面的套餐管理组件，数据层直写不可用；请改用界面模拟模式",
+        deferredCount: 0,
+        serialFallback: false
+      };
     }
 
     installFastPathTap();
@@ -8962,6 +9379,31 @@
     let cursor = 0;
     let inFlight = 0;
     let stopMessage = "";
+
+    // 首轮没拿到结果的条数，以及是否已降级为逐条提交（详见 FAST_PATH.maxInFlight 注释）。
+    let deferredCount = 0;
+    let serialFallback = false;
+
+    const syncPipelineHud = () =>
+      updateBatchHudPipeline(inFlight, retryQueue.length);
+
+    /*
+     * 降级模式下的"让位"：等上一条回执彻底落地、页面收完加载态，
+     * 再动那个整批复用的编辑弹窗。否则页面的"保存中"状态会把这次提交
+     * 静默吞掉（请求不发出）⇒ 首轮全废、进度条一条不动。
+     * 必须在表单锁内调用，否则等完又被别的 worker 抢在前面。
+     */
+    const waitSubmitSlot = async () => {
+      if (!serialFallback || inFlight <= 0) return;
+
+      const startedAt = Date.now();
+
+      while (inFlight > 0 && Date.now() - startedAt < FAST_PATH.serializeWaitMs) {
+        await sleep(40);
+      }
+
+      await sleep(FAST_PATH.serializeSettleMs);
+    };
 
     const describeItem = candidate =>
       `${candidate.sequence || "-"} · ${candidate.code}`;
@@ -8981,12 +9423,12 @@
       ].filter(Boolean).join("，") || "内容已更新";
     };
 
-    const finishOutcome = (candidate, evaluation, applied, attempts) => {
+    const finishOutcome = async (candidate, evaluation, applied, attempts) => {
       if (!evaluation.ok) return false;
 
       batchVerifiedCodes.add(strictKey(candidate.code));
 
-      applyResult(candidate, {
+      await applyResult(candidate, {
         status: "saved",
         attempts,
         verificationMode: "network",
@@ -9012,7 +9454,7 @@
         try {
           plan = await prepareFastPathCandidate(vm, candidate);
         } catch (error) {
-          applyResult(candidate, {
+          await applyResult(candidate, {
             status: "failed",
             reason: error?.message || String(error)
           });
@@ -9020,7 +9462,7 @@
         }
 
         if (!plan) {
-          applyResult(candidate, {
+          await applyResult(candidate, {
             status: "skipped",
             attempts: 1,
             verificationMode: "none",
@@ -9032,12 +9474,15 @@
         try {
           updateBatchHudCurrent(candidate, index + 1, "写入表单并提交……");
 
-          const committed = await runExclusive(() =>
-            commitFastPathCandidate(vm, candidate, plan)
-          );
+          const committed = await runExclusive(async () => {
+            // 锁内让位：降级模式下要等上一条回执落地再动这个共用弹窗。
+            await waitSubmitSlot();
+
+            return commitFastPathCandidate(vm, candidate, plan);
+          });
 
           if (committed.kind === "skip") {
-            applyResult(candidate, {
+            await applyResult(candidate, {
               status: "skipped",
               attempts: 1,
               verificationMode: "none",
@@ -9047,14 +9492,20 @@
           }
 
           if (committed.kind === "blocked") {
+            // 请求压根没发出去（多数是复用弹窗还没从上一次保存里出来）：
+            // 记一笔首轮未过，并立刻切到"等回执再提交"。
+            deferredCount++;
+            serialFallback = true;
             retryQueue.push({
               candidate,
               lastReason: committed.reason || "未知原因"
             });
+            syncPipelineHud();
             continue;
           }
 
           inFlight++;
+          syncPipelineHud();
           updateBatchHudCurrent(
             candidate,
             index + 1,
@@ -9067,21 +9518,35 @@
           );
 
           inFlight--;
+          syncPipelineHud();
 
-          if (finishOutcome(candidate, evaluation, committed.applied, 1)) {
+          if (
+            await finishOutcome(
+              candidate,
+              evaluation,
+              committed.applied,
+              1
+            )
+          ) {
             continue;
           }
 
+          deferredCount++;
+          serialFallback = true;
           retryQueue.push({
             candidate,
             lastReason: evaluation.reason || "未知原因"
           });
+          syncPipelineHud();
         } catch (error) {
           // 提交环节的瞬时错误（弹窗未就绪、表单被占用等）：交给批末重试。
+          deferredCount++;
+          serialFallback = true;
           retryQueue.push({
             candidate,
             lastReason: error?.message || String(error)
           });
+          syncPipelineHud();
         }
       }
     };
@@ -9095,8 +9560,15 @@
 
     /* ---- 批末重试：串行逐条补足次数；仍失败则停批 ---- */
     if (!batchCancelRequested && !stopMessage && retryQueue.length) {
+      let retryLeft = retryQueue.length;
+
+      updateBatchHudPipeline(0, retryLeft);
+
       for (const item of retryQueue) {
         if (batchCancelRequested || stopMessage) break;
+
+        retryLeft--;
+        updateBatchHudPipeline(0, retryLeft);
 
         const candidate = item.candidate;
         let resolved = false;
@@ -9117,7 +9589,7 @@
             const plan = await prepareFastPathCandidate(vm, candidate);
 
             if (!plan) {
-              applyResult(candidate, {
+              await applyResult(candidate, {
                 status: "skipped",
                 attempts: attempt,
                 verificationMode: "none",
@@ -9127,12 +9599,14 @@
               break;
             }
 
-            const committed = await runExclusive(() =>
-              commitFastPathCandidate(vm, candidate, plan)
-            );
+            const committed = await runExclusive(async () => {
+              await waitSubmitSlot();
+
+              return commitFastPathCandidate(vm, candidate, plan);
+            });
 
             if (committed.kind === "skip") {
-              applyResult(candidate, {
+              await applyResult(candidate, {
                 status: "skipped",
                 attempts: attempt,
                 verificationMode: "none",
@@ -9151,7 +9625,7 @@
               );
 
               if (
-                finishOutcome(
+                await finishOutcome(
                   candidate,
                   evaluation,
                   committed.applied,
@@ -9175,7 +9649,7 @@
         }
 
         if (!resolved) {
-          applyResult(candidate, {
+          await applyResult(candidate, {
             status: "failed",
             reason: lastReason
           });
@@ -9192,7 +9666,7 @@
       }
     }
 
-    return stopMessage;
+    return { stopMessage, deferredCount, serialFallback };
   }
 
   async function processOneBatchCandidate(
@@ -9477,7 +9951,7 @@
     }
 
     if (!latestBatchCandidates.length) {
-      showToast("当前没有可安全批量处理的套餐");
+      showToast("当前没有需要核对补齐的套餐");
       return;
     }
 
@@ -9486,7 +9960,7 @@
       return;
     }
 
-    // 点击“批量安全修复”后直接开始，不再弹出浏览器原生确认框。
+    // 点击“批量核对补齐”后直接开始，不再弹出浏览器原生确认框。
     // 安全候选筛选、首错即停、停止按钮和保存复核仍然保留。
     const queue =
       buildOrderedBatchQueue(
@@ -9509,7 +9983,7 @@
     updateBatchProgress(
       `停止批量处理（0/${queue.length}）`,
       [
-        `已开始批量安全修复，共 ${queue.length} 个套餐`,
+        `已开始批量核对补齐，共 ${queue.length} 个套餐`,
         `处理顺序：只缺岗位 ${queueCounts["stage-only"]} 个` +
           ` → 只缺危害 ${queueCounts["hazard-only"]} 个` +
           ` → 两者都缺 ${queueCounts.combined} 个`,
@@ -9517,7 +9991,12 @@
       ].join("\n")
     );
 
-    showBatchHud(queue.length);
+    showBatchHud(
+      queue.length,
+      `本批 ${queue.length} 个：只缺岗位 ${queueCounts["stage-only"]}` +
+        ` · 只缺危害 ${queueCounts["hazard-only"]}` +
+        ` · 两者都缺 ${queueCounts.combined}`
+    );
 
     let savedCount = 0;
     let skippedCount = 0;
@@ -9535,8 +10014,10 @@
     const batchLog = [];
 
     let doneCount = 0;
+    let fastPathDeferredCount = 0;
+    let fastPathSerialFallback = false;
 
-    // 两条处理路径（流水线 / 界面模拟）共用的结果归账：
+    // 两条处理路径（流水线 / 界面模拟）共用的结果归账（纯同步）：
     // 计数、HUD、按钮进度、逐条报告都在这里。
     const applyBatchResult = (candidate, result) => {
       doneCount++;
@@ -9549,7 +10030,7 @@
         bumpBatchHudProgress("saved");
         batchLog.push(
           [
-            `已保存｜${candidate.sequence || "-"} · ${candidate.code}`,
+            `已补齐｜${candidate.sequence || "-"} · ${candidate.code}`,
             result.detail ? `（${result.detail}）` : ""
           ].filter(Boolean).join("")
         );
@@ -9599,7 +10080,7 @@
         bumpBatchHudProgress("skipped");
         batchLog.push(
           [
-            `跳过｜${candidate.sequence || "-"} · ${candidate.code}`,
+            `无需动｜${candidate.sequence || "-"} · ${candidate.code}`,
             result.note ? `（${result.note}）` : ""
           ].filter(Boolean).join("")
         );
@@ -9613,16 +10094,32 @@
           ].filter(Boolean).join("")
         );
       }
+
+      // 全屏进度背景的"最近完成"跟着走；角落小卡片没有这张清单，函数里自会跳过。
+      pushBatchHudItem(candidate, result);
+    };
+
+    // 归账 + 让出一帧渲染。批量期间主线程被页面重绘占满，浏览器没机会刷新
+    // HUD，表现就是"进度条运行期间不动、结束才一次性跳满"；每条处理完让一帧，
+    // 进度才会实时走动（代价 ≈ 每条 +1 帧，约 16ms）。
+    const applyBatchResultAndYield = (candidate, result) => {
+      applyBatchResult(candidate, result);
+
+      return yieldToPaintFrame();
     };
 
     try {
       if (fastPathEnabled) {
         // 流水线并发：最多 maxInFlight 个保存请求同时在途，
         // 失败项批末串行重试；stopMessage 非空 = 重试仍失败已停批。
-        failedMessage = await runFastPathPipeline(
+        const pipelineOutcome = await runFastPathPipeline(
           queue,
-          applyBatchResult
+          applyBatchResultAndYield
         );
+
+        failedMessage = pipelineOutcome.stopMessage;
+        fastPathDeferredCount = pipelineOutcome.deferredCount;
+        fastPathSerialFallback = pipelineOutcome.serialFallback;
       } else {
         for (let index = 0; index < queue.length; index++) {
           if (batchCancelRequested) break;
@@ -9638,7 +10135,7 @@
               queue.length
             );
 
-            applyBatchResult(candidate, result);
+            await applyBatchResultAndYield(candidate, result);
           } catch (error) {
             bumpBatchHudProgress("failed");
             failedMessage = [
@@ -9677,8 +10174,8 @@
           ? "批量处理已因错误停止"
           : stoppedByUser
             ? "批量处理已按你的要求停止"
-            : "批量处理结束",
-        `已完成保存 ${savedCount} 个套餐`,
+            : "批量核对补齐结束",
+        `已核对补齐 ${savedCount} 个套餐`,
         completedStageOnly
           ? `只缺岗位：完成 ${completedStageOnly} 个`
           : "",
@@ -9712,11 +10209,17 @@
         retryCount
           ? `保存不完整时自动重试 ${retryCount} 次`
           : "",
+        fastPathDeferredCount
+          ? `首轮有 ${fastPathDeferredCount} 条被页面弹窗的"保存中"状态挡下、` +
+            (fastPathSerialFallback
+              ? "脚本已自动改为逐条提交收尾"
+              : "已转入批末补试")
+          : "",
         failedCount
           ? `自动补试后仍失败 ${failedCount} 个套餐（见逐条结果）`
           : "",
         skippedCount
-          ? `无需修改并跳过 ${skippedCount} 个套餐`
+          ? `本就一致、无需改动 ${skippedCount} 个套餐`
           : "",
         failedMessage,
         batchLog.length
@@ -9731,7 +10234,7 @@
         elapsedText,
         "队列按“只缺岗位 → 只缺危害 → 两者都缺”处理。",
         networkCount
-          ? `本次为静默直写＋流水线并发（最多 ${FAST_PATH.maxInFlight} 条请求同时在途）：编辑弹窗整批只在后台开一次（全程不可见），每条套餐一次保存请求、成败以接口回执为准；失败项批末自动补试。请对照逐条结果自行抽查核对。`
+          ? `本次为静默直写＋流水线并发（最多 ${FAST_PATH.maxInFlight} 条请求同时在途）：编辑弹窗整批只在后台开一次（全程不可见），每条套餐一次保存请求、成败以接口回执为准；失败项批末自动补试；首轮若被页面弹窗的保存状态挡下，自动降级为逐条提交。请对照逐条结果自行抽查核对。`
           : "组合套餐岗位选中后只留短缓冲，再补危害并在提交前双向复核。"
       ].filter(Boolean).join("\n");
 
@@ -9745,12 +10248,12 @@
 
       finishBatchHud(
         failedMessage
-          ? "批量已停止（出错）"
+          ? "批量核对补齐已停止（出错）"
           : stoppedByUser
             ? "已按要求停止"
-            : "批量修复完成",
+            : "批量核对补齐完成",
         [
-          `已保存 ${savedCount} · 跳过 ${skippedCount}`,
+          `已补齐 ${savedCount} · 无需动 ${skippedCount}`,
           failedCount ? ` · 失败 ${failedCount}` : "",
           ` · 用时 ${(batchElapsedMs / 1000).toFixed(1)} 秒`
         ].join("")
@@ -10800,5 +11303,5 @@
     hideToolPanel();
     enhanceVisibleEditDialogs();
   });
-  console.log("套餐危害因素核对工具 v4.5.0 已加载。");
+  console.log("套餐危害因素核对工具 v4.6.3 已加载。");
 })();
