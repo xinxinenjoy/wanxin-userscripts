@@ -2965,6 +2965,59 @@ jobs:
               </div>
             </main>
 
+            <section class="section" id="tools">
+              <div class="wrap">
+                <div class="section-head">
+                  <div>
+                    <h2 class="section-title">小工具</h2>
+                    <p class="section-desc">
+                      不用装脚本，点开就能用的网页小工具。
+                    </p>
+                  </div>
+                </div>
+
+                <div class="script-grid">
+                  <article class="script-card"
+                           data-folder="工具"
+                           data-search="地下城宝箱模拟 抽奖 六宫格 宝箱 工具">
+                    <div class="script-card-head">
+                      <div class="script-title-wrap">
+                        <h3>地下城宝箱模拟</h3>
+                      </div>
+                      <span class="script-version">网页</span>
+                    </div>
+
+                    <p class="script-description">
+                      六宫格随机开 3 个中奖位，共 20 种组合。每天 15:00 重置；
+                      点「停止」即定稿并锁定本轮，想换一组点「重新摇号」（带二次确认）。
+                      结果保存在你自己的浏览器里，换设备或清缓存会重置。
+                    </p>
+
+                    <div class="script-card-foot">
+                      <div class="script-meta">
+                        <span>纯前端 · 手机可用</span>
+                      </div>
+
+                      <div class="script-actions">
+                        <a class="button button-primary"
+                           href="/assets/tools/chest/"
+                           target="_blank"
+                           rel="noopener noreferrer">
+                          打开工具
+                        </a>
+                        <a class="button button-secondary"
+                           href="{h(GITHUB_REPO_URL)}/blob/main/site-assets/tools/chest/index.html"
+                           target="_blank"
+                           rel="noopener noreferrer">
+                          查看源码
+                        </a>
+                      </div>
+                    </div>
+                  </article>
+                </div>
+              </div>
+            </section>
+
             <div class="image-modal"
                  id="image-modal"
                  aria-hidden="true"
