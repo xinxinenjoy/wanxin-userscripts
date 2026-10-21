@@ -2979,7 +2979,7 @@ jobs:
                 <div class="script-grid">
                   <article class="script-card"
                            data-folder="工具"
-                           data-search="地下城宝箱模拟 抽奖 六宫格 宝箱 工具">
+                           data-search="地下城宝箱模拟 抽奖 六宫格 宝箱 陷阱 楼梯 宝石 打开顺序 工具">
                     <div class="script-card-head">
                       <div class="script-title-wrap">
                         <h3>地下城宝箱模拟</h3>
@@ -2988,8 +2988,8 @@ jobs:
                     </div>
 
                     <p class="script-description">
-                      六宫格随机开 3 个中奖位，共 20 种组合。每天 15:00 重置；
-                      点「停止」即定稿并锁定本轮，想换一组点「重新摇号」（带二次确认）。
+                      六宫格随机分配 3 个中奖、2 个陷阱、1 个楼梯或宝石（共 60 种布局）。
+                      定稿后直接标出打开顺序 1→4，陷阱格标「不可选」。每天 15:00 重置；
                       结果保存在你自己的浏览器里，换设备或清缓存会重置。
                     </p>
 
