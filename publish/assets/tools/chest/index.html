@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>地下城宝箱模拟</title>
+<meta name="description" content="六宫格随机开 3 个中奖位，共 20 种组合。每天 15:00 重置，定稿即锁定。">
+<meta name="theme-color" content="#f3f5f7">
+<meta name="format-detection" content="telephone=no">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2064%2064%27%3E%3Crect%20width%3D%2764%27%20height%3D%2764%27%20rx%3D%2714%27%20fill%3D%27%23191c21%27%2F%3E%3Ccircle%20cx%3D%2721%27%20cy%3D%2721%27%20r%3D%275.5%27%20fill%3D%27%23f5b93f%27%2F%3E%3Ccircle%20cx%3D%2743%27%20cy%3D%2721%27%20r%3D%275.5%27%20fill%3D%27%23f5b93f%27%2F%3E%3Ccircle%20cx%3D%2721%27%20cy%3D%2743%27%20r%3D%275.5%27%20fill%3D%27%234a5160%27%2F%3E%3Ccircle%20cx%3D%2743%27%20cy%3D%2743%27%20r%3D%275.5%27%20fill%3D%27%234a5160%27%2F%3E%3C%2Fsvg%3E">
+<style>
+:root{
+  --bg:#f3f5f7;
+  --card:#ffffff;
+  --text:#1d2129;
+  --muted:#7a828d;
+  --line:#e7eaf0;
+  --dark:#191c21;
+  --gold:#f5b93f;
+  --gold-soft:#fff4d7;
+  --green:#15996a;
+  --red:#d95b5b;
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg)}
+body{
+  font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  color:var(--text);
+  background:
+    radial-gradient(circle at 12% 0%,rgba(245,185,63,.10),transparent 28%),
+    linear-gradient(180deg,#fafbfc 0%,#f3f5f7 100%);
+}
+.app{
+  width:min(1440px,calc(100% - 24px));
+  min-height:calc(100vh - 24px);
+  margin:12px auto;
+  display:flex;
+  flex-direction:column;
+}
+.header{
+  min-height:58px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:18px;
+  padding:0 2px 10px;
+}
+h1{
+  margin:0;
+  font-size:24px;
+  line-height:1.2;
+  letter-spacing:-.5px;
+}
+.subtitle{
+  margin-top:6px;
+  color:var(--muted);
+  font-size:12px;
+}
+.badge{
+  flex:0 0 auto;
+  padding:7px 11px;
+  border-radius:999px;
+  background:#eef1f5;
+  color:#5c646f;
+  font-size:12px;
+  font-weight:800;
+  white-space:nowrap;
+}
+.badge.on{
+  background:var(--gold-soft);
+  color:#835900;
+}
+.main{
+  flex:1;
+  min-height:0;
+  display:grid;
+  grid-template-columns:minmax(320px,1.35fr) minmax(0,1fr);
+  gap:12px;
+}
+.panel{
+  background:var(--card);
+  border:1px solid var(--line);
+  border-radius:18px;
+  box-shadow:0 10px 28px rgba(24,30,40,.06);
+}
+.left{
+  padding:16px;
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+}
+.panel-title{
+  font-size:14px;
+  font-weight:900;
+  margin-bottom:12px;
+}
+.topline{
+  flex:none;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  margin-bottom:10px;
+}
+.topline .panel-title{margin:0}
+.legend{
+  font-size:10px;
+  color:var(--muted);
+  white-space:nowrap;
+}
+.result{
+  flex:none;
+  margin:0 0 14px;
+  border:1px solid #f0dca8;
+  border-radius:16px;
+  background:linear-gradient(180deg,#fffdf6,#fff6e0);
+  padding:16px 10px;
+  text-align:center;
+  font-size:clamp(30px,3.4vw,52px);
+  line-height:1.12;
+  font-weight:900;
+  letter-spacing:5px;
+  color:#8a5a00;
+  font-variant-numeric:tabular-nums;
+  transition:.18s ease;
+  user-select:text;
+}
+.result.pending{
+  border-color:var(--line);
+  background:linear-gradient(180deg,#fbfcfd,#f4f6f8);
+  color:#b6bcc5;
+}
+.result.locked{
+  box-shadow:0 8px 20px rgba(245,185,63,.20);
+}
+.grid{
+  flex:1 1 auto;
+  min-height:0;
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  grid-template-rows:repeat(2,minmax(58px,1fr));
+  gap:11px;
+}
+.box{
+  min-height:58px;
+  max-height:170px;
+  border:1px solid var(--line);
+  border-radius:16px;
+  background:linear-gradient(180deg,#fff,#f8f9fb);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  position:relative;
+  font-size:clamp(24px,2.4vw,42px);
+  font-weight:900;
+  color:#9aa1ab;
+  transition:.1s ease;
+}
+.box.win{
+  background:linear-gradient(180deg,#fffaf0,#fff0bf);
+  border-color:#edc769;
+  box-shadow:0 6px 16px rgba(245,185,63,.15);
+  color:#7a5200;
+  transform:translateY(-1px);
+}
+.box.win::after{
+  content:"中奖";
+  position:absolute;
+  right:7px;
+  top:7px;
+  font-size:clamp(9px,.85vw,12px);
+  font-weight:800;
+  color:#805600;
+  background:#ffe8a3;
+  padding:3px 6px;
+  border-radius:999px;
+}
+.action{
+  flex:none;
+  width:100%;
+  margin-top:14px;
+  border:0;
+  border-radius:14px;
+  background:var(--dark);
+  color:white;
+  padding:16px 14px;
+  font-size:clamp(15px,1.4vw,19px);
+  font-weight:900;
+  letter-spacing:1px;
+  cursor:pointer;
+  transition:.15s ease;
+}
+.action:hover{transform:translateY(-1px)}
+.action:active{transform:translateY(0)}
+.action.rolling{background:var(--red)}
+.action:disabled{
+  background:#e9ecf1;
+  color:#a3aab4;
+  cursor:not-allowed;
+  transform:none;
+}
+/* 重新摇号（次级按钮，仅定稿后出现） */
+.respin{
+  flex:none;
+  width:100%;
+  margin-top:9px;
+  border:1px solid #d7dce4;
+  border-radius:14px;
+  background:#fff;
+  color:#3d4653;
+  padding:12px 14px;
+  font-size:clamp(13px,1.25vw,16px);
+  font-weight:800;
+  letter-spacing:.5px;
+  cursor:pointer;
+  transition:.15s ease;
+}
+.respin:hover{border-color:#b9c2ce;background:#fafbfc;transform:translateY(-1px)}
+.respin:active{transform:translateY(0)}
+.respin.armed{border-color:var(--red);color:var(--red);background:#fff7f7}
+.respin[hidden]{display:none}
+/* 二次确认条 */
+.confirm{
+  display:none;
+  margin-top:9px;
+  padding:12px 13px;
+  border:1px solid #f0dca8;
+  border-radius:14px;
+  background:linear-gradient(180deg,#fffdf6,#fff6e0);
+}
+.confirm.show{display:block}
+.confirm .q{
+  font-size:12.5px;
+  font-weight:900;
+  color:#835900;
+  line-height:1.5;
+}
+.confirm .d{
+  margin-top:5px;
+  font-size:10.5px;
+  color:#94794a;
+  line-height:1.6;
+}
+.confirm .row{
+  margin-top:10px;
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:8px;
+}
+.confirm button{
+  border:1px solid transparent;
+  border-radius:11px;
+  padding:10px 8px;
+  font-size:13px;
+  font-weight:900;
+  cursor:pointer;
+  transition:.12s ease;
+}
+.confirm .yes{background:var(--red);color:#fff}
+.confirm .yes:hover{filter:brightness(1.06)}
+.confirm .no{background:#fff;color:#5c646f;border-color:#d7dce4}
+.confirm .no:hover{background:#f4f6f8}
+.hint{
+  margin-top:13px;
+  color:var(--muted);
+  font-size:10px;
+  line-height:1.6;
+}
+.hint b{color:#835900}
+.hint .stamp{color:#835900;font-weight:800}
+.right{
+  padding:14px;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+}
+.tables{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+  min-height:0;
+}
+.table-card{
+  overflow:hidden;
+  border:1px solid var(--line);
+  border-radius:12px;
+}
+table{
+  width:100%;
+  border-collapse:collapse;
+  table-layout:fixed;
+  font-size:10.5px;
+}
+th,td{
+  height:23px;
+  padding:3px 4px;
+  text-align:center;
+  border-bottom:1px solid var(--line);
+  white-space:nowrap;
+}
+tr:last-child td{border-bottom:0}
+th{
+  height:25px;
+  background:#fafbfc;
+  color:var(--muted);
+  font-size:9.5px;
+  font-weight:800;
+}
+th:nth-child(1){width:32px}
+th:nth-child(2){width:72px}
+th:nth-child(3){width:48px}
+th:nth-child(4){width:52px}
+.rank{font-weight:900}
+.combo{font-weight:900;letter-spacing:.2px}
+.pos{color:var(--green);font-weight:800}
+.neg{color:var(--red);font-weight:800}
+.neu{font-weight:800}
+.empty{
+  flex:1;
+  min-height:260px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  padding:0 24px;
+  color:#a0a6af;
+  font-size:12px;
+  line-height:1.7;
+  border:1px dashed var(--line);
+  border-radius:12px;
+}
+.footerline{
+  margin-top:8px;
+  display:grid;
+  grid-template-columns:repeat(6,1fr);
+  gap:6px;
+}
+.num{
+  border:1px solid var(--line);
+  border-radius:9px;
+  padding:6px 5px;
+  background:#fafbfc;
+  text-align:center;
+}
+.num b{font-size:11px}
+.num span{display:block;margin-top:1px;font-size:9px;color:var(--muted)}
+.warn{
+  display:none;
+  margin-top:10px;
+  padding:8px 10px;
+  border-radius:10px;
+  background:#fff4d7;
+  border:1px solid #f0dca8;
+  color:#835900;
+  font-size:10px;
+  line-height:1.6;
+}
+.foot{
+  padding:8px 2px 0;
+  text-align:center;
+  color:#a8aeb8;
+  font-size:10px;
+  line-height:1.5;
+}
+.foot:empty{display:none}
+@media(min-width:1500px){
+  .main{grid-template-columns:minmax(420px,1.4fr) minmax(0,1fr)}
+  .box{min-height:100px;max-height:180px}
+  table{font-size:11.5px}
+  th,td{height:26px}
+  th{height:28px}
+}
+@media(max-width:900px){
+  .app{width:min(760px,calc(100% - 18px));margin:9px auto}
+  .main{grid-template-columns:1fr}
+  .tables{grid-template-columns:1fr}
+  .box{min-height:80px;max-height:130px}
+  .grid{flex:none;grid-template-rows:repeat(2,minmax(80px,auto))}
+  .header{flex-direction:column;align-items:flex-start;gap:8px}
+  .hint{margin-top:14px}
+  .topline{flex-wrap:wrap;gap:4px 10px}
+  .legend{white-space:normal}
+  .subtitle{padding-right:4px}
+}
+@media(max-width:480px){
+  .box{min-height:62px;max-height:92px;font-size:26px}
+  .grid{grid-template-rows:repeat(2,minmax(62px,auto))}
+  .box.win::after{font-size:9px;right:5px;top:5px;padding:2px 5px}
+  .result{font-size:28px;letter-spacing:3px;padding:12px 8px}
+  h1{font-size:20px}
+  .left,.right{padding:12px}
+  .hint{margin-top:10px}
+  .empty{padding:0 14px}
+  th:nth-child(1){width:26px}
+  th:nth-child(2){width:62px}
+  th:nth-child(3){width:42px}
+  th:nth-child(4){width:46px}
+  .num{padding:5px 3px}
+  .num b{font-size:10px}
+  .footerline{gap:4px}
+}
+@media(max-height:620px) and (min-width:901px){
+  .app{margin:8px auto;min-height:calc(100vh - 16px)}
+  .header{min-height:48px;padding-bottom:8px}
+  h1{font-size:22px}
+  .subtitle{font-size:11px;margin-top:4px}
+  .left{padding:14px}
+  .right{padding:12px}
+  .result{padding:11px 8px;margin-bottom:11px}
+  .box{min-height:52px}
+  .grid{grid-template-rows:repeat(2,minmax(52px,1fr));gap:9px}
+  .action{margin-top:12px;padding:13px 12px;font-size:16px}
+  .hint{margin-top:10px;font-size:9px}
+  .topline{margin-bottom:8px}
+  th,td{height:22px;padding:2px 4px}
+  th{height:24px}
+  .num{padding:5px 4px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <div>
+      <h1>地下城宝箱模拟</h1>
+      <div class="subtitle">点「开始模拟」六宫格开始滚动，点「停止」当场定稿；定稿后要等每天 <b>15:00</b> 重置才能重摇。</div>
+    </div>
+    <div class="badge" id="lockBadge">本轮未定稿</div>
+  </div>
+
+  <div class="main">
+    <section class="panel left">
+      <div class="topline">
+        <div class="panel-title">本轮方案</div>
+        <div class="legend" id="lockState">等待模拟</div>
+      </div>
+
+      <div class="result pending" id="result">— · — · —</div>
+
+      <div class="grid" id="grid"></div>
+
+      <button class="action" id="mainBtn" onclick="onMain()">开始模拟</button>
+
+      <button class="respin" id="respinBtn" hidden onclick="askRespin()">重新摇号</button>
+
+      <div class="confirm" id="confirmBox">
+        <div class="q">确定要重新摇号吗？</div>
+        <div class="d" id="confirmDesc">重新摇号会覆盖本轮已定稿的方案，且无法撤销。</div>
+        <div class="row">
+          <button class="no" onclick="cancelRespin()">取消</button>
+          <button class="yes" onclick="doRespin()">确定重摇</button>
+        </div>
+      </div>
+
+      <div class="hint" id="hint">
+        六宫格每轮从 1–6 中随机开出 3 个中奖位，共 20 种组合。<br>
+        <b>定稿即锁定</b> —— 停在哪一组就是哪一组；想换一组就点「重新摇号」（会二次确认）。
+      </div>
+
+      <div class="warn" id="warn"></div>
+    </section>
+
+    <section class="panel right">
+      <div class="topline">
+        <div class="panel-title">20 种中奖组合 · 5000 次随机分布</div>
+        <div class="legend">定稿时附带的波动参考，与本轮方案无关</div>
+      </div>
+
+      <div id="empty" class="empty">点「停止」定稿后，这里显示同一次 5000 轮模拟的分布情况。<br>仅用于说明 20 种组合机会均等，不代表某个组合更容易中。</div>
+
+      <div id="results" style="display:none">
+        <div class="tables">
+          <div class="table-card">
+            <table>
+              <thead>
+                <tr><th>排名</th><th>组合</th><th>次数</th><th>频率</th><th>偏差</th></tr>
+              </thead>
+              <tbody id="tbodyA"></tbody>
+            </table>
+          </div>
+          <div class="table-card">
+            <table>
+              <thead>
+                <tr><th>排名</th><th>组合</th><th>次数</th><th>频率</th><th>偏差</th></tr>
+              </thead>
+              <tbody id="tbodyB"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="footerline" id="numberStats"></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+var TOTAL = 5000;
+var COMBOS = [];
+for(var a=1;a<=4;a++){
+  for(var b=a+1;b<=5;b++){
+    for(var c=b+1;c<=6;c++){
+      COMBOS.push([a,b,c]);
+    }
+  }
+}
+
+function key(c){ return c.join('-'); }
+
+function rndInt(max){
+  try{
+    var range = 0x100000000;
+    var limit = range - (range % max);
+    var buf = new Uint32Array(1);
+    var x;
+    do{
+      crypto.getRandomValues(buf);
+      x = buf[0];
+    }while(x >= limit);
+    return x % max;
+  }catch(e){
+    return Math.floor(Math.random()*max);
+  }
+}
+
+function randomCombo(){
+  var pool=[1,2,3,4,5,6];
+  for(var i=pool.length-1;i>0;i--){
+    var j=rndInt(i+1);
+    var t=pool[i]; pool[i]=pool[j]; pool[j]=t;
+  }
+  return pool.slice(0,3).sort(function(a,b){return a-b;});
+}
+
+/* ---------- 日期 / 重置周期 ---------- */
+function pad(n){ return (n<10?'0':'')+n; }
+function ymd(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+function hms(d){ return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); }
+
+/* 重置时刻：每天 RESET_H 点整 = 新一轮的起点（可用 URL ?reset=N 临时改，仅调试） */
+var RESET_H = 15;
+/* 部署版：重置点写死 15 点；改点必须同时带 ?debug=1&reset=N，
+   否则任何人给链接加个 ?reset=8 就能绕开「当天已定稿」的锁。 */
+(function(){
+  try{
+    if(!/[?&]debug=1(?!\d)/.test(location.search)) return;
+    var m = /[?&]reset=(\d{1,2})(?!\d)/.exec(location.search);
+    if(m){ var v = parseInt(m[1],10); if(v>=0 && v<=23) RESET_H = v; }
+  }catch(e){}
+})();
+function pad2h(h){ return (h<10?'0':'')+h; }
+var RESET_LABEL = pad2h(RESET_H) + ':00';
+
+/* 当前所在的「周期」：
+   时刻 >= 当天 RESET_H 点 ⇒ 周期 = 今天；否则周期 = 昨天（当天 0:00 ~ 重置点属于上一周期） */
+function cycleKey(now){
+  var d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if(now.getHours() < RESET_H) d.setDate(d.getDate()-1);
+  return ymd(d);
+}
+/* 下一次重置时刻 */
+function nextReset(now){
+  var d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), RESET_H, 0, 0, 0);
+  if(now >= d) d.setDate(d.getDate()+1);
+  return d;
+}
+/* 重置倒计时文案：< 1 小时 ⇒ 显示「N 分」；否则显示「约 N 小时」 */
+function untilResetText(now){
+  var ms = nextReset(now) - now;
+  var mins = Math.max(1, Math.ceil(ms/60000));
+  if(mins < 60) return mins + ' 分钟';
+  var h = Math.floor(mins/60), m = mins%60;
+  return m ? ('约 ' + h + ' 小时 ' + m + ' 分') : ('约 ' + h + ' 小时');
+}
+
+var TODAY = ymd(new Date());   /* 仅用于显示「定稿于 <日期>」 */
+var CYCLE = cycleKey(new Date());
+
+/* >>>STORAGE-BEGIN>>> 存储层（独立网页版：浏览器本地 localStorage） */
+var STORE_OK = (function(){
+  try{
+    localStorage.setItem('__probe__','1');
+    localStorage.removeItem('__probe__');
+    return true;
+  }catch(e){ return false; }
+})();
+var STORE_KEY = 'dungeon-chest-sim-v2';
+var STORE_FOOT = '结果保存在你自己的浏览器里，换浏览器或清理浏览数据后记录会丢。';
+var STORE_WARN = STORE_OK ? '' :
+  '⚠️ 当前浏览器不允许本地保存（可能是无痕模式）—— 定稿结果关掉页面后会丢失，建议用普通窗口重新打开。';
+
+/* 读取存档：cycle 为「所属周期」，如 "2026-09-23"（该日 RESET_H 点起算的那一轮）
+   返回 { combo:'1-3-5', cycle:'2026-09-23', time:'21:30:05' } */
+function loadSave(){
+  if(!STORE_OK) return {};
+  try{
+    return JSON.parse(localStorage.getItem(STORE_KEY) || '{}') || {};
+  }catch(e){ return {}; }
+}
+
+/* 写入存档 */
+function writeSave(rec){
+  if(!STORE_OK) return;
+  try{ localStorage.setItem(STORE_KEY, JSON.stringify(rec)); }catch(e){}
+}
+
+/* 清空存档（重新摇号时调用：旧结果作废，避免重开窗口又被锁回去） */
+function clearSave(){
+  if(!STORE_OK) return;
+  try{ localStorage.removeItem(STORE_KEY); }catch(e){}
+}
+/* <<<STORAGE-END<<< */
+
+/* ---------- 状态 ---------- */
+var locked = false;
+var rolling = false;
+var rollTimer = null;
+var cur = null;
+var lockTime = '';
+
+/* ---------- 渲染 ---------- */
+function initGrid(){
+  var grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  for(var i=1;i<=6;i++){
+    var div = document.createElement('div');
+    div.className = 'box';
+    div.id = 'box'+i;
+    div.textContent = i;
+    grid.appendChild(div);
+  }
+}
+
+function renderGrid(combo){
+  var set = combo || [];
+  for(var i=1;i<=6;i++){
+    var el = document.getElementById('box'+i);
+    el.className = 'box' + (set.indexOf(i) >= 0 ? ' win' : '');
+  }
+}
+
+function setResult(combo, isLockedStyle){
+  var el = document.getElementById('result');
+  if(!combo){
+    el.textContent = '— · — · —';
+    el.className = 'result pending';
+    return;
+  }
+  el.textContent = combo.join(' · ');
+  el.className = 'result' + (isLockedStyle ? ' locked' : ' pending');
+}
+
+function setHint(html){ document.getElementById('hint').innerHTML = html; }
+function setEmpty(html){ document.getElementById('empty').innerHTML = html; }
+
+function setState(text, isOn){
+  var b = document.getElementById('lockBadge');
+  b.textContent = text;
+  b.className = 'badge' + (isOn ? ' on' : '');
+  document.getElementById('lockState').textContent = text;
+}
+
+/* 已定稿时统一的说明文案 */
+function lockedHint(){
+  return '<b>本轮方案已锁定</b> —— ' + cur.join(' · ') +
+    '<br>定稿于 ' + lockTime + ' · 还有 <span class="stamp">' + untilResetText(new Date()) +
+    '</span>（' + RESET_LABEL + '）才能重摇。';
+}
+var EMPTY_LOCKED =
+  '本轮方案已在定稿时确定，这里不再重摇分布（重摇的数字与当时的不是一次，容易造成误解）。' +
+  '<br>如需重新模拟，请等 ' + RESET_LABEL + ' 重置后打开。';
+
+function showWarn(html){
+  var w = document.getElementById('warn');
+  if(!html){ w.style.display = 'none'; return; }
+  w.innerHTML = html;
+  w.style.display = 'block';
+}
+
+/* ---------- 交互 ---------- */
+function onMain(){
+  if(locked) return;
+  if(rolling) stopRoll();
+  else startRoll();
+}
+
+/* ---------- 重新摇号（含二次确认） ---------- */
+var confirmOpen = false;
+
+function setRespinVisible(on){
+  document.getElementById('respinBtn').hidden = !on;
+}
+function showConfirm(desc){
+  confirmOpen = true;
+  document.getElementById('confirmDesc').textContent = desc;
+  document.getElementById('confirmBox').className = 'confirm show';
+  document.getElementById('respinBtn').className = 'respin armed';
+  document.getElementById('respinBtn').textContent = '等待确认…';
+}
+function hideConfirm(){
+  confirmOpen = false;
+  document.getElementById('confirmBox').className = 'confirm';
+  document.getElementById('respinBtn').className = 'respin';
+  document.getElementById('respinBtn').textContent = '重新摇号';
+}
+
+/* 点「重新摇号」→ 先问一次，不直接摇 */
+function askRespin(){
+  if(rolling) return;
+  if(confirmOpen){ hideConfirm(); return; }   /* 再点一次 = 收起 */
+  showConfirm(locked
+    ? ('会覆盖本轮已定稿的 ' + cur.join(' · ') + '，重新摇一组。')
+    : '重新摇一组新的组合。');
+}
+
+function cancelRespin(){ hideConfirm(); }
+
+/* 确认后才真正重摇：清掉锁定 → 回到未定稿 → 直接开始滚动 */
+function doRespin(){
+  hideConfirm();
+  if(rolling) return;
+
+  locked = false;
+  cur = null;
+  lockTime = '';
+
+  renderGrid(null);
+  setResult(null, false);
+  setState('重新摇号', false);
+
+  var btn = document.getElementById('mainBtn');
+  btn.disabled = false;
+  btn.className = 'action';
+  btn.textContent = '开始模拟';
+
+  setRespinVisible(false);
+  setEmpty('点「停止」定稿后，这里显示同一次 5000 轮模拟的分布情况。<br>仅用于说明 20 种组合机会均等，不代表某个组合更容易中。');
+  document.getElementById('empty').style.display = 'flex';
+  document.getElementById('results').style.display = 'none';
+  clearSave();                 /* 旧存档作废，避免重开后又被锁回去 */
+  startRoll();                 /* 直接进入滚动，少点一次 */
+}
+
+function startRoll(){
+  rolling = true;
+  var btn = document.getElementById('mainBtn');
+  btn.textContent = '停 止';
+  btn.className = 'action rolling';
+  setState('滚动中', false);
+  setHint('六宫格正在滚动 —— 点「停止」即定稿，<b>停在哪一组就是哪一组</b>。');
+  syncBadge();               /* 徽标：立刻切成「滚动中」，别留着上一次的「已定稿」 */
+  rollTimer = setInterval(function(){
+    cur = randomCombo();
+    renderGrid(cur);
+    setResult(cur, false);
+  }, 70);
+}
+
+function stopRoll(){
+  rolling = false;
+  if(rollTimer){ clearInterval(rollTimer); rollTimer = null; }
+
+  if(!cur || cur.length !== 3) cur = randomCombo();
+
+  lockTime = hms(new Date());
+  locked = true;
+
+  renderGrid(cur);
+  setResult(cur, true);
+  setState('已定稿', true);
+
+  var btn = document.getElementById('mainBtn');
+  btn.textContent = '本轮已定稿';
+  btn.className = 'action';
+  btn.disabled = true;
+
+  setHint(lockedHint());
+  setEmpty(EMPTY_LOCKED);
+  hideConfirm();
+  setRespinVisible(true);
+  syncBadge();               /* 徽标：立刻切成「已定稿 + 倒计时」 */
+
+  writeSave({ combo: cur.join('-'), cycle: CYCLE, time: lockTime });
+  runStats();
+}
+
+/* ---------- 分布统计（定稿后跑一次，仅作参考） ---------- */
+function rowHtml(row, index){
+  var diff = row.rate - 5;
+  var cls = diff > 0 ? 'pos' : (diff < 0 ? 'neg' : 'neu');
+  return '<tr>' +
+    '<td class="rank">' + (index+1) + '</td>' +
+    '<td class="combo">' + row.combo + '</td>' +
+    '<td><b>' + row.count + '</b></td>' +
+    '<td>' + row.rate.toFixed(2) + '%</td>' +
+    '<td class="' + cls + '">' + (diff>0?'+':'') + diff.toFixed(2) + '%</td>' +
+  '</tr>';
+}
+
+function runStats(){
+  var counts = {};
+  COMBOS.forEach(function(c){ counts[key(c)] = 0; });
+  var numberCounts = [0,0,0,0,0,0];
+
+  for(var i=0;i<TOTAL;i++){
+    var c = randomCombo();
+    counts[key(c)]++;
+    for(var k=0;k<3;k++) numberCounts[c[k]-1]++;
+  }
+
+  var rows = Object.keys(counts).map(function(combo){
+    return { combo: combo, count: counts[combo], rate: counts[combo]/TOTAL*100 };
+  }).sort(function(x,y){
+    return (y.count - x.count) || x.combo.localeCompare(y.combo);
+  });
+
+  var htmlA = '', htmlB = '';
+  for(var j=0;j<rows.length;j++){
+    if(j<10) htmlA += rowHtml(rows[j], j);
+    else htmlB += rowHtml(rows[j], j);
+  }
+  document.getElementById('tbodyA').innerHTML = htmlA;
+  document.getElementById('tbodyB').innerHTML = htmlB;
+
+  var statsHtml = '';
+  for(var n=1;n<=6;n++){
+    var rate = numberCounts[n-1]/TOTAL*100;
+    statsHtml += '<div class="num"><b>' + n + ' 号：' + rate.toFixed(1) + '%</b><span>' + numberCounts[n-1] + ' 次进入中奖位</span></div>';
+  }
+  document.getElementById('numberStats').innerHTML = statsHtml;
+
+  document.getElementById('empty').style.display = 'none';
+  document.getElementById('results').style.display = 'block';
+}
+
+/* ---------- 启动 ---------- */
+function applyLocked(combo, timeText){
+  locked = true;
+  cur = combo;
+  lockTime = timeText || '—';
+  renderGrid(cur);
+  setResult(cur, true);
+  setState('已定稿', true);
+  var btn = document.getElementById('mainBtn');
+  btn.textContent = '本轮已定稿';
+  btn.disabled = true;
+  setHint(lockedHint());
+  setEmpty(EMPTY_LOCKED);
+  setRespinVisible(true);
+}
+
+function init(){
+  initGrid();
+
+  var rec = loadSave();
+  var combo  = rec.combo ? String(rec.combo) : '';
+  var cycle  = rec.cycle ? String(rec.cycle) : (rec.date ? String(rec.date) : '');
+  var timeTx = rec.time  ? String(rec.time)  : '';
+  var validCombo = /^[1-6]-[1-6]-[1-6]$/.test(combo);
+
+  if(validCombo && cycle === CYCLE){
+    applyLocked(combo.split('-').map(Number), timeTx);
+  }else{
+    if(validCombo && cycle && cycle !== CYCLE){
+      setState('已重置', false);
+      setHint('上一轮定稿于 ' + cycle + ' ' + RESET_LABEL + ' 之后（' + combo +
+        '）—— 已过重置点，本轮可以重新模拟。');
+    }
+    renderGrid(null);
+    setResult(null, false);
+  }
+
+  document.getElementById('foot').textContent = STORE_FOOT;
+  showWarn(STORE_WARN);
+}
+
+/* 跨过重置点自动解锁 / 刷新倒计时（页面一直开着的情况） */
+var lastState = null;      /* 上一次快照：{combo,time} 或 null（未定稿） */
+var lastBadge = '';        /* 上一次写进徽标的文案，避免无谓 DOM 写入 */
+
+function markState(){
+  lastState = locked ? ({ combo: cur.join('-'), time: lockTime }) : null;
+}
+
+function syncBadge(){
+  /* ⚠️ 必须把 rolling 也算进去：重摇确认后是「已解锁 + 正在滚动」，
+     此时若只看 locked 会显示成「本轮已定稿」，与事实相反（踩过）。 */
+  var state = rolling ? 'rolling' : (locked ? 'locked' : 'idle');
+  var t;
+  if(state === 'rolling')      t = '滚动中 · 点停止定稿';
+  else if(state === 'locked')  t = '本轮已定稿 · ' + untilResetText(new Date()) + '后重摇';
+  else                         t = '本轮未定稿 · ' + untilResetText(new Date()) + '后重置';
+  if(t !== lastBadge){
+    lastBadge = t;
+    document.getElementById('lockBadge').textContent = t;
+  }
+  return t;
+}
+
+function tick(){
+  var now = new Date();
+  TODAY = ymd(now);
+  var c = cycleKey(now);
+
+  if(c !== CYCLE){
+    /* 跨过重置点：解锁，倒计时按新周期重算 */
+    CYCLE = c;
+    if(locked){
+      locked = false; cur = null;
+      renderGrid(null);
+      setResult(null, false);
+      var btn = document.getElementById('mainBtn');
+      btn.disabled = false;
+      btn.textContent = '开始模拟';
+      setState('已重置', false);
+      setHint('已到 ' + RESET_LABEL + ' 重置点（' + TODAY + '）—— 可以重新模拟了。');
+      hideConfirm();
+      setRespinVisible(false);
+    }
+  }else if(locked){
+    /* 同一轮内：刷新「还有多久重置」 */
+    var next = lockedHint();
+    if(next !== document.getElementById('hint').innerHTML) setHint(next);
+  }
+  markState();
+  syncBadge();
+}
+
+setInterval(tick, 30000);   /* 30 秒兜底：判周期变化 */
+setInterval(syncBadge, 1000); /* 1 秒：徽标倒计时走字，文案没变则不碰 DOM */
+
+init();
+markState();
+syncBadge();
+</script>
+</body>
+</html>
