@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.1单位信息填充
 // @namespace    https://dime.health-100.cn/
-// @version      7.8.6
+// @version      7.9.0
 // @description  蝶美自动填充单位信息：按输入字段自适应填写，支持重复运行跳过、缺失字段跳过、行业/经济末级匹配、地区、单位类型、社会信用代码、企业规模及人数等字段。
 
 //
@@ -3362,21 +3362,28 @@
   const style = document.createElement("style");
   style.id = STYLE_ID;
   style.textContent = `
+    /* v7.9 跟着「编辑单位信息」弹窗走：位置由脚本按弹窗右边缘算，不再记忆拖拽位置 */
     #${TOOL_ID}{
-      position:fixed;top:80px;left:calc(100vw - 485px);
-      z-index:2147483647;width:465px;min-width:360px;
+      position:fixed;top:80px;left:auto;right:18px;
+      z-index:2147483647;width:420px;min-width:340px;
       max-width:calc(100vw - 8px);max-height:calc(100vh - 55px);
       box-sizing:border-box;overflow:hidden;
       border:1px solid #cfd5df;border-radius:9px;background:#fff;
       box-shadow:0 8px 32px rgba(0,0,0,.25);
-      font-family:"Microsoft YaHei",sans-serif;color:#303133
+      font-family:"Microsoft YaHei",sans-serif;color:#303133;
+      animation:dime-company-fill-in .16s cubic-bezier(.4,0,.2,1)
     }
+    @keyframes dime-company-fill-in{
+      from{opacity:.4;transform:translateX(12px)}
+      to{opacity:1;transform:none}
+    }
+    #${TOOL_ID} .tool-header{cursor:default}
     #${TOOL_ID}.is-dragging,
     #${TOOL_ID}.is-resizing{user-select:none}
     #${TOOL_ID} .tool-header{
       display:flex;align-items:center;justify-content:space-between;
       padding:12px 14px;border-bottom:1px solid #ebeef5;
-      background:#f5f7fa;font-size:16px;cursor:grab;user-select:none
+      background:#f5f7fa;font-size:16px;cursor:default;user-select:none
     }
     #${TOOL_ID} .tool-header:active{cursor:grabbing}
     #${TOOL_ID} .tool-header strong{
@@ -3491,6 +3498,7 @@
     }
 
     #${LAUNCHER_ID}{
+      display:none!important;
       position:fixed;bottom:82px;right:18px;z-index:2147483646;
       width:172px;height:42px;display:flex;align-items:center;justify-content:center;
       gap:9px;padding:0 16px;border:1px solid #3f8f24;
@@ -3529,7 +3537,7 @@
   tool.id = TOOL_ID;
   tool.innerHTML = `
     <div class="tool-header">
-      <strong>单位信息自动填写工具 v7.8.6</strong>
+      <strong>单位信息自动填写工具 v7.9.0</strong>
       <div class="tool-header-actions">
         <button class="tool-header-button tool-collapse" type="button" title="折叠工具">−</button>
         <button class="tool-header-button tool-close" type="button" title="收起到快捷按钮">×</button>
@@ -3540,8 +3548,8 @@
       <details class="tool-help">
         <summary>使用说明（点击展开）</summary>
         <div class="tool-tip">
-          可按住标题栏拖动，位置会自动记忆。<br>
-          可拖动工具右侧边缘调整宽度，宽度会自动记忆。<br>
+          跟着「编辑单位信息」弹窗走：弹窗一开，本面板自动出现在它右侧；弹窗关掉，面板一起消失。位置不再记忆，也不会挡住表单。<br>
+          面板宽度固定 420px，位置由弹窗决定，不用再手动拖；窗口太窄时自动贴到窗口右缘。<br>
           使用条件等待减少无效停顿，并锁定当前字段对应的下拉弹层。<br>
           地区缺少省级时自动补“河南省”，支持斜杠、反斜杠、空格、顿号、逗号、横杠、箭头等分隔；网页地区树出现连续同名层级时会自动跨越。<br>
           企业规模网页标准选项为“大、中、小、微型”；输入“大型、中型、小型、微”等常见写法会自动转换。<br>
@@ -4323,22 +4331,21 @@
   }
 
   function hideToolPanel() {
-    if (!tool.isConnected || !launcher.isConnected) return;
+    if (!tool.isConnected) return;
     tool.style.display = "none";
-    launcher.style.display = "flex";
     updateLauncherState(false);
   }
 
   function showToolPanel() {
-    if (!tool.isConnected || !launcher.isConnected) return;
+    if (!tool.isConnected) return;
 
     tool.style.display = "block";
-    launcher.style.display = "flex";
     updateLauncherState(true);
 
     requestAnimationFrame(() => {
       applySavedState();
-      keepToolInsideViewport();
+      /* 位置交给 syncFollowDialog：弹窗在哪儿，面板就在哪儿 */
+      syncFollowDialog();
     });
   }
 
@@ -4421,126 +4428,121 @@
 
   function applySavedState() {
     try {
-      const savedWidth = Number(localStorage.getItem(WIDTH_KEY));
-      if (Number.isFinite(savedWidth) && savedWidth > 0) {
-        const minimumWidth = getMinimumToolWidth();
-        const maximumWidth = Math.max(minimumWidth, window.innerWidth - 4);
-        tool.style.width = clamp(savedWidth, minimumWidth, maximumWidth) + "px";
-      }
-
       applySavedTextAreaHeight();
 
       const collapsed = localStorage.getItem(COLLAPSED_KEY) === "1";
       tool.classList.toggle("is-collapsed", collapsed);
       updateCollapseButton();
-
-      const savedPosition = JSON.parse(
-        localStorage.getItem(POSITION_KEY) || "null"
-      );
-
-      if (
-        savedPosition &&
-        Number.isFinite(savedPosition.left) &&
-        Number.isFinite(savedPosition.top)
-      ) {
-        tool.style.left = savedPosition.left + "px";
-        tool.style.top = savedPosition.top + "px";
-        tool.style.right = "auto";
-      }
-
-      keepToolInsideViewport();
     } catch (error) {
       console.warn("读取工具界面状态失败：", error);
       updateCollapseButton();
-      keepToolInsideViewport();
     }
   }
 
-  let dragging = false;
-  let resizing = false;
-  let startMouseX = 0;
-  let startMouseY = 0;
-  let startLeft = 0;
-  let startTop = 0;
-  let startWidth = 0;
+  /* ================= v7.9 跟着「编辑单位信息」弹窗走 =================
+   * 弹窗一开，面板直接出现在它右侧；弹窗关掉，面板跟着消失。
+   * 位置只由弹窗决定，所以去掉了拖拽记忆 —— 拖到别处也会被下一轮同步拉回来。
+   */
+  let followedDialog = null;
+  let followTimer = 0;
 
-  dragHandle.addEventListener("mousedown", event => {
-    if (event.button !== 0) return;
-    if (event.target.closest(".tool-header-button")) return;
+  function findUnitFormDialog() {
+    let best = null;
 
-    dragging = true;
+    document.querySelectorAll(".el-dialog__wrapper").forEach(wrapper => {
+      if (
+        typeof wrapper.checkVisibility === "function" &&
+        !wrapper.checkVisibility()
+      ) {
+        return;
+      }
 
-    const rect = tool.getBoundingClientRect();
-    startMouseX = event.clientX;
-    startMouseY = event.clientY;
-    startLeft = rect.left;
-    startTop = rect.top;
+      const dialog = wrapper.querySelector(".el-dialog");
+      if (!dialog) return;
 
-    tool.style.left = rect.left + "px";
-    tool.style.top = rect.top + "px";
+      const rect = dialog.getBoundingClientRect();
+      if (rect.width < 320 || rect.height < 220) return;
+
+      const title = (
+        dialog.querySelector(".el-dialog__title")?.textContent || ""
+      ).trim();
+
+      const labels = [...dialog.querySelectorAll(".el-form-item__label")]
+        .slice(0, 12)
+        .map(el => (el.textContent || "").trim());
+
+      const isUnitForm =
+        /单位信息/.test(title) ||
+        labels.some(text => /单位编码|社会信用代码|单位名称/.test(text));
+
+      if (!isUnitForm) return;
+
+      const zIndex = Number(getComputedStyle(wrapper).zIndex) || 0;
+      if (!best || zIndex >= best.zIndex) best = { rect, zIndex };
+    });
+
+    return best;
+  }
+
+  function placeBesideDialog(rect) {
+    const gap = 12;
+    /* 右侧若有别的工具面板占着位置（蝶美 1.2 展开时会给页面留出 --dime-hazard-reserve），
+       就把本面板夹在弹窗右缘和那块留白之间，两边都不压。 */
+    const reserved =
+      parseFloat(
+        getComputedStyle(document.documentElement).getPropertyValue(
+          "--dime-hazard-reserve"
+        )
+      ) || 0;
+    const rightLimit = Math.max(320, window.innerWidth - reserved - 8);
+
+    let width = 420;
+    let left = rect.right + gap;
+
+    if (left + width > rightLimit) {
+      width = Math.max(320, rightLimit - left - 4);
+      if (left + width > rightLimit) {
+        left = Math.max(8, rightLimit - width);
+      }
+    }
+
+    const maxTop = Math.max(8, window.innerHeight - tool.offsetHeight - 8);
+    const top = Math.min(Math.max(rect.top, 8), maxTop);
+
+    tool.style.width = Math.round(width) + "px";
+    tool.style.left = Math.round(left) + "px";
+    tool.style.top = Math.round(top) + "px";
     tool.style.right = "auto";
-    tool.classList.add("is-dragging");
+  }
 
-    event.preventDefault();
-  });
+  function syncFollowDialog() {
+    const found = findUnitFormDialog();
 
-  resizeHandle.addEventListener("mousedown", event => {
-    if (event.button !== 0 || tool.classList.contains("is-collapsed")) return;
-
-    resizing = true;
-
-    const rect = tool.getBoundingClientRect();
-    startMouseX = event.clientX;
-    startWidth = rect.width;
-
-    tool.style.left = rect.left + "px";
-    tool.style.right = "auto";
-    tool.classList.add("is-resizing");
-
-    event.preventDefault();
-    event.stopPropagation();
-  });
-
-  document.addEventListener("mousemove", event => {
-    if (dragging) {
-      const maxLeft = Math.max(0, window.innerWidth - tool.offsetWidth);
-      const maxTop = Math.max(0, window.innerHeight - tool.offsetHeight);
-
-      tool.style.left =
-        clamp(startLeft + event.clientX - startMouseX, 0, maxLeft) + "px";
-      tool.style.top =
-        clamp(startTop + event.clientY - startMouseY, 0, maxTop) + "px";
+    if (found) {
+      followedDialog = true;
+      const wasHidden = tool.style.display === "none";
+      if (wasHidden) showToolPanel();
+      placeBesideDialog(found.rect);
+      if (wasHidden) {
+        requestAnimationFrame(() => {
+          const again = findUnitFormDialog();
+          if (again) placeBesideDialog(again.rect);
+        });
+      }
       return;
     }
 
-    if (resizing) {
-      const left = tool.getBoundingClientRect().left;
-      const minimumWidth = getMinimumToolWidth();
-      const maximumWidth = getMaximumToolWidth(left);
-      const nextWidth = clamp(
-        startWidth + event.clientX - startMouseX,
-        minimumWidth,
-        maximumWidth
-      );
-
-      tool.style.width = nextWidth + "px";
+    if (followedDialog) {
+      followedDialog = null;
+      hideToolPanel();
     }
-  });
+  }
 
-  document.addEventListener("mouseup", () => {
-    if (dragging) {
-      dragging = false;
-      tool.classList.remove("is-dragging");
-      savePosition();
-    }
-
-    if (resizing) {
-      resizing = false;
-      tool.classList.remove("is-resizing");
-      saveWidth();
-      savePosition();
-    }
-  });
+  function startFollowDialog() {
+    syncFollowDialog();
+    clearInterval(followTimer);
+    followTimer = window.setInterval(syncFollowDialog, 400);
+  }
 
   collapseButton.addEventListener("click", event => {
     event.stopPropagation();
@@ -4553,7 +4555,6 @@
   });
 
   window.addEventListener("resize", () => {
-    keepLauncherInsideViewport();
     const currentHeight = textBox.getBoundingClientRect().height;
     textBox.style.height = clamp(
       currentHeight,
@@ -4561,10 +4562,8 @@
       getMaximumTextAreaHeight()
     ) + "px";
 
-    keepToolInsideViewport();
     saveTextAreaHeight();
-    saveWidth();
-    savePosition();
+    syncFollowDialog();
   });
 
   let textAreaSaveTimer = null;
@@ -4581,132 +4580,10 @@
   }
 
 
-  function saveLauncherPosition() {
-    const rect = launcher.getBoundingClientRect();
-    localStorage.setItem(LAUNCHER_POSITION_KEY, JSON.stringify({
-      left: Math.round(rect.left),
-      top: Math.round(rect.top)
-    }));
-  }
-
-  function keepLauncherInsideViewport() {
-    const rect = launcher.getBoundingClientRect();
-    const maxLeft = Math.max(0, innerWidth - rect.width);
-    const maxTop = Math.max(0, innerHeight - rect.height);
-
-    launcher.style.left = Math.min(Math.max(rect.left, 0), maxLeft) + "px";
-    launcher.style.top = Math.min(Math.max(rect.top, 0), maxTop) + "px";
-    launcher.style.right = "auto";
-    launcher.style.bottom = "auto";
-  }
-
-  function applySavedLauncherPosition() {
-    try {
-      const saved = JSON.parse(
-        localStorage.getItem(LAUNCHER_POSITION_KEY) || "null"
-      );
-
-      if (
-        saved &&
-        Number.isFinite(saved.left) &&
-        Number.isFinite(saved.top)
-      ) {
-        launcher.style.left = saved.left + "px";
-        launcher.style.top = saved.top + "px";
-        launcher.style.right = "auto";
-        launcher.style.bottom = "auto";
-      }
-    } catch (_) {}
-
-    keepLauncherInsideViewport();
-  }
-
-  let launcherDragging = false;
-  let launcherMoved = false;
-  let launcherStartX = 0;
-  let launcherStartY = 0;
-  let launcherStartLeft = 0;
-  let launcherStartTop = 0;
-
-  launcher.addEventListener("pointerdown", event => {
-    if (event.button !== 0) return;
-
-    const rect = launcher.getBoundingClientRect();
-    launcherDragging = true;
-    launcherMoved = false;
-    launcherStartX = event.clientX;
-    launcherStartY = event.clientY;
-    launcherStartLeft = rect.left;
-    launcherStartTop = rect.top;
-
-    launcher.style.left = rect.left + "px";
-    launcher.style.top = rect.top + "px";
-    launcher.style.right = "auto";
-    launcher.style.bottom = "auto";
-    launcher.classList.add("is-launcher-dragging");
-
-    try { launcher.setPointerCapture(event.pointerId); } catch (_) {}
-    event.preventDefault();
-  });
-
-  launcher.addEventListener("pointermove", event => {
-    if (!launcherDragging) return;
-
-    const deltaX = event.clientX - launcherStartX;
-    const deltaY = event.clientY - launcherStartY;
-
-    if (!launcherMoved && Math.hypot(deltaX, deltaY) >= 4) {
-      launcherMoved = true;
-    }
-
-    if (!launcherMoved) return;
-
-    const maxLeft = Math.max(0, innerWidth - launcher.offsetWidth);
-    const maxTop = Math.max(0, innerHeight - launcher.offsetHeight);
-
-    launcher.style.left = Math.min(
-      Math.max(launcherStartLeft + deltaX, 0),
-      maxLeft
-    ) + "px";
-
-    launcher.style.top = Math.min(
-      Math.max(launcherStartTop + deltaY, 0),
-      maxTop
-    ) + "px";
-  });
-
-  function endLauncherDrag(event) {
-    if (!launcherDragging) return;
-
-    launcherDragging = false;
-    launcher.classList.remove("is-launcher-dragging");
-
-    try { launcher.releasePointerCapture(event.pointerId); } catch (_) {}
-
-    if (launcherMoved) {
-      saveLauncherPosition();
-      setTimeout(() => {
-        launcherMoved = false;
-      }, 0);
-    }
-  }
-
-  launcher.addEventListener("pointerup", endLauncherDrag);
-  launcher.addEventListener("pointercancel", endLauncherDrag);
-
-  launcher.addEventListener("click", event => {
-    if (launcherMoved) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-
-    toggleToolPanel();
-  });
 
   requestAnimationFrame(() => {
-    applySavedLauncherPosition();
     hideToolPanel();
+    startFollowDialog();
   });
 
   closeButton.addEventListener("click", event => {
@@ -4796,5 +4673,5 @@
   });
 
   textBox.focus();
-  console.log("单位信息自动填写工具 v7.8.6 最后一项弹层收起版 已加载。");
+  console.log("单位信息自动填写工具 v7.9.0 最后一项弹层收起版 已加载。");
 })();

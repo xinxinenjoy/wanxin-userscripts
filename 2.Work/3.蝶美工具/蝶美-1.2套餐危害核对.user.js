@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.2套餐危害核对
 // @namespace    https://dime.health-100.cn/
-// @version      4.6.4
+// @version      4.10.4
 // @description  蝶美套餐危害核对：核对套餐名称里的危害因素、在岗状态同系统实际值是否一致，差异批量补齐，结束给出逐条报告。详细用法与更新记录见工具面板里的"使用说明"。
 
 // @match        https://dime.health-100.cn/*
@@ -1000,6 +1000,28 @@
       "乙酐": "乙酐（乙酸酐）",
     },
 
+    /*
+     * 「一个名称 = 多个分项」的等价组。
+     *
+     * 系统字典里既有合并条目，也有拆开的分项条目，
+     * 比如：
+     *   三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）
+     *   = 三氧化铬 + 铬酸盐 + 重铬酸盐（按 Cr 计）
+     *
+     * 核对时把合并条目按分项展开再比，
+     * 避免「套餐写合并条目、系统录了分项」被判成互相缺失；
+     * 分项缺哪一条也能直接看出来。
+     * 每组第一项是合并条目，其余是必须同时存在的分项（都应是标准名）。
+     */
+    equivalentHazardGroups: [
+      [
+        "三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）",
+        "三氧化铬",
+        "铬酸盐",
+        "重铬酸盐（按 Cr 计）"
+      ]
+    ],
+
     // 默认排除项：仍会在“无关内容”模块中保留记录，便于复核。
     builtinIgnoreTerms: [
       "赠送包",
@@ -1066,11 +1088,8 @@
       .replace(/[\s\u3000]+/g, "")
       .toLowerCase();
 
-    // 只修正高度确定的录入差异，不做泛化错别字替换。
-    return text
-      .replace(/树酯/g, "树脂")
-      .replace(/环已烷/g, "环己烷")
-      .replace(/ν(?=\-|水杨酰)/g, "n");
+    // 不做任何录字纠偏：差一个字可能就是另一种危害，只认套餐名里实际写出的内容。
+    return text;
   }
 
   function strictKey(value) {
@@ -1118,6 +1137,42 @@
   let userIgnoreTerms = readStoredArray(USER_IGNORE_STORAGE_KEY);
   let userIgnoreKeywords =
     readStoredArray(USER_IGNORE_KEYWORD_STORAGE_KEY);
+
+  /*
+   * 危害之间的分隔符（v4.7 起可配置）
+   *
+   * 默认只用「+」：套餐名称本来就是「XX-危害1+危害2+岗中+性别」这个写法。
+   * 配了这个之后，只有配置里的符号才会拆危害，其它符号（、，；/ 等）
+   * 一律当名称的一部分，不再靠猜 —— 名称里的顿号逗号再也污染不到拆分。
+   * 没配「按旧规则自动识别」时，遇到完全不含配置分隔符的老数据，
+   * 仍按原来的多符号启发式兜一次底，避免历史套餐直接拆不开。
+   */
+  const DEFAULT_HAZARD_SEPARATORS = "+";
+  const SEPARATOR_STORAGE_KEY = "dime-hazard-separator-v1";
+  const SEPARATOR_GUESS_STORAGE_KEY = "dime-hazard-separator-guess-v1";
+
+  function readStoredSeparators() {
+    try {
+      const raw = localStorage.getItem(SEPARATOR_STORAGE_KEY);
+      if (raw === null) return DEFAULT_HAZARD_SEPARATORS;
+      return String(raw).replace(/[\u200B-\u200D\uFEFF]/g, "");
+    } catch (_) {
+      return DEFAULT_HAZARD_SEPARATORS;
+    }
+  }
+
+  function readStoredSeparatorGuess() {
+    try {
+      // 默认关闭：只认配置的分隔符，其它符号一律算名称的一部分；
+      // 拆不出来又不认识的整段按「异常」处理，交人工判断。
+      return localStorage.getItem(SEPARATOR_GUESS_STORAGE_KEY) === "1";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  let hazardSeparators = readStoredSeparators();
+  let hazardSeparatorGuess = readStoredSeparatorGuess();
 
   let aliasIndex = new Map();
   let builtinIgnoreIndex = new Set();
@@ -1591,6 +1646,33 @@
   const HAZARD_EDGE_SEPARATOR_RE =
     /^[+＋、,，;；|｜/／\\&＆#＃*＊×✕✖·•。]+|[+＋、,，;；|｜/／\\&＆#＃*＊×✕✖·•。]+$/g;
 
+  // 配置的分隔符 → 归一到 kind 集合（"+" / "、" / "," …）
+  function getConfiguredSeparatorKinds() {
+    const kinds = new Set();
+
+    for (const char of hazardSeparators) {
+      const kind = HAZARD_SEPARATOR_KIND_MAP.get(char);
+
+      // 空白单独处理：写成「空格」也允许，但要用户明确填进去。
+      if (kind) kinds.add(kind);
+    }
+
+    return kinds;
+  }
+
+  function saveSeparatorConfig(chars, guessEnabled) {
+    hazardSeparators = String(chars ?? "");
+    hazardSeparatorGuess = Boolean(guessEnabled);
+
+    try {
+      localStorage.setItem(SEPARATOR_STORAGE_KEY, hazardSeparators);
+      localStorage.setItem(
+        SEPARATOR_GUESS_STORAGE_KEY,
+        hazardSeparatorGuess ? "1" : "0"
+      );
+    } catch (_) {}
+  }
+
   function scanOuterHazardSeparators(value) {
     const text = String(value ?? "");
     const groups = [];
@@ -1955,7 +2037,253 @@
     );
   }
 
+  /*
+   * 标准名称内嵌符号保护（2026-10-23 新增）
+   *
+   * 背景：系统字典里有一批标准名本身就带分隔符，
+   * 按「符号即分隔符」去拆就会把一个危害拆成好几个：
+   *
+   *   三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）
+   *   → 三氧化铬 + 铬酸盐 + 重铬酸盐（错）
+   *
+   * 系统字典（681 项）里出现在名称内部的符号统计：
+   *   （ ）  -      空格  ,   、   )   (   %    ＜ ＜ ＞ ＞ ≥ ~
+   *   ，   ；   β α γ ℃ ` ’ · 等
+   * 其中真正会撞上分隔符表的只有：、 ， , ； X
+   * 而且几乎都藏在括号里（括号内本来就不参与检测），
+   * 只有「三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）」这一条是顶层顿号。
+   *
+   * 做法：拆分前先把「含顶层分隔符的标准名」整体占位保护起来，
+   * 拆完再还原，符号就污染不到拆分逻辑。
+   * 名称尾部括号可省略（套餐里常写成不带「（按 Cr 计）」的形式），
+   * 但只对这类复合名称、且归属唯一时才启用。
+   */
+
+  const HAZARD_NAME_PLACEHOLDER_HEAD = "\uE000";
+  const HAZARD_NAME_PLACEHOLDER_TAIL = "\uE001";
+
+  // 逐字归一，按字符缓存（一页上千行，这里会被反复调用）。
+  const PHRASE_CHAR_CACHE = new Map();
+
+  function normalizeCharForPhraseMatch(char) {
+    const cached = PHRASE_CHAR_CACHE.get(char);
+    if (cached !== undefined) return cached;
+
+    let text = char;
+    try { text = text.normalize("NFKC"); } catch (_) {}
+
+    text = text
+      .replace(/[（【〔［｛]/g, "(")
+      .replace(/[）】〕］｝]/g, ")")
+      .replace(/[＋]/g, "+")
+      .replace(/[－—–−‐‑‒]/g, "-")
+      .replace(/[，、]/g, ",")
+      .replace(/[；]/g, ";")
+      .replace(/[：]/g, ":")
+      .replace(/[＜]/g, "<")
+      .replace(/[＞]/g, ">")
+      .replace(/[％]/g, "%")
+      .replace(/[～]/g, "~")
+      .replace(/[‘’′＇`´]/g, "'")
+      .replace(/[“”＂]/g, '"')
+      .toLowerCase();
+
+    PHRASE_CHAR_CACHE.set(char, text);
+    return text;
+  }
+
+  function toPhraseKey(value) {
+    return [...String(value ?? "")]
+      .map(normalizeCharForPhraseMatch)
+      .join("")
+      .replace(/[\s\u3000]+/g, "");
+  }
+
+  // 从 startIndex 起把 text 与 phraseKey 逐字对齐（跳过空白），
+  // 命中则返回原文中的结束位置，否则 -1。
+  function matchPhraseAt(text, startIndex, phraseKey) {
+    let index = startIndex;
+    let keyIndex = 0;
+
+    while (keyIndex < phraseKey.length) {
+      while (index < text.length && /[\s\u3000]/.test(text[index])) index++;
+      if (index >= text.length) return -1;
+
+      const normalized = normalizeCharForPhraseMatch(text[index]);
+      if (!normalized) {
+        index++;
+        continue;
+      }
+
+      if (!phraseKey.startsWith(normalized, keyIndex)) return -1;
+
+      keyIndex += normalized.length;
+      index++;
+    }
+
+    return index;
+  }
+
+  let compositeHazardPhraseIndex = null;
+
+  function getCompositeHazardPhraseIndex() {
+    if (compositeHazardPhraseIndex) return compositeHazardPhraseIndex;
+
+    const entries = [];
+    const heads = new Map();
+
+    for (const canonical of STANDARD_NAMES) {
+      if (!scanOuterHazardSeparators(canonical).length) continue;
+
+      entries.push({
+        key: toPhraseKey(canonical),
+        canonical
+      });
+
+      // 去掉最外层末尾括号后的主体，
+      // 仅当主体本身也含顶层分隔符时才考虑。
+      const head = String(canonical)
+        .replace(/\s*[（(][^（）()]*[）)]\s*$/, "")
+        .trim();
+
+      if (
+        !head ||
+        head === canonical ||
+        head.length < 5 ||
+        !scanOuterHazardSeparators(head).length ||
+        STANDARD_SET.has(head)
+      ) {
+        continue;
+      }
+
+      const headKey = toPhraseKey(head);
+
+      if (!heads.has(headKey)) {
+        heads.set(headKey, {
+          key: headKey,
+          owners: new Set()
+        });
+      }
+
+      heads.get(headKey).owners.add(canonical);
+    }
+
+    for (const item of heads.values()) {
+      if (item.owners.size !== 1) continue;
+      entries.push({
+        key: item.key,
+        canonical: [...item.owners][0]
+      });
+    }
+
+    // 长名优先，保证「最长命中」。
+    entries.sort((a, b) => b.key.length - a.key.length);
+
+    const byFirstChar = new Map();
+
+    for (const entry of entries) {
+      const firstChar = entry.key[0];
+      if (!firstChar) continue;
+
+      if (!byFirstChar.has(firstChar)) {
+        byFirstChar.set(firstChar, []);
+      }
+
+      byFirstChar.get(firstChar).push(entry);
+    }
+
+    compositeHazardPhraseIndex = {
+      entries,
+      byFirstChar
+    };
+
+    return compositeHazardPhraseIndex;
+  }
+
+  function shieldCompositeHazardNames(text) {
+    const raw = String(text ?? "");
+    const identity = value => String(value ?? "");
+
+    if (!raw) {
+      return { text: raw, restore: identity };
+    }
+
+    const { entries, byFirstChar } = getCompositeHazardPhraseIndex();
+
+    if (!entries.length) {
+      return { text: raw, restore: identity };
+    }
+
+    let output = "";
+    const shielded = [];
+    let index = 0;
+
+    while (index < raw.length) {
+      const firstChar = normalizeCharForPhraseMatch(raw[index]);
+      const candidates = firstChar
+        ? byFirstChar.get(firstChar)
+        : null;
+
+      let matched = null;
+
+      if (candidates) {
+        for (const entry of candidates) {
+          const end = matchPhraseAt(raw, index, entry.key);
+          if (end > index) {
+            matched = { entry, end };
+            break;
+          }
+        }
+      }
+
+      if (!matched) {
+        output += raw[index];
+        index++;
+        continue;
+      }
+
+      const token =
+        HAZARD_NAME_PLACEHOLDER_HEAD +
+        shielded.length +
+        HAZARD_NAME_PLACEHOLDER_TAIL;
+
+      shielded.push({
+        token,
+        canonical: matched.entry.canonical
+      });
+
+      output += token;
+      index = matched.end;
+    }
+
+    if (!shielded.length) {
+      return { text: raw, restore: identity };
+    }
+
+    return {
+      text: output,
+      restore: value => {
+        let result = String(value ?? "");
+        for (const item of shielded) {
+          result = result.split(item.token).join(item.canonical);
+        }
+        return result;
+      }
+    };
+  }
+
   function splitHazardSegment(segment) {
+    const shielded = shieldCompositeHazardNames(
+      cleanText(segment)
+    );
+
+    return splitHazardSegmentCore(shielded.text)
+      .map(shielded.restore)
+      .map(cleanText)
+      .filter(Boolean);
+  }
+
+  function splitHazardSegmentCore(segment) {
     const text = cleanText(segment)
       .replace(
         HAZARD_EDGE_SEPARATOR_RE,
@@ -1988,6 +2316,32 @@
 
     if (!allGroups.length) {
       return [text];
+    }
+
+    /*
+     * 配置了分隔符（默认「+」）时，只按配置的符号拆。
+     * 这样名称里的 、 ， ； / 等不再参与猜测。
+     * 整段一个配置符号都没有（老数据）时，按开关决定是否兜底猜一次。
+     */
+    const configuredKinds =
+      getConfiguredSeparatorKinds();
+
+    if (configuredKinds.size) {
+      const configuredGroups =
+        allGroups.filter(group =>
+          configuredKinds.has(group.kind)
+        );
+
+      if (configuredGroups.length) {
+        return splitTextAtSeparatorGroups(
+          text,
+          configuredGroups
+        );
+      }
+
+      if (!hazardSeparatorGuess) {
+        return [text];
+      }
     }
 
     const occurrenceCount =
@@ -2259,6 +2613,10 @@
     const tokens =
       splitHazardSegment(segment);
 
+    // 只写了「合并条目」的一部分时，照常拆分核对，
+    // 另外挂一条「疑似漏写」提示交人工确认（不自动补全）。
+    const suspectHazards = detectPartialEquivalentRuns(segment);
+
     if (!tokens.length) {
       return {
         hazards: [],
@@ -2338,6 +2696,7 @@
       recognizedHazards,
       unresolvedHazards,
       irrelevantHazards,
+      suspectHazards,
       rawMiddle: segment,
       stage: stageInfo.canonical,
       gender: meta.gender,
@@ -2360,38 +2719,255 @@
     if (separateTexts.length > 1) return uniqueHazards(separateTexts);
 
     const raw = cleanText(cell.innerText || cell.textContent);
-    return uniqueHazards(raw
+
+    // 单元格退化为纯文本时同样要保护名称内嵌符号，
+    // 否则「三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）」会被拆成三行。
+    const shielded = shieldCompositeHazardNames(raw);
+
+    return uniqueHazards(shielded.text
       .split(/[\r\n、，,；;|｜\u2028\u2029\u001E\u001F]+/)
       .map(cleanText)
-      .filter(Boolean));
+      .filter(Boolean)
+      .map(shielded.restore));
+  }
+
+  let equivalentHazardGroupIndex = null;
+
+  function getEquivalentHazardGroupIndex() {
+    if (equivalentHazardGroupIndex) return equivalentHazardGroupIndex;
+
+    equivalentHazardGroupIndex = new Map();
+
+    for (const group of CONFIG.equivalentHazardGroups || []) {
+      const names = (group || [])
+        .map(cleanText)
+        .filter(Boolean);
+
+      if (names.length < 2) continue;
+
+      const composite = resolveCanonical(names[0])?.canonical || "";
+      const parts = names
+        .slice(1)
+        .map(name => resolveCanonical(name)?.canonical || "");
+
+      if (!composite || parts.some(part => !part)) continue;
+
+      equivalentHazardGroupIndex.set(composite, parts);
+    }
+
+    return equivalentHazardGroupIndex;
+  }
+
+  /*
+   * 「只写了合并条目的一部分」检测（2026-10-23 红领巾定规则）
+   *
+   * 系统整条名称：三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）
+   * 套餐里只写：  三氧化铬、铬酸盐
+   *
+   * 规定：**不自动补全成整条**，也不静默当成两个独立危害放过 ——
+   * 命中就在该行挂「疑似漏写」提示，交人工判断。
+   *
+   * 做法：在原文上找「同一组里连续 2 项及以上、但没写全」的片段。
+   * 整条完整出现的部分先被 shieldCompositeHazardNames 占位掉，
+   * 所以不会把写全的当成漏写；也不依赖用户把分隔符写成哪种符号。
+   */
+
+  // 两个分项之间允许出现的分隔写法（一个字符即可）
+  const HAZARD_GAP_RE = /[+＋、,，;；|｜/／\\&＆#＃*＊×✕✖·•。\s]/;
+
+  // 一个分项在原文里可能有多种写法：带括号全称 / 去掉括号的主体名
+  const HAZARD_PART_KEY_CACHE = new Map();
+
+  function getHazardPartKeys(part) {
+    const cached = HAZARD_PART_KEY_CACHE.get(part);
+    if (cached) return cached;
+
+    const keys = [toPhraseKey(part)];
+    const head = String(part)
+      .replace(/\s*[（(][^（）()]*[）)]\s*$/, "")
+      .trim();
+
+    if (head && head !== part) keys.push(toPhraseKey(head));
+
+    HAZARD_PART_KEY_CACHE.set(part, keys);
+    return keys;
+  }
+
+  function matchHazardPartAt(text, index, part) {
+    let matchedEnd = -1;
+
+    for (const key of getHazardPartKeys(part)) {
+      const end = matchPhraseAt(text, index, key);
+      if (end > matchedEnd) matchedEnd = end;
+    }
+
+    return matchedEnd;
+  }
+
+  function matchHazardPartsChainAt(text, index, parts) {
+    let cursor = index;
+
+    for (let i = 0; i < parts.length; i++) {
+      if (i > 0) {
+        const beforeGap = cursor;
+
+        while (
+          cursor < text.length &&
+          HAZARD_GAP_RE.test(text[cursor])
+        ) {
+          cursor++;
+        }
+
+        // 两个分项之间必须真的隔着一个分隔符，
+        // 否则「甲苯三氧化铬」这种连写也会被误判。
+        if (cursor === beforeGap) return -1;
+      }
+
+      const end = matchHazardPartAt(text, cursor, parts[i]);
+
+      if (end <= cursor) return -1;
+
+      cursor = end;
+    }
+
+    return cursor;
+  }
+
+  function detectPartialEquivalentRuns(text) {
+    const index = getEquivalentHazardGroupIndex();
+
+    if (!index.size || !text) return [];
+
+    // 先把写全的合并名占位，避免「整条的前 2 项」被当成漏写。
+    const shielded = shieldCompositeHazardNames(text);
+    const source = shielded.text;
+    const runs = [];
+    let position = 0;
+
+    while (position < source.length) {
+      let best = null;
+
+      for (const [composite, parts] of index) {
+        if (parts.length < 2) continue;
+
+        for (let length = parts.length - 1; length >= 2; length--) {
+          for (
+            let offset = 0;
+            offset + length <= parts.length;
+            offset++
+          ) {
+            const end = matchHazardPartsChainAt(
+              source,
+              position,
+              parts.slice(offset, offset + length)
+            );
+
+            if (end <= position) continue;
+            if (best && best.end - best.start >= end - position) continue;
+
+            best = {
+              start: position,
+              end,
+              composite,
+              missing: parts.filter(
+                (part, partIndex) =>
+                  partIndex < offset ||
+                  partIndex >= offset + length
+              )
+            };
+          }
+        }
+      }
+
+      if (!best) {
+        position++;
+        continue;
+      }
+
+      runs.push({
+        raw: shielded.restore(source.slice(best.start, best.end)),
+        composite: best.composite,
+        missing: best.missing
+      });
+
+      position = best.end;
+    }
+
+    return runs;
+  }
+
+  /*
+   * 「没被分隔符切开的整段就是一个危害」—— 合并条目不再拆成分项去比（v4.7.1）。
+   *
+   * 合并条目（如「三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）」）在系统字典里是一条，
+   * 名称里写它就是一条危害。以前把它展开成 3 个分项去比，系统只选了其中 2 项时
+   * 会报「匹配缺失：重铬酸盐（按 Cr 计）」—— 名称里根本没有单独写过这一项，属误报。
+   *
+   * 判定（两边都按"条"比，v4.7.2）：
+   *   ① 两边写同一条                        ⇒ 匹配
+   *   ② 一边写合并条目、另一边把它的分项全选齐 ⇒ 匹配（含义相同，只是写法不同）
+   *   ③ 其它写法差异一律照实报：名称有、系统没有 ⇒ 匹配缺失（缺的是整条）；
+   *      系统有、名称没有 ⇒ 危害多出。不另设"写法不一致"这种第三态。
+   */
+  function buildHazardSideMap(items) {
+    const map = new Map();
+
+    for (const item of items) {
+      if (!item.standardResolved) continue;
+      if (!map.has(item.canonical)) map.set(item.canonical, item);
+    }
+
+    return map;
+  }
+
+  function resolvePartKey(part) {
+    return resolveCanonical(part)?.canonical || part;
+  }
+
+  /*
+   * 合并条目 ↔ 分项「全选齐」：只有这一种情况内部消化成匹配。
+   * 只选了几项时什么都不做（不摘除、不改写），让两边各自按条进缺失 / 多出。
+   */
+  function takeEquivalentPair(ownerMap, otherMap, matchedFrom) {
+    const index = getEquivalentHazardGroupIndex();
+
+    for (const canonical of [...ownerMap.keys()]) {
+      const parts = index.get(canonical);
+      if (!parts || !parts.length) continue;
+      if (otherMap.has(canonical)) continue; // 两边都写合并条目 ⇒ 普通匹配，交给后面
+
+      const partKeys = parts.map(resolvePartKey);
+      if (!partKeys.every(key => otherMap.has(key))) continue; // 没选齐 ⇒ 各算各的
+
+      ownerMap.delete(canonical);
+      partKeys.forEach(key => otherMap.delete(key));
+      matchedFrom.push({ composite: canonical });
+    }
   }
 
   function compareHazardLists(packageHazards, cellHazards) {
-    const packageMap = new Map(
-      packageHazards
-        .filter(item => item.standardResolved)
-        .map(item => [item.canonical, item])
+    const packageMap = buildHazardSideMap(packageHazards);
+    const cellMap = buildHazardSideMap(cellHazards);
+
+    const matchedFrom = [];
+
+    takeEquivalentPair(packageMap, cellMap, matchedFrom);
+    takeEquivalentPair(cellMap, packageMap, matchedFrom);
+
+    const packageOnly = [...packageMap.values()].filter(
+      item => !cellMap.has(item.canonical)
     );
 
-    const cellMap = new Map(
-      cellHazards
-        .filter(item => item.standardResolved)
-        .map(item => [item.canonical, item])
+    const cellOnly = [...cellMap.values()].filter(
+      item => !packageMap.has(item.canonical)
     );
-
-    const packageOnly = [...packageMap.entries()]
-      .filter(([canonical]) => !cellMap.has(canonical))
-      .map(([, item]) => item);
-
-    const cellOnly = [...cellMap.entries()]
-      .filter(([canonical]) => !packageMap.has(canonical))
-      .map(([, item]) => item);
 
     return {
       packageOnly,
       cellOnly,
-      comparedPackageCount: packageMap.size,
-      comparedCellCount: cellMap.size,
+      matchedFrom,
+      comparedPackageCount: packageMap.size + matchedFrom.length,
+      comparedCellCount: cellMap.size + matchedFrom.length,
       isMatched: packageOnly.length === 0 && cellOnly.length === 0
     };
   }
@@ -2585,29 +3161,47 @@
   const style = document.createElement("style");
   style.id = STYLE_ID;
   style.textContent = `
+    /* v4.10.1 侧边栏：与页面融为一体 —— 通高、贴边、无圆角无阴影，只留一条分隔线 */
     #${TOOL_ID}{
-      position:fixed;top:80px;left:calc(100vw - 475px);z-index:2147483647;
-      width:455px;height:min(680px,calc(100vh - 105px));
-      min-width:360px;min-height:320px;
-      max-width:calc(100vw - 8px);max-height:calc(100vh - 8px);
+      position:fixed;top:0;bottom:auto;z-index:2147483000;
+      width:var(--dime-hazard-panel-w,clamp(330px,25vw,420px));max-width:calc(100vw - 24px);
+      height:100vh;
+      min-width:0;min-height:0;
       display:flex;flex-direction:column;box-sizing:border-box;
-      overflow:hidden;border:1px solid #cfd5df;border-radius:9px;background:#fff;
-      box-shadow:0 8px 32px rgba(0,0,0,.25);
-      font-family:"Microsoft YaHei",sans-serif;color:#303133
+      overflow:hidden;border:0;background:#fff;
+      font-family:"Microsoft YaHei",sans-serif;color:#303133;
+      animation:dime-hazard-panel-in .18s cubic-bezier(.4,0,.2,1)
+    }
+    #${TOOL_ID}.dock-right{right:0;left:auto;border-left:1px solid #dcdfe6}
+    #${TOOL_ID}.dock-left{left:0;right:auto;border-right:1px solid #dcdfe6}
+    @keyframes dime-hazard-panel-in{
+      from{opacity:.35;transform:translateX(18px)}
+      to{opacity:1;transform:none}
+    }
+    #${TOOL_ID}.dock-left{animation-name:dime-hazard-panel-in-left}
+    @keyframes dime-hazard-panel-in-left{
+      from{opacity:.35;transform:translateX(-18px)}
+      to{opacity:1;transform:none}
     }
     #${TOOL_ID}.is-dragging,
     #${TOOL_ID}.is-resizing,
     #${TOOL_ID}.is-height-resizing{user-select:none}
+    /* v4.10.4 宽度拖拽：把手铺满"靠页面那一侧"的整条边缘（靠右停靠时在左缘，靠左时在右缘），
+       平时是透明的 7px 感应带，hover / 拖动时才浮出一条蓝线。中部那截被收起把手压着
+       （它 z-index 更高），点不到正好互不打扰 */
     #${TOOL_ID} .tool-resize-handle{
-      position:absolute;top:0;right:0;width:10px;height:49px;z-index:10;
-      cursor:ew-resize;touch-action:none
+      position:absolute;top:0;bottom:0;width:7px;z-index:35;
+      cursor:ew-resize;touch-action:none;background:transparent
     }
+    #${TOOL_ID}.dock-right .tool-resize-handle{left:0;right:auto}
+    #${TOOL_ID}.dock-left .tool-resize-handle{right:0;left:auto}
     #${TOOL_ID} .tool-resize-handle::after{
-      content:"";position:absolute;right:1px;top:50%;width:3px;height:28px;
-      transform:translateY(-50%);border-radius:3px;background:#c0c4cc;opacity:.45
+      content:"";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+      width:3px;height:44px;border-radius:3px;background:#409eff;opacity:0;
+      transition:opacity .16s
     }
     #${TOOL_ID} .tool-resize-handle:hover::after,
-    #${TOOL_ID}.is-resizing .tool-resize-handle::after{background:#409eff;opacity:1}
+    #${TOOL_ID}.is-resizing .tool-resize-handle::after{opacity:.9}
     #${TOOL_ID} .tool-height-resize-handle{
       position:absolute;left:0;bottom:0;width:100%;height:11px;z-index:11;
       cursor:ns-resize;touch-action:none
@@ -2623,17 +3217,77 @@
     #${TOOL_ID} .tool-header{
       display:flex;align-items:center;justify-content:space-between;padding:12px 14px;
       border-bottom:1px solid #ebeef5;background:#f5f7fa;font-size:16px;
-      cursor:grab;user-select:none
+      cursor:default;user-select:none;gap:10px
     }
-    #${TOOL_ID} .tool-header:active{cursor:grabbing}
-    #${TOOL_ID} .tool-header-actions{display:flex;align-items:center;gap:5px;margin-right:4px}
+    #${TOOL_ID} .tool-header-left{
+      display:flex;align-items:center;gap:10px;min-width:0
+    }
+    #${TOOL_ID} .tool-header-left strong{
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+    }
+    /* 折叠态的紧凑条：一行放状态 + 开始核对，不占版面 */
+    #${TOOL_ID} .tool-mini-status,
+    #${TOOL_ID} .tool-mini-run{display:none}
+    #${TOOL_ID} .tool-mini-status{
+      font-size:12px;font-weight:400;color:#909399;
+      padding-left:10px;border-left:1px solid #dfe6ef;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+    }
+    #${TOOL_ID} .tool-mini-run{
+      align-items:center;justify-content:center;
+      padding:4px 12px;margin-left:auto;border:0;border-radius:5px;
+      background:#409eff;color:#fff;font-size:12px;font-weight:800;cursor:pointer
+    }
+    #${TOOL_ID} .tool-mini-run:hover{filter:brightness(.95)}
+    #${TOOL_ID}.is-collapsed .tool-header{padding:7px 12px;font-size:13px;background:#fff}
+    #${TOOL_ID}.is-collapsed .tool-mini-status,
+    #${TOOL_ID}.is-collapsed .tool-mini-run{display:inline-flex}
+    #${TOOL_ID} .tool-header-actions{display:flex;align-items:center;gap:4px;margin-right:2px}
     #${TOOL_ID} .tool-header-button{
-      width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;
-      border:0;border-radius:4px;padding:0;background:transparent;color:#606266;
-      font-size:20px;line-height:1;cursor:pointer
+      height:26px;min-width:26px;display:inline-flex;align-items:center;justify-content:center;gap:3px;
+      border:0;border-radius:4px;padding:0 6px;background:transparent;color:#606266;
+      font-size:16px;line-height:1;cursor:pointer
     }
     #${TOOL_ID} .tool-header-button:hover{background:#e9edf3;color:#409eff}
-    #${TOOL_ID} .tool-close{font-size:26px}
+    #${TOOL_ID} .tool-header-button-text{font-size:12px;font-weight:700;letter-spacing:0}
+
+    /* v4.10.4 收起把手：跟收起后的竖条（写「开」）同款 —— 同样圆角阴影、圆形图标 + 竖排字。
+       关键改动：平时只从面板边缘露出 8px 一条窄带（落在正文内边距里，既不占宽度也不遮字），
+       鼠标移上去整条「危害匹配-关」才滑出来，移开就缩回去 —— 不再为它留一整列白 */
+    #${TOOL_ID} .tool-edge-collapse{
+      position:absolute;top:50%;transform:translateY(-50%);z-index:40;
+      display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;
+      width:26px;padding:8px 0;box-sizing:border-box;overflow:hidden;
+      border:1px solid #1f6fbd;border-radius:6px;
+      background:#409eff;color:#fff;cursor:pointer;
+      box-shadow:0 3px 10px rgba(64,158,255,.28);
+      font-family:"Microsoft YaHei",sans-serif;
+      transition:left .18s ease,right .18s ease,box-shadow .16s
+    }
+    #${TOOL_ID} .tool-edge-collapse:hover{box-shadow:0 5px 16px rgba(64,158,255,.45)}
+    #${TOOL_ID} .tool-edge-collapse .edge-icon,
+    #${TOOL_ID} .tool-edge-collapse .edge-label{
+      opacity:0;transition:opacity .13s ease
+    }
+    #${TOOL_ID} .tool-edge-collapse:hover .edge-icon,
+    #${TOOL_ID} .tool-edge-collapse:hover .edge-label{opacity:1}
+    #${TOOL_ID} .tool-edge-collapse .edge-icon{
+      width:16px;height:16px;flex:0 0 auto;
+      display:inline-flex;align-items:center;justify-content:center;
+      border-radius:50%;background:#fff;
+      color:#2677c8;font-size:10px;font-weight:900;line-height:1
+    }
+    #${TOOL_ID} .tool-edge-collapse .edge-label{
+      writing-mode:vertical-rl;text-orientation:upright;
+      font-size:11px;font-weight:800;letter-spacing:1.5px;line-height:1;white-space:nowrap
+    }
+    /* 靠右停靠：把手压在面板左缘外侧，常态只露 8px */
+    #${TOOL_ID}.dock-right .tool-edge-collapse{left:-18px;right:auto}
+    #${TOOL_ID}.dock-right .tool-edge-collapse:hover{left:0}
+    /* 靠左停靠：镜像到面板右缘 */
+    #${TOOL_ID}.dock-left .tool-edge-collapse{right:-18px;left:auto}
+    #${TOOL_ID}.dock-left .tool-edge-collapse:hover{right:0}
+    #${TOOL_ID}.is-collapsed .tool-edge-collapse{display:none}
     #${TOOL_ID} .tool-body{
       flex:1;min-height:0;padding:10px 14px 17px;overflow:auto;
       max-height:none;scroll-behavior:smooth
@@ -2644,13 +3298,13 @@
       border-bottom:1px solid #ebeef5;background:#fff;
       box-shadow:0 5px 12px rgba(31,45,61,.08)
     }
-    #${TOOL_ID}.is-collapsed{
-      height:49px!important;min-height:49px!important;max-height:49px!important
-    }
+    #${TOOL_ID}.is-collapsed{height:auto!important;min-height:0!important;max-height:none!important}
     #${TOOL_ID}.is-collapsed .tool-body,
     #${TOOL_ID}.is-collapsed .tool-resize-handle,
     #${TOOL_ID}.is-collapsed .tool-height-resize-handle{display:none}
     #${TOOL_ID}.is-collapsed .tool-header{border-bottom:0}
+    /* 通高侧栏用不到上下调高把手；左右调宽把手见上面 */
+    #${TOOL_ID} .tool-height-resize-handle{display:none}
     #${TOOL_ID} .tool-help{
       margin:10px 0 0;border:1px solid #e4e7ed;border-radius:5px;
       background:#f5f7fa;overflow:hidden
@@ -2671,10 +3325,10 @@
       gap:6px;margin-top:8px
     }
     #${TOOL_ID} .tool-reference-button{
-      min-width:0;padding:7px 5px;border:1px solid #dcdfe6;
+      min-width:0;padding:7px 4px;border:1px solid #dcdfe6;
       border-radius:5px;background:#f5f7fa;color:#606266;
-      font-size:11px;font-weight:900;cursor:pointer;
-      white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+      font-size:11px;font-weight:700;cursor:pointer;letter-spacing:0;
+      white-space:nowrap;overflow:visible
     }
     #${TOOL_ID} .tool-reference-button:hover{
       border-color:#b3d8ff;background:#ecf5ff;color:#337ecc
@@ -3199,98 +3853,235 @@
     .${AUTO_PANEL_CLASS} .autofill-action:disabled{background:#a0cfff;cursor:not-allowed;filter:none}
     .${AUTO_PANEL_CLASS} .autofill-status{margin-top:6px;white-space:pre-wrap;word-break:break-word}
 
+    /* 收起时的竖条：贴在停靠侧的边缘中部，竖排文字，不占页面布局（v4.10.2 收窄到 34px） */
     #${LAUNCHER_ID}{
-      position:fixed;top:88px;right:18px;z-index:2147483646;
-      width:172px;height:42px;display:flex;align-items:center;justify-content:center;
-      gap:9px;padding:0 16px;border:1px solid #1f6fbd;
-      border-radius:22px;background:#409eff;color:#fff;
-      box-shadow:0 7px 20px rgba(64,158,255,.38);
-      font-family:"Microsoft YaHei",sans-serif;font-size:15px;font-weight:900;
-      letter-spacing:.3px;white-space:nowrap;cursor:grab;touch-action:none;
-      text-shadow:0 1px 1px rgba(0,0,0,.22);
-      transition:box-shadow .16s,background .16s,filter .16s
+      position:fixed;top:50%;transform:translateY(-50%);z-index:2147483001;
+      display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;
+      width:27px;padding:9px 0;border:1px solid #1f6fbd;
+      border-radius:6px;background:#409eff;color:#fff;
+      box-shadow:0 4px 12px rgba(64,158,255,.3);
+      font-family:"Microsoft YaHei",sans-serif;cursor:pointer;
+      transition:background .16s,box-shadow .16s,filter .16s
     }
-    #${LAUNCHER_ID}:hover{
-      background:#337ecc;filter:brightness(1.03);
-      box-shadow:0 9px 26px rgba(64,158,255,.48)
-    }
-    #${LAUNCHER_ID}.is-open{
-      background:#1f6fbd;border-color:#185b9c;
-      box-shadow:0 7px 22px rgba(31,111,189,.46)
-    }
-    #${LAUNCHER_ID}.is-open:hover{
-      background:#185b9c
-    }
-    #${LAUNCHER_ID}.is-launcher-dragging{
-      cursor:grabbing;filter:brightness(.96);
-      box-shadow:0 10px 28px rgba(64,158,255,.5)
-    }
+    #${LAUNCHER_ID}.dock-right{right:0;left:auto;border-radius:6px 0 0 6px;border-right:0}
+    #${LAUNCHER_ID}.dock-left{left:0;right:auto;border-radius:0 6px 6px 0;border-left:0}
+    #${LAUNCHER_ID}:hover{background:#337ecc;box-shadow:0 6px 18px rgba(64,158,255,.45)}
     #${LAUNCHER_ID} .launcher-icon{
-      width:25px;height:25px;display:inline-flex;align-items:center;justify-content:center;
-      flex:0 0 auto;border-radius:50%;background:#fff;
-      color:#2677c8;font-size:13px;font-weight:900;text-shadow:none;
-      box-shadow:0 1px 3px rgba(0,0,0,.16)
+      width:16px;height:16px;flex:0 0 auto;
+      display:inline-flex;align-items:center;justify-content:center;
+      border-radius:50%;background:#fff;
+      color:#2677c8;font-size:10px;font-weight:900;line-height:1
+    }
+    #${LAUNCHER_ID} .launcher-text{
+      writing-mode:vertical-rl;text-orientation:upright;
+      font-size:12px;font-weight:800;letter-spacing:2px;line-height:1;white-space:nowrap
+    }
+    /* 展开时给页面让出与面板等宽的位置：内容整体被推向另一侧，而不是被面板压住 */
+    html.dime-hazard-push-right #app,
+    html.dime-hazard-push-left #app{
+      box-sizing:border-box!important;
+      transition:padding .22s cubic-bezier(.4,0,.2,1)
+    }
+    html.dime-hazard-push-right #app{padding-right:var(--dime-hazard-reserve,0px)!important}
+    html.dime-hazard-push-left #app{padding-left:var(--dime-hazard-reserve,0px)!important}
+    /* 弹窗也让位：很多「页面」其实是全屏弹窗（如导入体检单位），挂 body 不走 #app，
+       不推它就会被面板盖住右半截；窗口太窄时不推，免得小弹窗内部被挤变形 */
+    @media (min-width:1240px){
+      html.dime-hazard-push-right .el-dialog__wrapper{right:var(--dime-hazard-reserve,0px)!important}
+      html.dime-hazard-push-left .el-dialog__wrapper{left:var(--dime-hazard-reserve,0px)!important}
+      html.dime-hazard-push-right .el-drawer__wrapper,
+      html.dime-hazard-push-right .el-message-box__wrapper{right:var(--dime-hazard-reserve,0px)!important}
+      html.dime-hazard-push-left .el-drawer__wrapper,
+      html.dime-hazard-push-left .el-message-box__wrapper{left:var(--dime-hazard-reserve,0px)!important}
+    }
+    /* ================= v4.7 布局：左侧操作/概览，右侧结果 ================= */
+    #${TOOL_ID} .tool-body{
+      flex:1;min-height:0;display:grid;grid-template-columns:296px minmax(0,1fr);
+      gap:0;padding:0;overflow:hidden
+    }
+    /* v4.10.4 上下占比拖动条：单栏（窄）时上方操作区与下方结果区不再硬切 44vh，
+       拖这条横杠就能改占比，双击回到默认；两栏布局用不到，藏起来 */
+    #${TOOL_ID} .tool-splitter{
+      display:none;flex:0 0 auto;position:relative;height:9px;z-index:25;
+      cursor:row-resize;touch-action:none;
+      background:#fafbfc;border-top:1px solid #ebeef5;border-bottom:1px solid #ebeef5
+    }
+    #${TOOL_ID} .tool-splitter::after{
+      content:"";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+      width:44px;height:3px;border-radius:2px;background:#dcdfe6;
+      transition:background .15s,width .15s
+    }
+    #${TOOL_ID} .tool-splitter:hover::after,
+    #${TOOL_ID}.is-split-dragging .tool-splitter::after{background:#409eff;width:62px}
+    #${TOOL_ID}.is-split-dragging{cursor:row-resize}
+    #${TOOL_ID}.is-split-dragging .tool-splitter{background:#ecf5ff}
+    #${TOOL_ID} .tool-side{
+      display:flex;flex-direction:column;gap:10px;min-height:0;
+      padding:12px 12px 16px;overflow:auto;
+      background:#fafbfc;border-right:1px solid #ebeef5
+    }
+    /* v4.10.3 关键：左栏限高（max-height）+ 滚动时，子项默认会被 flex 压缩，
+       说明/更新记录这两个框就被压成一条、文字上下被切。禁止收缩，超出走滚动条 */
+    #${TOOL_ID} .tool-side > *{flex:0 0 auto}
+    #${TOOL_ID} .tool-main{
+      display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden
+    }
+    #${TOOL_ID} .tool-main-bar{
+      display:flex;align-items:center;justify-content:space-between;gap:8px;
+      padding:10px 14px 9px;border-bottom:1px solid #ebeef5;background:#fff
+    }
+    #${TOOL_ID} .tool-main-title{color:#303133;font-size:13px;font-weight:900}
+    #${TOOL_ID} .tool-results:empty::before{
+      content:"还没有核对结果 —— 点左侧「开始核对」，差异会一条条列在这里。";
+      display:block;padding:40px 22px;color:#c0c4cc;
+      font-size:12px;line-height:1.8;text-align:center
+    }
+    #${TOOL_ID} .tool-results{
+      flex:1;min-height:0;overflow:auto;padding:10px 12px 18px
+    }
+    #${TOOL_ID} .tool-sticky-zone{
+      position:static;margin:0;padding:0;border:0;background:transparent;box-shadow:none
+    }
+    #${TOOL_ID} .tool-summary{margin-top:0}
+    #${TOOL_ID} .summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+    #${TOOL_ID} .tool-copy-all{
+      display:none;width:auto;min-width:0;margin:0;padding:5px 10px;
+      background:#67c23a;border-radius:5px;font-size:11px;font-weight:800
+    }
+    #${TOOL_ID} .tool-toast{margin:8px 14px 0}
+    #${TOOL_ID} .tool-side .tool-help{margin-top:0}
+    /* 窄栏形态：操作区在上、结果区在下，结果多只在自己的框里滚，不把按钮顶走 */
+    #${TOOL_ID}.is-narrow .tool-body{
+      display:flex;flex-direction:column;gap:0;overflow:hidden
+    }
+    #${TOOL_ID}.is-narrow .tool-side{
+      flex:0 0 auto;height:var(--dime-hazard-side-h,auto);
+      max-height:var(--dime-hazard-side-max,44vh);
+      border-right:0;padding:9px 10px 10px;gap:8px;overflow:auto
+    }
+    #${TOOL_ID}.is-narrow .tool-splitter{display:block}
+    #${TOOL_ID}.is-narrow .tool-main{flex:1 1 auto;min-height:0;overflow:hidden}
+    #${TOOL_ID}.is-narrow .tool-results{overflow:auto;min-height:0;max-height:none}
+    #${TOOL_ID}.is-narrow .tool-summary{padding:8px 9px}
+    #${TOOL_ID}.is-narrow .summary-grid{gap:5px}
+    @media (max-width:900px){
+      #${TOOL_ID} .tool-body{display:flex;flex-direction:column;overflow:hidden}
+      #${TOOL_ID} .tool-side{
+        flex:0 0 auto;height:var(--dime-hazard-side-h,auto);
+        max-height:var(--dime-hazard-side-max,44vh);
+        border-right:0;padding:9px 10px 10px;overflow:auto
+      }
+      #${TOOL_ID} .tool-splitter{display:block}
+      #${TOOL_ID} .tool-main{flex:1 1 auto;min-height:0;overflow:hidden}
+      #${TOOL_ID} .tool-results{overflow:auto;min-height:0;max-height:none}
+    }
+
+    /* ================= v4.7 配置视图（整面板切换） ================= */
+    #${TOOL_ID} .tool-settings-view{
+      display:none;flex:1;min-height:0;flex-direction:column;
+      padding:10px 14px 16px;overflow:auto
+    }
+    #${TOOL_ID}.is-settings .tool-settings-view{display:flex}
+    #${TOOL_ID}.is-settings .tool-body{display:none}
+    #${TOOL_ID}.is-collapsed .tool-settings-view{display:none}
+    #${TOOL_ID} .tool-settings-bar{
+      display:flex;align-items:center;justify-content:space-between;gap:8px;
+      padding-bottom:9px;margin-bottom:9px;border-bottom:1px solid #ebeef5
+    }
+    #${TOOL_ID} .tool-dock-row{
+      display:flex;align-items:center;gap:8px;margin-bottom:10px;
+      padding:8px 10px;border:1px solid #e4e7ed;border-radius:6px;background:#fafbfc
+    }
+    #${TOOL_ID} .tool-dock-label{
+      font-size:12px;font-weight:800;color:#606266;margin-right:2px
+    }
+    #${TOOL_ID} .tool-dock-button{
+      padding:5px 10px;border:1px solid #dcdfe6;border-radius:5px;background:#fff;
+      color:#606266;font-size:12px;font-weight:700;cursor:pointer
+    }
+    #${TOOL_ID} .tool-dock-button:hover{border-color:#b3d8ff;color:#337ecc}
+    #${TOOL_ID} .tool-dock-button.is-active{
+      border-color:#409eff;background:#ecf5ff;color:#337ecc
+    }
+    #${TOOL_ID} .tool-settings-title{font-size:13px;font-weight:900;color:#303133}
+    #${TOOL_ID} .tool-settings-back{
+      padding:5px 11px;border:1px solid #dcdfe6;border-radius:5px;background:#fff;
+      color:#606266;font-size:12px;font-weight:800;cursor:pointer
+    }
+    #${TOOL_ID} .tool-settings-back:hover{
+      border-color:#b3d8ff;background:#ecf5ff;color:#337ecc
+    }
+    #${TOOL_ID} .tool-reference-buttons{grid-template-columns:repeat(auto-fit,minmax(78px,1fr))}
+    #${TOOL_ID} .tool-reference-panel-body{max-height:none}
+
+    /* 分隔符配置面板 */
+    #${TOOL_ID} .separator-field{display:flex;flex-direction:column;gap:7px;padding:10px}
+    #${TOOL_ID} .separator-label{color:#303133;font-size:12px;font-weight:900}
+    #${TOOL_ID} .separator-input{
+      width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #dcdfe6;
+      border-radius:5px;background:#fff;color:#303133;
+      font-family:Consolas,"Courier New",monospace;
+      font-size:14px;letter-spacing:2px
+    }
+    #${TOOL_ID} .separator-input:focus{outline:0;border-color:#409eff;box-shadow:0 0 0 2px #d9ecff}
+    #${TOOL_ID} .separator-hint{color:#909399;font-size:11px;line-height:1.6}
+    #${TOOL_ID} .separator-check{display:flex;align-items:flex-start;gap:6px;color:#606266;font-size:12px;line-height:1.5;cursor:pointer}
+    #${TOOL_ID} .separator-check input{margin:2px 0 0}
+    #${TOOL_ID} .separator-actions{display:flex;gap:8px;margin-top:2px}
+    #${TOOL_ID} .separator-save{
+      padding:7px 14px;border:0;border-radius:5px;background:#409eff;color:#fff;
+      font-size:12px;font-weight:800;cursor:pointer
+    }
+    #${TOOL_ID} .separator-reset{
+      padding:7px 14px;border:1px solid #dcdfe6;border-radius:5px;background:#fff;
+      color:#606266;font-size:12px;font-weight:800;cursor:pointer
+    }
+    #${TOOL_ID} .separator-preview{
+      margin-top:2px;padding:7px 9px;border-radius:5px;background:#f5f7fa;
+      color:#606266;font-size:11px;line-height:1.6;word-break:break-all
     }
   `;
+
   document.head.appendChild(style);
 
   const tool = document.createElement("div");
   tool.id = TOOL_ID;
   tool.innerHTML = `
     <div class="tool-header">
-      <strong>套餐危害因素核对工具 v4.6.4</strong>
+      <div class="tool-header-left">
+        <strong>套餐危害因素核对工具 v4.10.4</strong>
+        <span class="tool-mini-status">等待核对</span>
+      </div>
+      <button class="tool-mini-run" type="button" title="直接开始核对">开始核对</button>
       <div class="tool-header-actions">
-        <button class="tool-header-button tool-collapse" type="button" title="折叠工具">−</button>
-        <button class="tool-header-button tool-close" type="button" title="收起到快捷按钮">×</button>
+        <button class="tool-header-button tool-open-settings" type="button" title="设置：分隔符 / 匹配规则 / 排除项 / 无关内容 / 无关关键词 / 面板停靠">⚙<span class="tool-header-button-text">设置</span></button>
       </div>
     </div>
-    <div class="tool-body">
-      <div class="tool-sticky-zone">
-        <div class="tool-buttons">
-          <button class="tool-action tool-run" type="button">开始核对</button>
-          <button class="tool-action tool-clear" type="button">清除高亮</button>
-        </div>
 
-        <div class="tool-reference-buttons">
-          <button
-            class="tool-reference-button"
-            type="button"
-            data-reference-panel="aliases"
-          >匹配规则</button>
-          <button
-            class="tool-reference-button"
-            type="button"
-            data-reference-panel="exclusions"
-          >排除项</button>
-          <button
-            class="tool-reference-button"
-            type="button"
-            data-reference-panel="ignores"
-          >无关内容</button>
-          <button
-            class="tool-reference-button"
-            type="button"
-            data-reference-panel="ignore-keywords"
-          >无关关键词</button>
+    <!-- v4.10.4 收起把手：跟收起后的竖条同款，那条写「开」，这条写「关」，半嵌在面板边缘 -->
+    <button class="tool-edge-collapse" type="button" title="收起面板（收成贴边竖条）">
+      <span class="edge-icon">核</span>
+      <span class="edge-label">危害匹配-关</span>
+    </button>
+
+    <div class="tool-body">
+      <aside class="tool-side">
+        <div class="tool-sticky-zone">
+          <div class="tool-buttons">
+            <button class="tool-action tool-run" type="button">开始核对</button>
+            <button class="tool-action tool-clear" type="button">清除高亮</button>
+          </div>
         </div>
 
         <div class="tool-summary">等待核对</div>
-      </div>
 
-      <div class="tool-reference-panels"></div>
-      <div class="tool-toast"></div>
-      <div class="tool-results"></div>
-      <button class="tool-action tool-copy-all" type="button">
-        复制全部缺失名称
-      </button>
-
-      <details class="tool-help">
+<details class="tool-help">
         <summary>使用说明（点击展开）</summary>
         <div class="tool-tip">
           <b>它做什么：</b>把"套餐名称里写的危害因素与在岗状态"跟系统里实际存的值对一遍，不一致的批量补齐。<br>
           <b>怎么用：</b>打开体检套餐列表页 → 点「开始核对」→ 等进度走完 → 看结果。核对完成后按钮会变成「批量核对补齐本页（N）」，点它才会真正改数据；只想看不想改，停在核对这步就行。<br>
           <b>三种结论：</b>已补齐 = 脚本改过来了；无需动 = 本来就一致；失败 = 没改成，报告里写原因（多是名称在危害库里定位不到，或保存接口回执不通过）。<br>
-          <b>套餐名称格式：</b>建议「XX-危害1+危害2+危害3+岗中+性别」，常见其他分隔符与岗位简称也能识别；识别不了的会归到「待处理名称」，可用下面的匹配规则人工指定。<br>
+          <b>套餐名称格式：</b>「XX-危害1+危害2+危害3+岗中+性别」；岗位简称会自动识别。分隔符默认只认「+」，可在「⚙ 配置 → 分隔符」里改（也能加 、 ，等）。<b>只有配置的分隔符才拆危害</b>，没配的符号一律当名称的一部分；拆出来又对不上标准名的整段，按「名称异常」提示，可用「配置 → 匹配规则」人工指定。<br>
           <b>处理方式：</b>默认「静默直写」——编辑弹窗整批只在后台打开一次并全程隐身，屏幕上看不到弹窗、遮罩和逐条换内容的闪烁，也没有开窗动画；脚本把目标值直接写进页面表单模型、调页面自带的保存逻辑，成败以保存接口的回执为准，最快。若首轮提交被页面的"保存中"状态挡下（请求根本没发出），会自动降级成逐条提交，并在报告里说明。想改用「界面模拟」（逐项点选，慢但完全走人手路径，可肉眼对照）时，按住 <code>Alt</code> 点「批量核对补齐本页」即可来回切换，状态会记住。<br>
           <b>进度背景怎么读：</b>百分比按"已结案 + 在途/待补试各计半格"算，所以提交中也在往前走。「在途 N」= 已发出请求、等回执；「待补试 M」= 首轮没成、排队等批末重试；「正在处理」是当前这一条，「最近完成」是最后 4 条的去向。整批跑到 100% 会原地停 2 秒显示处理结果，再交回右下角小卡片。中途想停点「停止」，已发出的那几条仍会落地。<br>
           <b>报告怎么读：</b>逐条列出每条的结论与改动内容（新增了几项危害、在岗状态改成了什么）；开头若出现「首轮有 N 条…」，说明那 N 条是被自动降级后补成的，数据没问题、只是慢一点。请对照清单自行抽查。<br>
@@ -3301,6 +4092,47 @@
       <details class="tool-help">
         <summary>更新记录（点击展开）</summary>
         <div class="tool-tip">
+          <b>v4.10.4</b> 尺寸可调 + 把手不再占版面：<br>
+          ・<b>收起把手不再吃正文宽度</b>：原先为了让开那条竖把手，整块正文都缩进 35px，从上到下留出一条白柱。现在把手半嵌在面板边缘，常态只露出十几像素、贴在边框上，正文宽度全部还给内容。<br>
+          ・<b>上下比例能拖了</b>：操作区和「核对结果」之间加了一条横向拖动条（中间那道短杠），想多看结果就把上面压小、想多看摘要就把上面拉大；双击横条回到默认的 44%。<br>
+          ・<b>面板宽度能拖了</b>：在面板靠页面那一侧的边缘左右拖就能改宽窄，双击边缘复位；拖过 620px 会自动并成"左操作 / 右结果"两栏。<br>
+          ・<b>配置页签不再截字</b>：原来五个页签硬挤一行，「匹配规则」「无关关键词」被截成省略号；现在宽度不够就自动换行，字始终完整。<br>
+          <b>v4.10.3</b> 收起把手挪到侧栏边上 + 修框体被压 + 屏蔽 ESC：<br>
+          ・<b>收起按钮换位置</b>：头部「设置」右边那个 » 删掉了，改成贴在面板靠页面那一侧中部的一条蓝色竖条 —— 跟收起来的那条<b>完全同款</b>（圆形图标 + 竖排一个字）：收起的写 <b>危害匹配-开</b>，面板上的写 <b>危害匹配-关</b>，一眼分得清。<br>
+          ・<b>修「使用说明 / 更新记录」被压扁</b>：左栏限高后，这两个框被 flex 默认可收缩压成一条、文字上下被切。现在它们不再收缩，内容超出走滚动条。<br>
+          ・<b>ESC 不再误退</b>：这页 ESC 一按就把整层退出去，脚本在最外层拦掉；真需要退时按住 <code>Alt + ESC</code> 仍可放行。<br>
+          <b>v4.10.2</b> 全屏弹窗也让位 + 头部精简：<br>
+          ・<b>修「导入体检单位」这类全屏弹窗被面板压住</b>：有些"页面"其实是挂在 <code>body</code> 下的全屏弹窗（如导入体检单位），只推 <code>#app</code> 推不动它 —— 现在弹窗、抽屉、确认框也会一起让出面板宽度，表格右半截不再藏在面板底下。<br>
+          ・<b>头部只留两个按钮</b>：去掉没用的小化和关闭（本来都只是"收起"，重复了），统一成一个 <b>»</b> 折叠按钮（箭头跟着停靠侧变向）；配置入口挪到标题旁的 <b>⚙ 设置</b>，侧栏里那个占地方的大按钮删掉了。<br>
+          ・<b>收起后就是那条竖条</b>：点竖条展开、点 <b>»</b> 收回，一来一回；竖条从 61px 收窄到 34px，不再挡表格。<br>
+          <b>v4.10.1</b> 去掉框体 + 严格按原文比对：<br>
+          ・<b>面板不再是"浮窗卡片"</b>：去掉圆角、阴影、外框和上下留白，通高贴边，只在与页面相接的一侧留一条分隔线，看起来就是页面自己的侧栏。<br>
+          ・<b>删掉录字纠偏</b>：以前会自动把「树酯→树脂」「环已烷→环己烷」「ν→n」当成同一个危害，差一个字可能就是另一种危害，容易误判。现在只认套餐名里实际写出的内容，一个字都不替它改。<br>
+          <b>v4.10.0</b> 改成"推开"式侧栏，不再遮挡页面：<br>
+          ・<b>展开时页面整体让位</b>：面板占住窗口右侧，页面内容（列表、表格）自动向左让出同宽，不会再被压在面板底下；收起后页面立刻复原。<br>
+          ・<b>二层弹窗同样让位</b>：编辑弹窗打开时也跟着左移（窗口宽于 1240px 才挤弹窗，太窄时不动它，免得弹窗内部变形），弹窗右半边不会再被面板盖住。<br>
+          ・<b>面板收成一条窄栏</b>：宽 <code>clamp(330px, 25vw, 420px)</code>（原来最宽 820px），操作区在上、结果区在下，结果再多也只在自己的框里滚，不用占掉半个屏幕。<br>
+          ・左右停靠照样可配；贴边不留缝，靠内一侧才圆角。<br>
+          <b>v4.9.0</b> 改成侧边竖条 + 左右展开：<br>
+          ・<b>默认收成一条竖条</b>：贴在窗口边缘中部，竖排写「套餐危害核对」，不占版面、不挡表格；点它才展开完整面板。<br>
+          ・<b>展开方向可配置</b>：配置页顶部「面板停靠」可选「靠左展开 / 靠右展开」，记住你的选择 —— 左侧工具多就靠右，右侧操作多就靠左。<br>
+          ・<b>宽度跟着窗口走</b>：面板宽 <code>clamp(420px, 46vw, 820px)</code>、高 <code>min(760px, 100vh - 100px)</code>，缩小浏览器不会顶出可视区；面板本身窄于 720px 时上下堆叠成单栏。<br>
+          ・<b>不再嵌进页面内容区</b>：内嵌那版会被页面弹窗的遮罩整块盖住（日常是在二层页面里用），现在回到浮层，但收起来只有一条竖条，不影响页面布局。<br>
+          <b>v4.7.2</b> 内嵌进页面 + 差异照实报：<br>
+          ・<b>不再是悬浮窗</b>：工具直接嵌在页面内容区顶部，宽度跟着页面走，缩放浏览器、展开左侧菜单都不会再挤坏布局；窗口窄于 900px 时两栏自动收成一栏。<br>
+          ・顶部「−」折叠成一条标题条，「×」可把整块收走（右侧留一个小胶囊叫回来），两种都不占太多版面。<br>
+          ・<b>去掉「写法不一致」这种第三态</b>：名称写合并条目、系统只选了其中几项时，以前单独归一组、看着像只提示不处理；现在按正常判定走 —— <b>名称有系统没有 ⇒ 匹配缺失</b>，<b>系统有名称没有 ⇒ 危害多出</b>，两边各自列清楚。<br>
+          ・唯一保留的内部消化：一边写合并条目、另一边把它的分项<b>全选齐</b> ⇒ 算匹配（含义完全相同，只是写法不同）。<br>
+          <b>v4.7.1</b> 合并条目按「一条」比，不再拆成分项：<br>
+          ・以前把「三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）」展开成 3 个分项去比，系统只选了其中 2 项时会报「匹配缺失：重铬酸盐（按 Cr 计）」—— 可名称里根本没单独写过这一项，属误报。现在两边都按"条"比：<b>没被 + 分隔符切开的整段就是一个危害</b>。<br>
+          ・判定改成：两边写同一条 ⇒ 匹配；一边写合并条目、另一边把它的分项<b>全选齐</b> ⇒ 也算匹配（含义相同，只是写法不同）。<br>
+          <b>v4.7.0</b> 界面翻新 + 分隔符可配置：<br>
+          ・<b>布局从「一根长条」改成左右分栏</b>：左边是操作与概览（开始核对 / 清除高亮 / 打开配置 / 统计 / 说明），右边专放核对结果，窗口默认加宽到 820px（可拖右边框调宽），结果再多也不用一路往下滚。老版本存下来的窄宽度会自动升到这个默认宽，不用手动拖。<br>
+          ・<b>新增「⚙ 配置」视图</b>（面板右上角齿轮，或左侧「打开配置」）：分隔符、匹配规则、排除项、无关内容、无关关键词五个页签集中在一个配置页里，看完点「← 返回核对」。<br>
+          ・<b>危害分隔符可配置</b>，默认「+」。只有配置里的符号才把套餐名称拆成多个危害，没配的符号（、 ， ； / 等）一律当名称的一部分 —— 不再靠猜各种符号。<b>拆不出来的整段按「名称异常」处理</b>，交人工判断。<br>
+          ・<b>合并条目不再被拆散</b>：「三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）」整条按一个危害核对；若只写了其中两项（「三氧化铬、铬酸盐」或「三氧化铬,铬酸盐」），整段当一个整体、不拆分，并在该行标「名称异常｜缺 重铬酸盐（按 Cr 计）」，不自动补全。<br>
+          ・汇总里新增「疑似漏写」计数（合并条目怎么比，见 v4.7.1）。<br>
+          <b>v4.6.5</b> 拆分不再被名称里的符号带偏：系统字典里「三氧化铬、铬酸盐、重铬酸盐（按 Cr 计）」这类本身带顿号、逗号的标准名，以前会被拆成三个危害（三项还带着各自的括号写法），现在先整体占位保护、拆完再还原，整条按一个危害核对；名称尾部括号可省略（套餐里常写得短一截）。<br>
           <b>v4.6.4</b> 标准危害名称库按系统最新字典（危害因素下拉 681 项 / 去重 679 条）重新对了一遍：新增「氨基乙基乙醇胺」「金属镍与难溶性镍化合物」，删掉系统里已经没有的「有机粉尘」。匹配库（别名 62 条）左侧写法不动，右侧标准名逐条比对系统库 —— 全部命中，无需改。<br>
           <b>v4.6.3</b> 去掉常驻的「静默直写」勾选框和那四行实现说明：它本来就是默认值，不需要每次点开确认，模式从"有没有弹窗、有没有进度背景"一眼就能看出来。真要肉眼对照时，按住 <code>Alt</code> 点「批量核对补齐本页」切换，状态记在本地，切换结果只用一句短提示告知。<br>
           <b>v4.6.2</b> 收尾不再"啪"一下消失：跑到 100% 后进度背景先切成完成态（标题换成结果、收起停止按钮、圆点由呼吸变定格、原「正在处理」那一行换成本次汇总），原地停 2 秒再淡出，把汇总交回右下角小卡片；「在途 / 待补试」在收尾时换成一句定论。同时精简脚本开头的说明，清掉 2 个早就没人调用的死函数与 2 个没用上的配置项。<br>
@@ -3312,14 +4144,93 @@
           <b>v4.3.1</b> 批量单窗轮播：整批只开一次编辑弹窗、逐条换内容（页面那个弹窗关掉即整棵销毁，再开要重建 680+ 条危害的树）。<br>
           <b>v4.3</b> 数据层直写：批量与单个"一键补齐"不再模拟"展开树 → 输搜索词 → 等候选 → 逐项点选"这套交互，直接写表单模型后调页面保存；单个"一键补齐"仍在弹窗内进行、行为不变。
         </div>
-        </div>
       </details>
+      </aside>
+
+      <!-- v4.10.4 上下占比拖动条（单栏时显示，双击复位） -->
+      <div class="tool-splitter" title="上下拖动调整「操作区 / 核对结果」的占比，双击复位"></div>
+
+      <main class="tool-main">
+        <div class="tool-main-bar">
+          <span class="tool-main-title">核对结果</span>
+          <button class="tool-action tool-copy-all" type="button">复制全部缺失名称</button>
+        </div>
+        <div class="tool-toast"></div>
+        <div class="tool-results"></div>
+      </main>
     </div>
+
+    <div class="tool-settings-view">
+      <div class="tool-settings-bar">
+        <span class="tool-settings-title">配置</span>
+        <button class="tool-settings-back" type="button">← 返回核对</button>
+      </div>
+
+      <div class="tool-dock-row">
+        <span class="tool-dock-label">面板停靠</span>
+        <button class="tool-dock-button" type="button" data-dock-side="left">← 靠左展开</button>
+        <button class="tool-dock-button" type="button" data-dock-side="right">靠右展开 →</button>
+      </div>
+
+      <div class="tool-reference-buttons">
+        <button class="tool-reference-button" type="button" data-reference-panel="separator">分隔符</button>
+        <button class="tool-reference-button" type="button" data-reference-panel="aliases">匹配规则</button>
+        <button class="tool-reference-button" type="button" data-reference-panel="exclusions">排除项</button>
+        <button class="tool-reference-button" type="button" data-reference-panel="ignores">无关内容</button>
+        <button class="tool-reference-button" type="button" data-reference-panel="ignore-keywords">无关关键词</button>
+      </div>
+
+      <div class="tool-reference-panels"></div>
+    </div>
+
     <div class="tool-resize-handle" title="按住并左右拖动调整窗口宽度"></div>
     <div class="tool-height-resize-handle" title="按住底边上下拖动调整窗口高度"></div>
   `;
-  document.body.appendChild(tool);
-  tool.style.display = "none";
+  /*
+   * 停靠式抽屉：面板是 fixed 定位，挂在 body 下就行 —— 这样无论页面怎么重渲染、
+   * 弹窗怎么开合，它都浮在最上层，能直接操作；不像内嵌会被弹窗遮罩盖住。
+   */
+  function mountTool() {
+    if (tool.parentElement === document.body && tool.isConnected) return true;
+    document.body.appendChild(tool);
+    return true;
+  }
+
+  mountTool();
+
+  /* 页面是 Vue SPA，路由切换时可能把 body 上的节点一起清掉，盯着补回来 */
+  let remountFrame = 0;
+  const mountObserver = new MutationObserver(() => {
+    if (remountFrame) return;
+    remountFrame = requestAnimationFrame(() => {
+      remountFrame = 0;
+      if (destroyed || tool.isConnected) return;
+      mountTool();
+    });
+  });
+  mountObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+
+  /*
+   * 宽度不够就切单栏。用面板自己的宽度判断（而不是窗口宽度），
+   * 所以左侧菜单展开、右侧面板挤占时也能正确塌缩。
+   */
+  const NARROW_PANEL_WIDTH = 620;
+  /* v4.10.4 拖宽时不能让 ResizeObserver 的回调时机说了算（它会晚一拍），
+     这里按实际宽度立即判定，updatePageReserve 里也会顺带调一次 */
+  function syncNarrowClass() {
+    const width = tool.getBoundingClientRect().width;
+    if (!width) return;
+    tool.classList.toggle("is-narrow", width < NARROW_PANEL_WIDTH);
+  }
+  const panelWidthObserver = new ResizeObserver(() => {
+    syncNarrowClass();
+    /* 面板宽度随窗口变化时，页面让出的宽度也要跟着变 */
+    updatePageReserve();
+  });
+  panelWidthObserver.observe(tool);
 
   const launcher = document.createElement("button");
   launcher.id = LAUNCHER_ID;
@@ -3327,37 +4238,37 @@
   launcher.title = "点击打开套餐危害因素核对工具";
   launcher.innerHTML = `
     <span class="launcher-icon">核</span>
-    <span class="launcher-text">打开套餐核对</span>
+    <span class="launcher-text">危害匹配-开</span>
   `;
   document.body.appendChild(launcher);
 
   const runButton = tool.querySelector(".tool-run");
   const clearButton = tool.querySelector(".tool-clear");
   const copyAllButton = tool.querySelector(".tool-copy-all");
-  const collapseButton = tool.querySelector(".tool-collapse");
-  const closeButton = tool.querySelector(".tool-close");
+  const edgeCollapseButton = tool.querySelector(".tool-edge-collapse");
   const toolBody = tool.querySelector(".tool-body");
   const stickyZone = tool.querySelector(".tool-sticky-zone");
   const summaryBox = tool.querySelector(".tool-summary");
+  const settingsView = tool.querySelector(".tool-settings-view");
+  const settingsBackButton = tool.querySelector(".tool-settings-back");
+  const settingsButtons = [...tool.querySelectorAll(".tool-open-settings")];
+  const resultsScrollBox = tool.querySelector(".tool-results");
   const toastBox = tool.querySelector(".tool-toast");
   const resultsBox = tool.querySelector(".tool-results");
+  const miniStatusBox = tool.querySelector(".tool-mini-status");
+  const miniRunButton = tool.querySelector(".tool-mini-run");
+  const dockSideButtons = [...tool.querySelectorAll(".tool-dock-button")];
+
+  /* 折叠成一条时，状态摘要同步显示在标题条上 */
+  function syncMiniStatus(text) {
+    if (miniStatusBox) miniStatusBox.textContent = text || "等待核对";
+  }
   const referenceButtons = [
     ...tool.querySelectorAll(".tool-reference-button")
   ];
   const referencePanelsBox =
     tool.querySelector(".tool-reference-panels");
   const dragHandle = tool.querySelector(".tool-header");
-  const resizeHandle = tool.querySelector(".tool-resize-handle");
-  const heightResizeHandle =
-    tool.querySelector(".tool-height-resize-handle");
-  const MIN_TOOL_WIDTH = 360;
-  const MIN_VIEWPORT_TOOL_WIDTH = 260;
-  const MIN_TOOL_HEIGHT = 320;
-  const MIN_VIEWPORT_TOOL_HEIGHT = 220;
-  let expandedToolHeight = Math.min(
-    680,
-    Math.max(MIN_TOOL_HEIGHT, innerHeight - 105)
-  );
   let latestMissingNames = [];
   let latestMismatchByCode = new Map();
   let latestBatchCandidates = [];
@@ -3390,6 +4301,7 @@
     summaryBox.textContent = text;
     summaryBox.style.background = selected[0];
     summaryBox.style.color = selected[1];
+    syncMiniStatus(text);
   }
 
   function renderSummaryOverview(stats) {
@@ -3399,6 +4311,7 @@
       packageMissingPackageCount,
       cellExtraPackageCount,
       unresolvedNameCount,
+      suspectCount,
       stageIssueCount,
       parseErrorCount,
       batchCandidateCount
@@ -3420,16 +4333,19 @@
       statusText =
         `匹配缺失 ${packageMissingPackageCount} 个套餐，` +
         `危害多出 ${cellExtraPackageCount} 个套餐；` +
+        (suspectCount ? `疑似漏写 ${suspectCount} 个套餐；` : "") +
         `岗位异常 ${stageIssueCount} 个套餐。`;
     } else if (
       unresolvedNameCount ||
-      parseErrorCount
+      parseErrorCount ||
+      suspectCount
     ) {
       statusClass = "warning";
       statusIcon = "!";
       statusTitle = "仍有名称需要人工判断";
       statusText =
         `待处理名称 ${unresolvedNameCount} 项，` +
+        (suspectCount ? `疑似漏写 ${suspectCount} 个套餐，` : "") +
         `无法解析 ${parseErrorCount} 个套餐，` +
         `岗位异常 ${stageIssueCount} 个套餐。`;
     } else if (stageIssueCount > 0) {
@@ -3442,6 +4358,12 @@
 
     summaryBox.style.background = "#fff";
     summaryBox.style.color = "#303133";
+    /* 折叠成一条时，标题条上只放短结论 */
+    syncMiniStatus(
+      hasDifference
+        ? `缺失 ${packageMissingPackageCount} · 多出 ${cellExtraPackageCount}`
+        : statusTitle
+    );
     summaryBox.innerHTML = `
       <div class="summary-status ${statusClass}">
         <div class="summary-status-icon">${statusIcon}</div>
@@ -3667,19 +4589,17 @@
     }
 
     requestAnimationFrame(() => {
-      const bodyRect = toolBody.getBoundingClientRect();
-      const stickyHeight =
-        stickyZone?.getBoundingClientRect().height || 0;
+      // v4.7 起结果区自己滚动（左侧是固定操作栏）
+      const boxRect = resultsScrollBox.getBoundingClientRect();
       const targetRect = target.getBoundingClientRect();
 
       const nextTop =
-        toolBody.scrollTop +
+        resultsScrollBox.scrollTop +
         targetRect.top -
-        bodyRect.top -
-        stickyHeight -
+        boxRect.top -
         10;
 
-      toolBody.scrollTo({
+      resultsScrollBox.scrollTo({
         top: Math.max(0, nextTop),
         behavior: "smooth"
       });
@@ -4243,7 +5163,7 @@
     resultsBox.appendChild(section);
   }
 
-  let activeReferencePanel = "";
+  let activeReferencePanel = "separator";
 
   function makeRuleCodeRow(
     codeText,
@@ -4348,6 +5268,152 @@
       });
   }
 
+  function openSettings() {
+    renderRuleManager();
+
+    if (!activeReferencePanel) {
+      activeReferencePanel = "separator";
+    }
+
+    updateReferencePanelVisibility();
+    tool.classList.add("is-settings");
+    settingsView.scrollTop = 0;
+  }
+
+  function closeSettings() {
+    tool.classList.remove("is-settings");
+  }
+
+  /*
+   * 分隔符配置面板（v4.7）
+   *
+   * 只有这里配的符号才拆危害；没配的符号一律当名称的一部分。
+   * 写不出完整名称的整段按「异常」提示，不猜、不拆。
+   */
+  function buildSeparatorPanel() {
+    const { panel, body } = createReferencePanel(
+      "separator",
+      "分隔符",
+      hazardSeparators || "（空）",
+      "只有这里配的符号才会把套餐名称拆成多个危害；没配的符号（、 ， ； / 等）一律当名称的一部分，不参与拆分。"
+    );
+
+    const field = document.createElement("div");
+    field.className = "separator-field";
+
+    const label = document.createElement("div");
+    label.className = "separator-label";
+    label.textContent = "危害之间的分隔符";
+    field.appendChild(label);
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "separator-input";
+    input.value = hazardSeparators;
+    input.placeholder = DEFAULT_HAZARD_SEPARATORS;
+    input.setAttribute("spellcheck", "false");
+    field.appendChild(input);
+
+    const hint = document.createElement("div");
+    hint.className = "separator-hint";
+    hint.textContent =
+      "默认「+」。要同时认多种写法就写多个字符，例如「+、」表示 + 和 、 都算分隔符（＋ 与 + 等价）。";
+    field.appendChild(hint);
+
+    const checkLabel = document.createElement("label");
+    checkLabel.className = "separator-check";
+
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = hazardSeparatorGuess;
+
+    const checkText = document.createElement("span");
+    checkText.textContent =
+      "整段没有出现上面的分隔符时，仍按旧规则自动识别其它符号（默认关闭；开启后会去猜 、 ， ； / 这些，容易把名称拆坏）";
+
+    checkLabel.appendChild(check);
+    checkLabel.appendChild(checkText);
+    field.appendChild(checkLabel);
+
+    const preview = document.createElement("div");
+    preview.className = "separator-preview";
+    field.appendChild(preview);
+
+    const sample =
+      "氢氧化钠+三氧化铬、铬酸盐、重铬酸盐+岗中";
+
+    const renderPreview = () => {
+      const separators = new Set([...input.value]);
+      const parts = [];
+      let buffer = "";
+
+      for (const char of sample) {
+        if (separators.has(char)) {
+          if (buffer.trim()) parts.push(buffer.trim());
+          buffer = "";
+          continue;
+        }
+
+        buffer += char;
+      }
+
+      if (buffer.trim()) parts.push(buffer.trim());
+
+      preview.textContent =
+        `示例：${sample}　→　${parts.length} 段：${parts.join(" ／ ") || "（不拆分）"}`;
+    };
+
+    input.addEventListener("input", renderPreview);
+    check.addEventListener("change", renderPreview);
+    renderPreview();
+
+    const actions = document.createElement("div");
+    actions.className = "separator-actions";
+
+    const saveButton = document.createElement("button");
+    saveButton.type = "button";
+    saveButton.className = "separator-save";
+    saveButton.textContent = "保存";
+    saveButton.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      // 空白字符不参与（避免误把空格当分隔符）
+      const chars = input.value.replace(/[\s\u3000]/g, "");
+
+      saveSeparatorConfig(chars, check.checked);
+      renderRuleManager();
+      updateReferencePanelVisibility();
+
+      showToast(
+        `分隔符已保存：${chars || "（空，不拆分）"}` +
+        (check.checked ? "；并保留旧规则兜底" : "")
+      );
+    });
+
+    const resetButton = document.createElement("button");
+    resetButton.type = "button";
+    resetButton.className = "separator-reset";
+    resetButton.textContent = "恢复默认";
+    resetButton.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      saveSeparatorConfig(DEFAULT_HAZARD_SEPARATORS, false);
+      renderRuleManager();
+      updateReferencePanelVisibility();
+      showToast("分隔符已恢复默认：+");
+    });
+
+    actions.appendChild(saveButton);
+    actions.appendChild(resetButton);
+    field.appendChild(actions);
+
+    body.appendChild(field);
+
+    return { panel, body };
+  }
+
   function renderRuleManager() {
     const aliasEntries = getAllAliasEntriesForDisplay();
     const exclusionEntries = getExclusionEntriesForDisplay();
@@ -4365,6 +5431,10 @@
         .length;
 
     referencePanelsBox.innerHTML = "";
+
+    referencePanelsBox.appendChild(
+      buildSeparatorPanel().panel
+    );
 
     const aliasPanel = createReferencePanel(
       "aliases",
@@ -4523,6 +5593,7 @@
     );
 
     const buttonLabels = {
+      separator: "分隔符",
       aliases:
         `匹配规则 ${aliasEntries.length}` +
         (pendingAliasCount ? ` +${pendingAliasCount}` : ""),
@@ -10421,8 +11492,6 @@
       resultsBox.appendChild(details);
     }
 
-
-
     if (parseErrors.length) {
       const details = document.createElement("details");
       details.className = "result-group parse-error";
@@ -10500,6 +11569,7 @@
     let matchedCount = 0;
     let packageMissingPackageCount = 0;
     let cellExtraPackageCount = 0;
+    let suspectCount = 0;
 
     const differences = [];
     const stageIssues = [];
@@ -10604,7 +11674,37 @@
           cellHazards
         );
 
-        if (!comparison.isMatched) {
+        /*
+         * 只写了合并条目的一部分：不自动补全、也不拆成两个独立危害。
+         * 这一段整体当成「名称异常」交给人工 —— 跳过差异判定，
+         * 否则会因为这一整段没进比对而误报「危害多出」。
+         */
+        const suspectHazards =
+          packageResult.suspectHazards || [];
+
+        /*
+         * 合并条目写在一侧、另一侧只录了其中几项分项：
+         * 不再单设「写法不一致」——照实报，名称有系统没有的算缺失，
+         * 系统有名称没有的算多出，两边各自列清楚，由人来统一写法。
+         */
+        if (suspectHazards.length) {
+          suspectCount++;
+
+          markStageIssue(
+            hazardCell,
+            suspectHazards
+              .map(suspect =>
+                "名称异常｜「" +
+                suspect.raw +
+                "」按一个整体看，不拆分；系统整条名称是「" +
+                suspect.composite +
+                "」，缺「" +
+                suspect.missing.join("、") +
+                "」—— 请确认是有意省略还是漏写"
+              )
+              .join("；")
+          );
+        } else if (!comparison.isMatched) {
           const result = {
             ...resultBase,
             packageHazards: packageResult.hazards,
@@ -10632,10 +11732,11 @@
         }
 
         // “完全匹配”必须同时满足：
-        // 标准危害双向一致，并且套餐名称中没有尚未处理的名称。
+        // 标准危害双向一致、没有未处理名称、没有疑似漏写。
         if (
           comparison.isMatched &&
-          packageResult.unresolvedHazards.length === 0
+          packageResult.unresolvedHazards.length === 0 &&
+          !suspectHazards.length
         ) {
           matchedCount++;
         }
@@ -10788,6 +11889,7 @@
       packageMissingPackageCount,
       cellExtraPackageCount,
       unresolvedNameCount: unresolvedEntries.length,
+      suspectCount,
       stageIssueCount: stageIssues.length,
       parseErrorCount: parseErrors.length,
       batchCandidateCount: batchCandidates.length
@@ -10796,282 +11898,271 @@
 
   const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
-  function getViewportWidthLimit() {
-    return Math.max(MIN_VIEWPORT_TOOL_WIDTH, innerWidth - 8);
+  /*
+   * 停靠方向（左 / 右）记在本地；展开与否不记 —— 每次打开页面都从"收起的竖条"开始。
+   */
+  const DOCK_SIDE_KEY = "dime-hazard-dock-side-v1";
+  let dockSide = "right";
+  let panelOpen = false;
+
+  /*
+   * v4.10.4 面板尺寸记忆：宽度（拖左/右边缘）与上下占比（拖中间横条）。
+   * 0 表示"没设过，用样式表里的默认值"，这样换机器、换分辨率也不会被旧值卡住。
+   */
+  const PANEL_WIDTH_KEY = "dime-hazard-panel-width-v1";
+  const SIDE_HEIGHT_KEY = "dime-hazard-side-h-v1";
+
+  function readSavedNumber(key, min, max) {
+    try {
+      const value = Number(localStorage.getItem(key));
+      if (Number.isFinite(value) && value >= min && value <= max) return value;
+    } catch (_) {}
+    return 0;
   }
 
-  function applySavedPosition() {
+  function rememberNumber(key, value) {
     try {
-      const saved = JSON.parse(localStorage.getItem(POSITION_KEY) || "null");
-      if (!saved) return;
-
-      const viewportWidthLimit = getViewportWidthLimit();
-      const minimumWidth = Math.min(MIN_TOOL_WIDTH, viewportWidthLimit);
-
-      if (Number.isFinite(saved.width)) {
-        tool.style.width =
-          clamp(saved.width, minimumWidth, viewportWidthLimit) + "px";
-      }
-
-      const viewportHeightLimit = Math.max(
-        MIN_VIEWPORT_TOOL_HEIGHT,
-        innerHeight - 8
-      );
-      const minimumHeight = Math.min(
-        MIN_TOOL_HEIGHT,
-        viewportHeightLimit
-      );
-
-      if (Number.isFinite(saved.height)) {
-        expandedToolHeight = clamp(
-          saved.height,
-          minimumHeight,
-          viewportHeightLimit
-        );
-      } else {
-        expandedToolHeight = clamp(
-          expandedToolHeight,
-          minimumHeight,
-          viewportHeightLimit
-        );
-      }
-
-      tool.style.height = expandedToolHeight + "px";
-      setCollapsed(saved.collapsed === true, false);
-
-      if (!Number.isFinite(saved.left) || !Number.isFinite(saved.top)) return;
-
-      const maxLeft = Math.max(0, innerWidth - tool.offsetWidth);
-      const maxTop = Math.max(0, innerHeight - tool.offsetHeight);
-      tool.style.left = clamp(saved.left, 0, maxLeft) + "px";
-      tool.style.top = clamp(saved.top, 0, maxTop) + "px";
-      tool.style.right = "auto";
+      if (value) localStorage.setItem(key, String(value));
+      else localStorage.removeItem(key);
     } catch (_) {}
   }
 
-  function savePosition() {
-    try {
-      const rect = tool.getBoundingClientRect();
-      localStorage.setItem(POSITION_KEY, JSON.stringify({
-        left: Math.round(rect.left),
-        top: Math.round(rect.top),
-        width: Math.round(rect.width),
-        height: Math.round(expandedToolHeight),
-        collapsed: tool.classList.contains("is-collapsed")
-      }));
-    } catch (_) {}
+  let customWidth = readSavedNumber(PANEL_WIDTH_KEY, 280, 1400);
+  let sideHeight = readSavedNumber(SIDE_HEIGHT_KEY, 90, 4000);
+
+  if (customWidth) tool.style.setProperty("--dime-hazard-panel-w", customWidth + "px");
+  if (sideHeight) {
+    tool.style.setProperty("--dime-hazard-side-h", sideHeight + "px");
+    tool.style.setProperty("--dime-hazard-side-max", "none");
   }
 
-  function setCollapsed(collapsed, shouldSave = true) {
-    tool.classList.toggle("is-collapsed", !!collapsed);
-    collapseButton.textContent = collapsed ? "+" : "−";
-    collapseButton.title = collapsed ? "展开工具" : "折叠工具";
-    collapseButton.setAttribute("aria-expanded", String(!collapsed));
+  /*
+   * 展开 = 把页面内容整块推走：给 #app 让出与面板等宽的 padding，
+   * 二层页面的 dialog / drawer 容器同样收窄，弹窗就跟页面一起左移，不会被面板压住。
+   */
+  function updatePageReserve() {
+    const root = document.documentElement;
+    const isLeft = dockSide === "left";
+    syncNarrowClass();
+    root.classList.toggle("dime-hazard-push-right", panelOpen && !isLeft);
+    root.classList.toggle("dime-hazard-push-left", panelOpen && isLeft);
 
-    if (collapsed) {
-      toolBody.scrollTop = 0;
-    } else {
-      tool.style.height = expandedToolHeight + "px";
+    const width = panelOpen ? Math.round(tool.getBoundingClientRect().width) : 0;
+    if (width > 0) root.style.setProperty("--dime-hazard-reserve", width + "px");
+    else root.style.removeProperty("--dime-hazard-reserve");
+
+    updatePanelPlacement();
+  }
+
+  /*
+   * 展开时如果页面上正好开着编辑弹窗（日常的二层页面），就把面板贴到弹窗同侧边缘，
+   * 宽度不够就缩窄 —— 弹窗不动、也不被盖住。没有弹窗时清掉内联样式，回到 CSS 的贴边位置。
+   */
+  function updatePanelPlacement() {
+    if (!panelOpen) return;
+
+    let dialogRect = null;
+
+    if (typeof findVisibleEditDialogs === "function") {
+      const dialog = findVisibleEditDialogs()[0];
+      if (dialog) {
+        const rect = dialog.getBoundingClientRect();
+        if (rect.width >= 300 && rect.height >= 200) dialogRect = rect;
+      }
     }
 
-    const rect = tool.getBoundingClientRect();
-    const maxTop = Math.max(0, innerHeight - rect.height);
-    tool.style.top = clamp(rect.top, 0, maxTop) + "px";
-    if (shouldSave) savePosition();
+    if (!dialogRect) {
+      tool.style.width = "";
+      tool.style.left = "";
+      tool.style.right = "";
+      return;
+    }
+
+    const gap = 10;
+    const isLeft = dockSide === "left";
+    const baseWidth = customWidth
+      ? clamp(customWidth, 300, Math.max(360, window.innerWidth - 320))
+      : Math.min(420, Math.max(330, Math.round(window.innerWidth * 0.24)));
+    const rightLimit = Math.max(330, window.innerWidth - 8);
+
+    let width = baseWidth;
+    let left = isLeft
+      ? dialogRect.left - gap - width
+      : dialogRect.right + gap;
+
+    if (!isLeft && left + width > rightLimit) {
+      width = Math.max(330, rightLimit - left - 4);
+      if (left + width > rightLimit) left = Math.max(8, rightLimit - width);
+    }
+    if (isLeft && left < 8) {
+      width = Math.max(330, Math.min(baseWidth, dialogRect.left - gap - 12));
+      left = Math.max(8, dialogRect.left - gap - width);
+    }
+
+    tool.style.width = Math.round(width) + "px";
+    tool.style.left = Math.round(left) + "px";
+    tool.style.right = "auto";
+  }
+
+  function clearPageReserve() {
+    const root = document.documentElement;
+    root.classList.remove("dime-hazard-push-left", "dime-hazard-push-right");
+    root.style.removeProperty("--dime-hazard-reserve");
+  }
+
+  function applyDockSide(side) {
+    if (side === "left" || side === "right") dockSide = side;
+
+    const isLeft = dockSide === "left";
+    tool.classList.toggle("dock-left", isLeft);
+    tool.classList.toggle("dock-right", !isLeft);
+    launcher.classList.toggle("dock-left", isLeft);
+    launcher.classList.toggle("dock-right", !isLeft);
+
+    dockSideButtons.forEach(button => {
+      button.classList.toggle("is-active", button.dataset.dockSide === dockSide);
+    });
+
+    updatePageReserve();
+  }
+
+  function readDockSide() {
+    try {
+      const saved = localStorage.getItem(DOCK_SIDE_KEY);
+      if (saved === "left" || saved === "right") dockSide = saved;
+    } catch (_) {}
+    applyDockSide(dockSide);
+  }
+
+  function saveDockSide() {
+    try {
+      localStorage.setItem(DOCK_SIDE_KEY, dockSide);
+    } catch (_) {}
+  }
+
+  /* ===== v4.10.4 拖动：左右调宽（边缘那条感应带）+ 上下调占比（中间横条） ===== */
+  const panelResizeHandle = tool.querySelector(".tool-resize-handle");
+  const splitterBar = tool.querySelector(".tool-splitter");
+  const toolSideColumn = tool.querySelector(".tool-side");
+  const toolBodyBox = tool.querySelector(".tool-body");
+
+  function startDrag(event, onMove, onEnd) {
+    event.preventDefault();
+    const move = moveEvent => onMove(moveEvent);
+    const up = () => {
+      document.removeEventListener("mousemove", move, true);
+      document.removeEventListener("mouseup", up, true);
+      onEnd();
+    };
+    document.addEventListener("mousemove", move, true);
+    document.addEventListener("mouseup", up, true);
+  }
+
+  if (panelResizeHandle) {
+    panelResizeHandle.addEventListener("mousedown", event => {
+      if (event.button !== 0) return;
+      const startX = event.clientX;
+      const startWidth = tool.getBoundingClientRect().width;
+      const isLeft = dockSide === "left";
+      /* 最宽不超过窗口的 62%，也不把页面挤到 320px 以下 */
+      const maxWidth = Math.max(360, Math.min(1000, window.innerWidth - 320));
+
+      tool.classList.add("is-resizing");
+      startDrag(event, moveEvent => {
+        const delta = isLeft
+          ? moveEvent.clientX - startX
+          : startX - moveEvent.clientX;
+        customWidth = Math.round(clamp(startWidth + delta, 300, maxWidth));
+        tool.style.setProperty("--dime-hazard-panel-w", customWidth + "px");
+        updatePageReserve();
+      }, () => {
+        tool.classList.remove("is-resizing");
+        customWidth = Math.round(tool.getBoundingClientRect().width);
+        rememberNumber(PANEL_WIDTH_KEY, customWidth);
+      });
+    });
+
+    /* 双击边缘 = 宽度复位 */
+    panelResizeHandle.addEventListener("dblclick", () => {
+      customWidth = 0;
+      tool.style.removeProperty("--dime-hazard-panel-w");
+      rememberNumber(PANEL_WIDTH_KEY, 0);
+      updatePageReserve();
+    });
+  }
+
+  if (splitterBar && toolSideColumn && toolBodyBox) {
+    splitterBar.addEventListener("mousedown", event => {
+      if (event.button !== 0) return;
+      const startY = event.clientY;
+      const startHeight = toolSideColumn.getBoundingClientRect().height;
+
+      tool.style.setProperty("--dime-hazard-side-max", "none");
+      tool.classList.add("is-split-dragging");
+      startDrag(event, moveEvent => {
+        const maxHeight = Math.max(
+          140,
+          toolBodyBox.getBoundingClientRect().height - 150
+        );
+        sideHeight = Math.round(
+          clamp(startHeight + moveEvent.clientY - startY, 110, maxHeight)
+        );
+        tool.style.setProperty("--dime-hazard-side-h", sideHeight + "px");
+      }, () => {
+        tool.classList.remove("is-split-dragging");
+        sideHeight = Math.round(toolSideColumn.getBoundingClientRect().height);
+        rememberNumber(SIDE_HEIGHT_KEY, sideHeight);
+      });
+    });
+
+    /* 双击横条 = 占比复位（回到 44vh） */
+    splitterBar.addEventListener("dblclick", () => {
+      sideHeight = 0;
+      tool.style.removeProperty("--dime-hazard-side-h");
+      tool.style.removeProperty("--dime-hazard-side-max");
+      rememberNumber(SIDE_HEIGHT_KEY, 0);
+    });
+  }
+
+  /* 面板里的「−」= 收起成竖条，和点竖条展开是一对 */
+  function setCollapsed(collapsed) {
+    if (collapsed) hideToolPanel();
+    else showToolPanel();
   }
 
   function toggleCollapsed() {
-    setCollapsed(!tool.classList.contains("is-collapsed"));
+    setCollapsed(panelOpen);
   }
-
-  let dragging = false;
-  let resizing = false;
-  let heightResizing = false;
-  let startMouseX = 0;
-  let startMouseY = 0;
-  let startLeft = 0;
-  let startTop = 0;
-  let resizeStartX = 0;
-  let resizeStartWidth = 0;
-  let resizeStartLeft = 0;
-  let heightResizeStartY = 0;
-  let heightResizeStartHeight = 0;
-  let heightResizeStartTop = 0;
-
-  dragHandle.addEventListener("mousedown", event => {
-    if (event.target.closest(".tool-header-button")) return;
-    const rect = tool.getBoundingClientRect();
-    dragging = true;
-    resizing = false;
-    startMouseX = event.clientX;
-    startMouseY = event.clientY;
-    startLeft = rect.left;
-    startTop = rect.top;
-    tool.style.left = rect.left + "px";
-    tool.style.top = rect.top + "px";
-    tool.style.right = "auto";
-    tool.classList.add("is-dragging");
-    event.preventDefault();
-  });
-
-  resizeHandle.addEventListener("mousedown", event => {
-    if (event.button !== 0) return;
-    const rect = tool.getBoundingClientRect();
-    resizing = true;
-    heightResizing = false;
-    dragging = false;
-    resizeStartX = event.clientX;
-    resizeStartWidth = rect.width;
-    resizeStartLeft = rect.left;
-    tool.style.left = rect.left + "px";
-    tool.style.top = rect.top + "px";
-    tool.style.right = "auto";
-    tool.classList.add("is-resizing");
-    event.preventDefault();
-    event.stopPropagation();
-  });
-
-
-  heightResizeHandle.addEventListener("mousedown", event => {
-    if (event.button !== 0) return;
-    if (tool.classList.contains("is-collapsed")) return;
-
-    const rect = tool.getBoundingClientRect();
-    heightResizing = true;
-    resizing = false;
-    dragging = false;
-    heightResizeStartY = event.clientY;
-    heightResizeStartHeight = rect.height;
-    heightResizeStartTop = rect.top;
-    tool.style.left = rect.left + "px";
-    tool.style.top = rect.top + "px";
-    tool.style.right = "auto";
-    tool.classList.add("is-height-resizing");
-    event.preventDefault();
-    event.stopPropagation();
-  });
-
-  document.addEventListener("mousemove", event => {
-    if (heightResizing) {
-      const availableHeight = Math.max(
-        MIN_VIEWPORT_TOOL_HEIGHT,
-        innerHeight - heightResizeStartTop - 4
-      );
-      const minimumHeight = Math.min(
-        MIN_TOOL_HEIGHT,
-        availableHeight
-      );
-      const wantedHeight =
-        heightResizeStartHeight +
-        event.clientY -
-        heightResizeStartY;
-
-      expandedToolHeight = clamp(
-        wantedHeight,
-        minimumHeight,
-        availableHeight
-      );
-      tool.style.height = expandedToolHeight + "px";
-      return;
-    }
-
-    if (resizing) {
-      const viewportLimit = getViewportWidthLimit();
-      const availableWidth = Math.max(
-        MIN_VIEWPORT_TOOL_WIDTH,
-        Math.min(viewportLimit, innerWidth - resizeStartLeft)
-      );
-      const minimumWidth = Math.min(MIN_TOOL_WIDTH, availableWidth);
-      const wantedWidth = resizeStartWidth + event.clientX - resizeStartX;
-      tool.style.width = clamp(wantedWidth, minimumWidth, availableWidth) + "px";
-      return;
-    }
-
-    if (!dragging) return;
-    const maxLeft = Math.max(0, innerWidth - tool.offsetWidth);
-    const maxTop = Math.max(0, innerHeight - tool.offsetHeight);
-    tool.style.left = clamp(startLeft + event.clientX - startMouseX, 0, maxLeft) + "px";
-    tool.style.top = clamp(startTop + event.clientY - startMouseY, 0, maxTop) + "px";
-  });
-
-  document.addEventListener("mouseup", () => {
-    if (dragging) {
-      dragging = false;
-      tool.classList.remove("is-dragging");
-      savePosition();
-    }
-
-    if (resizing) {
-      resizing = false;
-      tool.classList.remove("is-resizing");
-      savePosition();
-    }
-
-    if (heightResizing) {
-      heightResizing = false;
-      tool.classList.remove("is-height-resizing");
-      savePosition();
-    }
-  });
-
-  window.addEventListener("resize", () => {
-    keepLauncherInsideViewport();
-    const initialRect = tool.getBoundingClientRect();
-    const viewportLimit = getViewportWidthLimit();
-    const minimumWidth = Math.min(MIN_TOOL_WIDTH, viewportLimit);
-    const fittedWidth = clamp(
-      initialRect.width,
-      minimumWidth,
-      viewportLimit
-    );
-    tool.style.width = fittedWidth + "px";
-
-    const viewportHeightLimit = Math.max(
-      MIN_VIEWPORT_TOOL_HEIGHT,
-      innerHeight - 8
-    );
-    const minimumHeight = Math.min(
-      MIN_TOOL_HEIGHT,
-      viewportHeightLimit
-    );
-    expandedToolHeight = clamp(
-      expandedToolHeight,
-      minimumHeight,
-      viewportHeightLimit
-    );
-
-    if (!tool.classList.contains("is-collapsed")) {
-      tool.style.height = expandedToolHeight + "px";
-    }
-
-    const rect = tool.getBoundingClientRect();
-    const maxLeft = Math.max(0, innerWidth - rect.width);
-    const maxTop = Math.max(0, innerHeight - rect.height);
-    tool.style.left = clamp(rect.left, 0, maxLeft) + "px";
-    tool.style.top = clamp(rect.top, 0, maxTop) + "px";
-    tool.style.right = "auto";
-    savePosition();
-  });
 
   referenceButtons.forEach(button => {
     button.addEventListener("click", () => {
-      const key = button.dataset.referencePanel;
-      activeReferencePanel =
-        activeReferencePanel === key ? "" : key;
+      activeReferencePanel = button.dataset.referencePanel;
       updateReferencePanelVisibility();
 
-      if (activeReferencePanel) {
-        requestAnimationFrame(() => {
-          toolBody.scrollTo({
-            top: 0,
-            behavior: "smooth"
-          });
-        });
-      }
+      requestAnimationFrame(() => {
+        settingsView.scrollTop = 0;
+      });
     });
   });
 
+  settingsButtons.forEach(button => {
+    button.addEventListener("click", () => {
+      tool.classList.remove("is-collapsed");
+      openSettings();
+    });
+  });
+
+  settingsBackButton?.addEventListener("click", closeSettings);
+
   runButton.addEventListener("click", () => runCheck());
+  miniRunButton?.addEventListener("click", () => runCheck());
+
+  dockSideButtons.forEach(button => {
+    button.addEventListener("click", () => {
+      applyDockSide(button.dataset.dockSide);
+      saveDockSide();
+    });
+  });
   clearButton.addEventListener("click", () => {
     removeExistingMarks();
     resultsBox.innerHTML = "";
@@ -11091,49 +12182,28 @@
     if (latestMissingNames.length) copyText(latestMissingNames.join("\n"));
   });
 
-  function updateLauncherState(isOpen) {
-    const text = launcher.querySelector(".launcher-text");
-    launcher.classList.toggle("is-open", isOpen);
-    launcher.setAttribute("aria-expanded", String(isOpen));
-
-    if (text) {
-      text.textContent = isOpen ? "关闭套餐核对" : "打开套餐核对";
-    }
-
-    launcher.title = isOpen
-      ? "点击关闭套餐危害因素核对工具"
-      : "点击打开套餐危害因素核对工具";
-  }
-
+  /*
+   * 「−」= 折叠（留在页面里，只留标题条）；「×」= 收走（连标题条也不占版面，
+   * 右侧浮现小胶囊叫回来）。内嵌后没有"浮窗位置"要记，只剩这两种状态。
+   */
   function hideToolPanel() {
-    if (!tool.isConnected || !launcher.isConnected) return;
+    panelOpen = false;
     tool.style.display = "none";
     launcher.style.display = "flex";
-    updateLauncherState(false);
+    launcher.title = "点击打开套餐危害因素核对工具";
+    updatePageReserve();
   }
 
   function showToolPanel() {
-    if (!tool.isConnected || !launcher.isConnected) return;
-
+    mountTool();
+    panelOpen = true;
     tool.style.display = "flex";
-    launcher.style.display = "flex";
-    updateLauncherState(true);
-
-    requestAnimationFrame(() => {
-      applySavedPosition();
-
-      const rect = tool.getBoundingClientRect();
-      const maxLeft = Math.max(0, innerWidth - rect.width);
-      const maxTop = Math.max(0, innerHeight - rect.height);
-      tool.style.left = clamp(rect.left, 0, maxLeft) + "px";
-      tool.style.top = clamp(rect.top, 0, maxTop) + "px";
-      tool.style.right = "auto";
-    });
+    launcher.style.display = "none";
+    updatePageReserve();
   }
 
   function toggleToolPanel() {
-    const isOpen = tool.style.display !== "none";
-    if (isOpen) hideToolPanel();
+    if (panelOpen) hideToolPanel();
     else showToolPanel();
   }
 
@@ -11143,6 +12213,11 @@
     destroyed = true;
     clearTimeout(enhanceTimer);
     dialogObserver?.disconnect();
+    mountObserver.disconnect();
+    panelWidthObserver.disconnect();
+    clearPageReserve();
+    window.removeEventListener("keydown", swallowEscapeKey, true);
+    window.removeEventListener("keyup", swallowEscapeKey, true);
     removeExistingMarks();
     document.querySelectorAll("." + AUTO_PANEL_CLASS).forEach(element => element.remove());
     launcher.remove();
@@ -11151,7 +12226,7 @@
     if (window[GLOBAL_KEY]?.destroy === destroyTool) delete window[GLOBAL_KEY];
   }
 
-  collapseButton.addEventListener("click", event => {
+  edgeCollapseButton?.addEventListener("click", event => {
     event.preventDefault();
     event.stopPropagation();
     toggleCollapsed();
@@ -11161,136 +12236,29 @@
     toggleCollapsed();
   });
 
-
-  function saveLauncherPosition() {
-    const rect = launcher.getBoundingClientRect();
-    localStorage.setItem(LAUNCHER_POSITION_KEY, JSON.stringify({
-      left: Math.round(rect.left),
-      top: Math.round(rect.top)
-    }));
-  }
-
-  function keepLauncherInsideViewport() {
-    const rect = launcher.getBoundingClientRect();
-    const maxLeft = Math.max(0, innerWidth - rect.width);
-    const maxTop = Math.max(0, innerHeight - rect.height);
-
-    launcher.style.left = Math.min(Math.max(rect.left, 0), maxLeft) + "px";
-    launcher.style.top = Math.min(Math.max(rect.top, 0), maxTop) + "px";
-    launcher.style.right = "auto";
-    launcher.style.bottom = "auto";
-  }
-
-  function applySavedLauncherPosition() {
-    try {
-      const saved = JSON.parse(
-        localStorage.getItem(LAUNCHER_POSITION_KEY) || "null"
-      );
-
-      if (
-        saved &&
-        Number.isFinite(saved.left) &&
-        Number.isFinite(saved.top)
-      ) {
-        launcher.style.left = saved.left + "px";
-        launcher.style.top = saved.top + "px";
-        launcher.style.right = "auto";
-        launcher.style.bottom = "auto";
-      }
-    } catch (_) {}
-
-    keepLauncherInsideViewport();
-  }
-
-  let launcherDragging = false;
-  let launcherMoved = false;
-  let launcherStartX = 0;
-  let launcherStartY = 0;
-  let launcherStartLeft = 0;
-  let launcherStartTop = 0;
-
-  launcher.addEventListener("pointerdown", event => {
-    if (event.button !== 0) return;
-
-    const rect = launcher.getBoundingClientRect();
-    launcherDragging = true;
-    launcherMoved = false;
-    launcherStartX = event.clientX;
-    launcherStartY = event.clientY;
-    launcherStartLeft = rect.left;
-    launcherStartTop = rect.top;
-
-    launcher.style.left = rect.left + "px";
-    launcher.style.top = rect.top + "px";
-    launcher.style.right = "auto";
-    launcher.style.bottom = "auto";
-    launcher.classList.add("is-launcher-dragging");
-
-    try { launcher.setPointerCapture(event.pointerId); } catch (_) {}
-    event.preventDefault();
-  });
-
-  launcher.addEventListener("pointermove", event => {
-    if (!launcherDragging) return;
-
-    const deltaX = event.clientX - launcherStartX;
-    const deltaY = event.clientY - launcherStartY;
-
-    if (!launcherMoved && Math.hypot(deltaX, deltaY) >= 4) {
-      launcherMoved = true;
-    }
-
-    if (!launcherMoved) return;
-
-    const maxLeft = Math.max(0, innerWidth - launcher.offsetWidth);
-    const maxTop = Math.max(0, innerHeight - launcher.offsetHeight);
-
-    launcher.style.left = Math.min(
-      Math.max(launcherStartLeft + deltaX, 0),
-      maxLeft
-    ) + "px";
-
-    launcher.style.top = Math.min(
-      Math.max(launcherStartTop + deltaY, 0),
-      maxTop
-    ) + "px";
-  });
-
-  function endLauncherDrag(event) {
-    if (!launcherDragging) return;
-
-    launcherDragging = false;
-    launcher.classList.remove("is-launcher-dragging");
-
-    try { launcher.releasePointerCapture(event.pointerId); } catch (_) {}
-
-    if (launcherMoved) {
-      saveLauncherPosition();
-      setTimeout(() => {
-        launcherMoved = false;
-      }, 0);
-    }
-  }
-
-  launcher.addEventListener("pointerup", endLauncherDrag);
-  launcher.addEventListener("pointercancel", endLauncherDrag);
-
-  launcher.addEventListener("click", event => {
-    if (launcherMoved) {
-      event.preventDefault();
-      event.stopPropagation();
+  /*
+   * v4.10.3 ESC 屏蔽：这页里 ESC 一按就把整层（甚至整页）退出去，很容易误触。
+   * 直接在最外层拦掉，不让它冒到页面的键盘处理去。
+   * 万一真需要退回，按住 Alt + ESC 仍可放行。
+   */
+  function swallowEscapeKey(event) {
+    if (event.key !== "Escape" && event.key !== "Esc" && event.keyCode !== 27) {
       return;
     }
+    if (event.altKey) return;
+    event.stopImmediatePropagation();
+    event.preventDefault();
+  }
+  window.addEventListener("keydown", swallowEscapeKey, true);
+  window.addEventListener("keyup", swallowEscapeKey, true);
 
+
+  launcher.addEventListener("click", event => {
+    event.preventDefault();
+    event.stopPropagation();
     toggleToolPanel();
   });
 
-
-  closeButton.addEventListener("click", event => {
-    event.preventDefault();
-    event.stopPropagation();
-    hideToolPanel();
-  });
 
   dialogObserver = new MutationObserver(scheduleEnhanceDialogs);
   dialogObserver.observe(document.body, {
@@ -11301,11 +12269,12 @@
   });
 
   window[GLOBAL_KEY] = { destroy: destroyTool };
-  requestAnimationFrame(() => {
-    renderRuleManager();
-    applySavedLauncherPosition();
-    hideToolPanel();
-    enhanceVisibleEditDialogs();
-  });
-  console.log("套餐危害因素核对工具 v4.6.4 已加载。");
+
+  /* 同步做掉：默认就是"收起成竖条"，不能等一帧 —— 否则会先闪一下大面板 */
+  mountTool();
+  readDockSide();
+  hideToolPanel();
+  renderRuleManager();
+  requestAnimationFrame(() => enhanceVisibleEditDialogs());
+  console.log("套餐危害因素核对工具 v4.10.4 已加载。");
 })();
