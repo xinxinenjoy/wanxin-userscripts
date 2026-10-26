@@ -48,6 +48,7 @@ jobs:
           from datetime import datetime
           from zoneinfo import ZoneInfo
           from html import escape
+          import hashlib
           import json
           import os
           import re
@@ -248,6 +249,52 @@ jobs:
                   }
 
               return None
+
+
+          # ============================================================
+          # 🔒 分类口令门禁（纯前端校验）
+          #
+          # 强度说明：只在浏览器里比对 SHA-256 哈希，能挡住随手点进来的人，
+          #          但挡不住按 F12 看页面源码的人（清单仍在 HTML 里）。
+          #          口令改这里即可，页面里只出现哈希，不会出现明文。
+          #
+          # 分类归属：源脚本一级目录含 "Game" → game，其余（2.Work/*）→ work。
+          # 留空 = 该分类不上锁（页面与现在完全一致）。
+          # ============================================================
+          GATE_PASSCODES = {
+              "work": "wanxin",
+              "game": "叫我红领巾",
+          }
+
+          # 解锁状态在本浏览器保留的天数。
+          GATE_STORAGE_DAYS = 30
+
+          GATE_SCOPE_LABELS = {
+              "work": "Work 工作脚本",
+              "game": "Game 游戏脚本",
+          }
+
+          GATE_SCOPE_HINTS = {
+              "work": "内网办公系统用的脚本，口令请向 WanXin 索取。",
+              "game": "游戏类脚本，口令请向 WanXin 索取。",
+          }
+
+
+          def folder_scope(folder):
+              """把分类目录映射到门禁范围：Game / Work 两档。"""
+
+              top = str(folder or "").replace("\\", "/").split("/")[0].lower()
+
+              if "game" in top:
+                  return "game"
+
+              return "work"
+
+
+          def gate_active(scope):
+              """该范围配了口令才上锁；留空 ⇒ 不上锁，页面行为与原来一致。"""
+
+              return bool(str(GATE_PASSCODES.get(scope, "")).strip())
 
 
           # 1. 扫描源脚本，建立 publishID -> 原始分类 / 修改时间映射
@@ -804,20 +851,61 @@ jobs:
           ):
               folder_count = len(page_groups[folder])
               folder_label = folder_display_name(folder)
+              folder_scope_name = folder_scope(folder)
+
+              scope_attr = (
+                  f' data-scope="{h(folder_scope_name)}"'
+                  if gate_active(folder_scope_name)
+                  else ""
+              )
 
               buttons.append(
-                  f'<button class="filter" data-group="{h(folder)}">'
+                  f'<button class="filter"{scope_attr} data-group="{h(folder)}">'
                   f'{h(folder_label)} <span>{folder_count}</span>'
                   '</button>'
               )
 
+          # 各门禁范围下的脚本数，用于锁卡文案。
+          scope_counts = {}
+
+          for folder_scope_key, group_items in page_groups.items():
+              folder_scope_name = folder_scope(folder_scope_key)
+              scope_counts[folder_scope_name] = (
+                  scope_counts.get(folder_scope_name, 0)
+                  + len(group_items)
+              )
+
+          # 页面里只输出 SHA-256 哈希，不输出口令明文。
+          gate_config = {}
+
+          for scope_name, passcode in GATE_PASSCODES.items():
+              passcode = str(passcode or "").strip()
+
+              if not passcode:
+                  continue
+
+              gate_config[scope_name] = {
+                  "hash": hashlib.sha256(
+                      passcode.encode("utf-8")
+                  ).hexdigest(),
+                  "label": GATE_SCOPE_LABELS.get(scope_name, scope_name),
+                  "count": scope_counts.get(scope_name, 0),
+              }
+
           page_sections = []
+          gate_blocks_emitted = set()
+
+          # 「小工具」区块要插在最后一个 Game 分组后面，这里记录插入位置。
+          tools_anchor = None
+          tools_follow = []
+          tools_scope_name = "game"
 
           for folder in sorted(
               page_groups,
               key=page_group_sort_key,
           ):
               folder_label = folder_display_name(folder)
+              folder_scope_name = folder_scope(folder)
               group_items = sorted(
                   page_groups[folder],
                   key=lambda x: (
@@ -977,9 +1065,70 @@ jobs:
                       """
                   )
 
+              if (
+                  gate_active(folder_scope_name)
+                  and folder_scope_name not in gate_blocks_emitted
+              ):
+                  gate_blocks_emitted.add(folder_scope_name)
+
+                  gate_label = GATE_SCOPE_LABELS.get(
+                      folder_scope_name, folder_scope_name
+                  )
+                  gate_hint = GATE_SCOPE_HINTS.get(
+                      folder_scope_name, ""
+                  )
+                  gate_count = scope_counts.get(
+                      folder_scope_name, 0
+                  )
+
+                  page_sections.append(
+                      f"""
+                      <section class="gate-wrap"
+                               data-scope="{h(folder_scope_name)}">
+                        <div class="gate-panel">
+                          <div class="gate-head">
+                            <h2>{h(gate_label)}</h2>
+                            <span class="gate-tag">需要口令</span>
+                          </div>
+
+                          <p class="gate-text">
+                            {h(gate_hint)}
+                            输入口令后可查看该分类下的 {gate_count} 个脚本；
+                            口令只需输入一次，本浏览器 {GATE_STORAGE_DAYS} 天内免输。
+                          </p>
+
+                          <form class="gate-form"
+                                data-scope="{h(folder_scope_name)}"
+                                autocomplete="off">
+                            <input type="password"
+                                   name="passcode"
+                                   placeholder="请输入口令"
+                                   aria-label="{h(gate_label)}口令"
+                                   autocomplete="current-password">
+                            <button class="button button-primary"
+                                    type="submit">
+                              解锁
+                            </button>
+                          </form>
+
+                          <p class="gate-error"
+                             data-scope="{h(folder_scope_name)}"
+                             hidden></p>
+                        </div>
+                      </section>
+                      """
+                  )
+
+              section_scope_attr = (
+                  f' data-scope="{h(folder_scope_name)}"'
+                  if gate_active(folder_scope_name)
+                  else ""
+              )
+
               page_sections.append(
                   f"""
-                  <section class="folder-group" data-folder="{h(folder)}">
+                  <section class="folder-group"{section_scope_attr}
+                           data-folder="{h(folder)}">
                     <div class="folder-head">
                       <div class="folder-title-line">
                         <h2>{h(folder_label)}</h2>
@@ -993,6 +1142,86 @@ jobs:
                   </section>
                   """
               )
+
+              # Game 分组的末尾就是「小工具」的位置（紧跟 Game）。
+              if folder_scope_name == tools_scope_name:
+                  tools_anchor = len(page_sections)
+                  tools_follow.append(folder)
+
+          # ------------------------------------------------------------
+          # 「小工具」区块
+          #
+          # 位置上紧跟 Game 分组（页面上归在一起管理），但仍是独立一块，
+          # 保留自己的小标题；不带 data-scope 以外的门禁结构。
+          # 直链 /assets/tools/... 不受影响，只是首页入口跟着 Game 一起隐藏。
+          # ------------------------------------------------------------
+          tools_follow_attr = h("|".join(tools_follow))
+
+          tools_scope_attr = (
+              f' data-scope="{h(tools_scope_name)}"'
+              if gate_active(tools_scope_name)
+              else ""
+          )
+
+          tools_section = f"""
+                  <section class="section tools-group"
+                           id="tools"
+                           data-follow="{tools_follow_attr}"{tools_scope_attr}>
+                    <div class="section-head">
+                      <div>
+                        <h2 class="section-title">小工具</h2>
+                        <p class="section-desc">
+                          不用装脚本，点开就能用的网页小工具。
+                        </p>
+                      </div>
+                    </div>
+
+                    <div class="script-grid">
+                      <article class="script-card"
+                               data-folder="工具"
+                               data-search="地下城宝箱模拟 抽奖 六宫格 宝箱 陷阱 楼梯 宝石 打开顺序 工具">
+                        <div class="script-card-head">
+                          <div class="script-title-wrap">
+                            <h3>地下城宝箱模拟</h3>
+                          </div>
+                          <span class="script-version">网页</span>
+                        </div>
+
+                        <p class="script-description">
+                          六宫格随机分配 3 个中奖、2 个陷阱、1 个楼梯或宝石（共 60 种布局）。
+                          定稿后直接标出打开顺序 1→4，陷阱格标「不可选」。每天 15:00 重置；
+                          结果保存在你自己的浏览器里，换设备或清缓存会重置。
+                        </p>
+
+                        <div class="script-card-foot">
+                          <div class="script-meta">
+                            <span>纯前端 · 手机可用</span>
+                          </div>
+
+                          <div class="script-actions">
+                            <a class="button button-primary"
+                               href="/assets/tools/chest/"
+                               target="_blank"
+                               rel="noopener noreferrer">
+                              打开工具
+                            </a>
+                            <a class="button button-secondary"
+                               href="{h(GITHUB_REPO_URL)}/blob/main/site-assets/tools/chest/index.html"
+                               target="_blank"
+                               rel="noopener noreferrer">
+                              查看源码
+                            </a>
+                          </div>
+                        </div>
+                      </article>
+                    </div>
+                  </section>
+                  """
+
+          if tools_anchor is None:
+              page_sections.append(tools_section)
+          else:
+              page_sections.insert(tools_anchor, tools_section)
 
           html = f"""<!doctype html>
           <html lang="zh-CN">
@@ -1880,6 +2109,25 @@ jobs:
                 display: none;
               }}
 
+              /* 「小工具」区块：紧跟 Game 分组，间距与普通分组保持一致 */
+              .tools-group {{
+                padding: 0;
+                margin-bottom: 28px;
+              }}
+
+              .tools-group .section-head {{
+                margin-bottom: 12px;
+              }}
+
+              /* 与 Game 分组的标题同字号，两块看起来是同一层级 */
+              .tools-group .section-title {{
+                font-size: 24px;
+              }}
+
+              .tools-group.hidden {{
+                display: none;
+              }}
+
               .folder-head {{
                 margin-bottom: 12px;
               }}
@@ -2418,6 +2666,103 @@ jobs:
                 text-align: center;
                 color: #999fab;
                 font-size: 13px;
+              }}
+
+              /* ---------- 🔒 分类口令门禁 ---------- */
+              .gate-wrap {{
+                margin-bottom: 28px;
+              }}
+
+              .gate-panel {{
+                padding: 26px 24px;
+                border: 1px solid var(--line);
+                border-radius: 18px;
+                background: #fff;
+                box-shadow: 0 10px 26px rgba(23, 28, 38, .06);
+              }}
+
+              .gate-head {{
+                display: flex;
+                flex-wrap: wrap;
+                align-items: baseline;
+                gap: 10px;
+                margin-bottom: 10px;
+              }}
+
+              .gate-head h2 {{
+                margin: 0;
+                font-size: 22px;
+                line-height: 1.3;
+              }}
+
+              .gate-tag {{
+                padding: 2px 9px;
+                border-radius: 999px;
+                color: #a15c00;
+                background: #fff4e5;
+                font-size: 11px;
+                font-weight: 800;
+              }}
+
+              .gate-text {{
+                margin: 0 0 16px;
+                color: var(--muted);
+                font-size: 14px;
+                line-height: 1.75;
+              }}
+
+              .gate-form {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+              }}
+
+              .gate-form input {{
+                flex: 1 1 220px;
+                min-width: 0;
+                padding: 11px 14px;
+                border: 1px solid var(--line);
+                border-radius: 12px;
+                background: #fff;
+                color: inherit;
+                font-size: 14px;
+              }}
+
+              .gate-form input:focus {{
+                outline: none;
+                border-color: var(--accent);
+                box-shadow: 0 0 0 3px rgba(229, 72, 77, .12);
+              }}
+
+              .gate-error {{
+                margin: 10px 0 0;
+                color: var(--accent);
+                font-size: 13px;
+                font-weight: 700;
+              }}
+
+              .gate-shake {{
+                animation: gate-shake .28s ease;
+              }}
+
+              @keyframes gate-shake {{
+                25% {{ transform: translateX(-5px); }}
+                50% {{ transform: translateX(5px); }}
+                75% {{ transform: translateX(-3px); }}
+              }}
+
+              /* 未解锁：隐藏该分类下的脚本区块与筛选按钮 */
+              body.gate-locked-work .folder-group[data-scope="work"],
+              body.gate-locked-game .folder-group[data-scope="game"],
+              body.gate-locked-game .tools-group[data-scope="game"],
+              body.gate-locked-work .tools-group[data-scope="work"] {{
+                display: none;
+              }}
+
+              .gate-wrap[hidden],
+              .gate-error[hidden],
+              .filter[hidden] {{
+                display: none;
               }}
 
               @media (max-width: 900px) {{
@@ -2965,59 +3310,6 @@ jobs:
               </div>
             </main>
 
-            <section class="section" id="tools">
-              <div class="wrap">
-                <div class="section-head">
-                  <div>
-                    <h2 class="section-title">小工具</h2>
-                    <p class="section-desc">
-                      不用装脚本，点开就能用的网页小工具。
-                    </p>
-                  </div>
-                </div>
-
-                <div class="script-grid">
-                  <article class="script-card"
-                           data-folder="工具"
-                           data-search="地下城宝箱模拟 抽奖 六宫格 宝箱 陷阱 楼梯 宝石 打开顺序 工具">
-                    <div class="script-card-head">
-                      <div class="script-title-wrap">
-                        <h3>地下城宝箱模拟</h3>
-                      </div>
-                      <span class="script-version">网页</span>
-                    </div>
-
-                    <p class="script-description">
-                      六宫格随机分配 3 个中奖、2 个陷阱、1 个楼梯或宝石（共 60 种布局）。
-                      定稿后直接标出打开顺序 1→4，陷阱格标「不可选」。每天 15:00 重置；
-                      结果保存在你自己的浏览器里，换设备或清缓存会重置。
-                    </p>
-
-                    <div class="script-card-foot">
-                      <div class="script-meta">
-                        <span>纯前端 · 手机可用</span>
-                      </div>
-
-                      <div class="script-actions">
-                        <a class="button button-primary"
-                           href="/assets/tools/chest/"
-                           target="_blank"
-                           rel="noopener noreferrer">
-                          打开工具
-                        </a>
-                        <a class="button button-secondary"
-                           href="{h(GITHUB_REPO_URL)}/blob/main/site-assets/tools/chest/index.html"
-                           target="_blank"
-                           rel="noopener noreferrer">
-                          查看源码
-                        </a>
-                      </div>
-                    </div>
-                  </article>
-                </div>
-              </div>
-            </section>
-
             <div class="image-modal"
                  id="image-modal"
                  aria-hidden="true"
@@ -3107,6 +3399,7 @@ jobs:
                 const search = document.getElementById("search");
                 const cards = [...document.querySelectorAll(".script-card")];
                 const folderGroups = [...document.querySelectorAll(".folder-group")];
+                const toolsGroups = [...document.querySelectorAll(".tools-group")];
                 const filters = [...document.querySelectorAll(".filter")];
                 const empty = document.getElementById("empty");
                 const ua = navigator.userAgent;
@@ -3150,6 +3443,11 @@ jobs:
                     card.querySelector("h3")?.textContent?.trim() || card.dataset.scriptId
                   ])
                 );
+
+                // 🔒 口令门禁：页面里只有 SHA-256 哈希，没有明文口令。
+                const GATE_CONFIG = {json.dumps(gate_config, ensure_ascii=False)};
+                const GATE_STORAGE_PREFIX = "wx-gate-";
+                const GATE_TTL_MS = {GATE_STORAGE_DAYS} * 24 * 60 * 60 * 1000;
 
                 let activeGroup = "all";
                 let browser = "";
@@ -4113,20 +4411,216 @@ jobs:
                   }}
                 }}
 
+                const gateState = {{}};
+
+                function gateStorageKey(scope) {{
+                  return GATE_STORAGE_PREFIX + scope;
+                }}
+
+                function gateUnlocked(scope) {{
+                  return Boolean(gateState[scope]);
+                }}
+
+                function restoreGateState() {{
+                  Object.keys(GATE_CONFIG).forEach(scope => {{
+                    gateState[scope] = false;
+
+                    try {{
+                      const raw = localStorage.getItem(gateStorageKey(scope));
+
+                      if (!raw) return;
+
+                      const saved = JSON.parse(raw);
+
+                      if (saved && Number(saved.expireAt) > Date.now()) {{
+                        gateState[scope] = true;
+                      }} else {{
+                        localStorage.removeItem(gateStorageKey(scope));
+                      }}
+                    }} catch (_) {{
+                      gateState[scope] = false;
+                    }}
+                  }});
+                }}
+
+                function paintGate() {{
+                  Object.keys(GATE_CONFIG).forEach(scope => {{
+                    const unlocked = gateUnlocked(scope);
+
+                    document.body.classList.toggle(
+                      "gate-locked-" + scope,
+                      !unlocked
+                    );
+
+                    document.querySelectorAll(
+                      '.gate-wrap[data-scope="' + scope + '"]'
+                    ).forEach(wrap => {{
+                      wrap.hidden = unlocked;
+                    }});
+
+                    document.querySelectorAll(
+                      '.filter[data-scope="' + scope + '"]'
+                    ).forEach(button => {{
+                      button.hidden = !unlocked;
+                    }});
+                  }});
+                }}
+
+                function showGateError(scope, message) {{
+                  const error = document.querySelector(
+                    '.gate-error[data-scope="' + scope + '"]'
+                  );
+
+                  if (!error) return;
+
+                  error.textContent = message;
+                  error.hidden = false;
+
+                  const panel = error.closest(".gate-panel");
+
+                  if (panel) {{
+                    panel.classList.remove("gate-shake");
+                    void panel.offsetWidth;
+                    panel.classList.add("gate-shake");
+                  }}
+                }}
+
+                function clearGateError(scope) {{
+                  const error = document.querySelector(
+                    '.gate-error[data-scope="' + scope + '"]'
+                  );
+
+                  if (!error) return;
+
+                  error.textContent = "";
+                  error.hidden = true;
+                }}
+
+                async function sha256Hex(text) {{
+                  if (!window.crypto || !window.crypto.subtle) return "";
+
+                  const data = new TextEncoder().encode(text);
+                  const buffer = await window.crypto.subtle.digest(
+                    "SHA-256",
+                    data
+                  );
+
+                  return [...new Uint8Array(buffer)]
+                    .map(byte => byte.toString(16).padStart(2, "0"))
+                    .join("");
+                }}
+
+                function isCardGated(card) {{
+                  const section = card.closest(".folder-group, .tools-group");
+
+                  if (!section) return false;
+
+                  const scope = section.dataset.scope;
+
+                  if (!scope) return false;
+
+                  return !gateUnlocked(scope);
+                }}
+
+                document.querySelectorAll(".gate-form").forEach(form => {{
+                  const scope = form.dataset.scope;
+                  const input = form.querySelector("input");
+                  const submit = form.querySelector("button");
+
+                  if (!scope || !input || !GATE_CONFIG[scope]) return;
+
+                  form.addEventListener("submit", async event => {{
+                    event.preventDefault();
+
+                    const passcode = input.value.trim();
+
+                    if (!passcode) {{
+                      showGateError(scope, "请先输入口令");
+                      input.focus();
+                      return;
+                    }}
+
+                    if (submit) {{
+                      submit.disabled = true;
+                      submit.textContent = "校验中…";
+                    }}
+
+                    let hash = "";
+
+                    try {{
+                      hash = await sha256Hex(passcode);
+                    }} catch (_) {{
+                      hash = "";
+                    }}
+
+                    if (submit) {{
+                      submit.disabled = false;
+                      submit.textContent = "解锁";
+                    }}
+
+                    if (!hash) {{
+                      showGateError(
+                        scope,
+                        "当前环境无法校验口令，请用 https 打开本页"
+                      );
+                      return;
+                    }}
+
+                    if (hash !== GATE_CONFIG[scope].hash) {{
+                      showGateError(scope, "口令不正确，请重新输入");
+                      input.select();
+                      return;
+                    }}
+
+                    gateState[scope] = true;
+
+                    try {{
+                      localStorage.setItem(
+                        gateStorageKey(scope),
+                        JSON.stringify({{
+                          expireAt: Date.now() + GATE_TTL_MS
+                        }})
+                      );
+                    }} catch (_) {{
+                      // 隐私模式写不进 localStorage，仅在本次会话内生效。
+                    }}
+
+                    clearGateError(scope);
+                    input.value = "";
+                    paintGate();
+                    refresh();
+                  }});
+                }});
+
                 function refresh() {{
                   const query = search.value.trim().toLowerCase();
                   let visible = 0;
 
                   cards.forEach(card => {{
-                    const groupMatch =
-                      activeGroup === "all" ||
-                      card.dataset.folder === activeGroup;
+                    const toolsGroup = card.closest(".tools-group");
+
+                    // 小工具跟着 Game 走：点 Game 的分类按钮时一起显示。
+                    const groupMatch = toolsGroup
+                      ? (
+                        activeGroup === "all" ||
+                        (toolsGroup.dataset.follow || "")
+                          .split("|")
+                          .filter(Boolean)
+                          .includes(activeGroup)
+                      )
+                      : (
+                        activeGroup === "all" ||
+                        card.dataset.folder === activeGroup
+                      );
 
                     const textMatch =
                       !query ||
                       card.dataset.search.includes(query);
 
-                    const show = groupMatch && textMatch;
+                    // 未解锁的分类：卡片一律不显示，也不参与搜索。
+                    const gateMatch = !isCardGated(card);
+
+                    const show = groupMatch && textMatch && gateMatch;
 
                     card.classList.toggle("hidden", !show);
 
@@ -4135,7 +4629,14 @@ jobs:
                     }}
                   }});
 
-                  folderGroups.forEach(group => {{
+                  folderGroups.concat(toolsGroups).forEach(group => {{
+                    const scope = group.dataset.scope;
+
+                    if (scope && !gateUnlocked(scope)) {{
+                      group.classList.add("hidden");
+                      return;
+                    }}
+
                     const hasVisibleCard = [...group.querySelectorAll(".script-card")]
                       .some(card => !card.classList.contains("hidden"));
 
@@ -4177,6 +4678,10 @@ jobs:
                 requestAnimationFrame(() => {{
                   refreshDescriptionToggles();
                 }});
+
+                restoreGateState();
+                paintGate();
+                refresh();
 
                 trackEvent("page_view");
                 loadStats();
