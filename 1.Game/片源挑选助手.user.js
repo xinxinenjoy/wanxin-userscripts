@@ -3,9 +3,7 @@
 // @namespace    local.wanxin.pick-source
 // @version      1.12.2
 // @description  影视资源列表页自动打分（按电视/电脑/手机口径可调），挑出前 3 个版本，一键推送到 115 网盘离线。
-// @author       WanXin
-// @publishGroup hljdyxjb
-// @publishID    game-pianyuan
+
 // @match        *://xn--wcv59z.com/*
 // @match        *://*.xn--wcv59z.com/*
 // @grant        GM_setClipboard
@@ -18,6 +16,11 @@
 // @connect      my.115.com
 // @connect      *
 // @run-at       document-idle
+// @author       WanXin
+// @publishGroup hljdyxjb
+// @publishID    game-pianyuan
+// @updateURL    https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-pianyuan.user.js
+// @downloadURL  https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-pianyuan.user.js
 // ==/UserScript==
 
 /* 使用说明
