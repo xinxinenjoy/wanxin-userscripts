@@ -8,7 +8,7 @@
 
 GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动更新。
 
-当前正式发布 **17** 个脚本 · 最近修改 **2026-10-26 13:18**
+当前正式发布 **17** 个脚本 · 最近修改 **2026-10-26 13:43**
 
 </div>
 
@@ -47,7 +47,7 @@ GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动�
 |---|---:|---|---|---|
 | **CurseForge增强** | `4.3` | 2026-09-24 17:29 | 增强CurseForge网站的中文显示，翻译部分英文为中文，支持动态加载内容的翻译。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-curseforge.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/hljdyxjb/game-curseforge.user.js) |
 | **GOW底下尖塔** | `4.2.30` | 2026-09-24 17:29 | GOW底下尖塔火把管理与节点同步工具 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-gowdxjt.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/hljdyxjb/game-gowdxjt.user.js) |
-| **片源挑选助手** | `1.12.2` | 2026-10-26 13:18 | 影视资源列表页自动打分（按电视/电脑/手机口径可调），挑出前 3 个版本，一键推送到 115 网盘离线。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-pianyuan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/hljdyxjb/game-pianyuan.user.js) |
+| **片源挑选助手** | `1.12.2` | 2026-10-26 13:43 | 影视资源列表页自动打分（按电视/电脑/手机口径可调），挑出前 3 个版本，一键推送到 115 网盘离线。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-pianyuan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/hljdyxjb/game-pianyuan.user.js) |
 
 ### 2.Work · 14 个
 
