@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.22
+// @version      6.28
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -16,6 +16,12 @@
 
 (function () {
   "use strict";
+
+  // 设置面板标题上显示版本，用来一眼确认浏览器里装的是不是刚改的这版
+  // （以前只能靠「覆盖安装」的口头约定，经常改完还在跑旧脚本）。
+  const SCRIPT_VERSION =
+    (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || "";
+  const withVersion = (text) => (SCRIPT_VERSION ? `${text}｜v${SCRIPT_VERSION}` : text);
 
   /******************** 0) 路由范围 ********************/
   const TARGET_HASH_PREFIX = "#/merge-order-invoice";
@@ -42,14 +48,14 @@ const COLUMN_LAYOUT = [
   ];
 
 // 文案替换表，左侧为原文，值为替换后的文案。仅在单元格中出现时才会替换，不会影响其他位置的文本。
-  const TEXT_REPLACE = {
+  const DEFAULT_TEXT_REPLACE = {
     "全电普通发票（电子）": "电子普票",
     "待提交审批": "❓核对后提交",
     "开票成功": "✅已开",
     "作废": "❌作废未开",
     "已退票": "❌红冲退票",
     "审批完成开票中": "开票中",
-    "开票申请审批中": "开票中",
+    "开票申请审批中": "钉钉审批中",
     "SOA开票": "订单开票",
     "SOA合并开票": "主页开票",
     "否": "—",
@@ -59,6 +65,54 @@ const COLUMN_LAYOUT = [
   };
 
   const WIDTH_STEP = 60;
+
+  /* ---- 用户设置：文案替换表 + 列宽，存 localStorage，两个发票脚本共用一份 ---- */
+  const SETTINGS_STORAGE_KEY = "tm-fapiao-settings";
+  const COLUMN_MIN_WIDTH = 60;
+  const COLUMN_MAX_WIDTH = 900;
+
+  let TEXT_REPLACE = { ...DEFAULT_TEXT_REPLACE };
+  const columnWidths = {}; // header → px（只在用户拖动过之后才有值）
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+      if (!raw) return;
+
+      const data = JSON.parse(raw) || {};
+
+      if (data.textReplace && typeof data.textReplace === "object") {
+        const entries = Object.entries(data.textReplace).filter(
+          ([source]) => typeof source === "string" && source.trim()
+        );
+        if (entries.length) TEXT_REPLACE = Object.fromEntries(entries);
+      }
+
+      if (data.columnWidths && typeof data.columnWidths === "object") {
+        Object.entries(data.columnWidths).forEach(([header, width]) => {
+          const value = Math.round(Number(width));
+          if (Number.isFinite(value) && value > 0) {
+            columnWidths[header] = Math.min(
+              COLUMN_MAX_WIDTH,
+              Math.max(COLUMN_MIN_WIDTH, value)
+            );
+          }
+        });
+      }
+    } catch (error) {}
+  }
+
+  function persistSettings() {
+    try {
+      localStorage.setItem(
+        SETTINGS_STORAGE_KEY,
+        JSON.stringify({ textReplace: TEXT_REPLACE, columnWidths })
+      );
+    } catch (error) {}
+  }
+
+  loadSettings();
+
 
   /* 「发票金额」列宽自适应。
      合并开票来的记录，站点会在金额格里多挂一个自己的标签（<span class="ant-tag">合</span>），
@@ -114,6 +168,17 @@ const COLUMN_LAYOUT = [
     return header ? [...header.querySelectorAll("th")] : [];
   }
 
+  // 表头文字。会先克隆一份、摘掉我们自己塞进去的按钮/拖拽手柄再取文本，
+  // 否则「操作」表头会变成「操作批量下载」，列名匹配和列宽记忆全乱。
+  function headerText(th) {
+    if (!th) return "";
+    const clone = th.cloneNode(true);
+    clone
+      .querySelectorAll(".tm-batch-head-btn, .tm-col-resizer")
+      .forEach((node) => node.remove());
+    return normText(clone.textContent);
+  }
+
   function getBodyRows(tableRoot = observedTableRoot) {
     const tbody = tableRoot?.querySelector(".ant-table-body tbody");
     return tbody
@@ -131,7 +196,7 @@ const COLUMN_LAYOUT = [
 
     const headers = new Set(
       getHeaderCells(tableRoot)
-        .map((cell) => normText(cell.innerText))
+        .map((cell) => headerText(cell))
         .filter(Boolean)
     );
 
@@ -162,7 +227,7 @@ const COLUMN_LAYOUT = [
   function getHeaderIndexMap(tableRoot = observedTableRoot) {
     const map = new Map();
     getHeaderCells(tableRoot).forEach((th, index) => {
-      const text = normText(th.innerText);
+      const text = headerText(th);
       if (text && !map.has(text)) map.set(text, index);
     });
     return map;
@@ -170,11 +235,15 @@ const COLUMN_LAYOUT = [
 
   function getHeaderSignature(tableRoot = observedTableRoot) {
     return getHeaderCells(tableRoot)
-      .map((th) => normText(th.innerText))
+      .map((th) => headerText(th))
       .join("|");
   }
 
   function getColumnWidth(column) {
+    // 用户拖过这一列就以拖出来的宽度为准（存 localStorage）
+    const custom = columnWidths[column.header];
+    if (custom) return custom;
+
     if (column.header === AMOUNT_COLUMN_HEADER) return amountColumnWidth;
 
     const delta = column.adjustable ? customerWidthDelta : 0;
@@ -236,6 +305,326 @@ const COLUMN_LAYOUT = [
     amountColumnWidth = next;
     return true;
   }
+
+  /* ---- 列宽手动拖拽：表头每列右边缘留 9px 热区，双击恢复该列默认宽度 ---- */
+  let columnResizeState = null;
+  // 拖动期间挂起所有重算（文案替换、金额量宽…），见 scheduleWork
+  let isResizingColumn = false;
+  let resizeFrameId = 0;
+
+  function ensureColumnResizers() {
+    const tableRoot = observedTableRoot;
+    if (!tableRoot) return;
+
+    const headerCells = getHeaderCells(tableRoot);
+    const indexMap = getHeaderIndexMap(tableRoot);
+    const columnByDomIndex = new Map();
+
+    COLUMN_LAYOUT.forEach((column) => {
+      const domIndex = indexMap.get(column.header);
+      if (domIndex !== undefined) columnByDomIndex.set(domIndex, column);
+    });
+
+    headerCells.forEach((th, domIndex) => {
+      const column = columnByDomIndex.get(domIndex);
+      if (!column) return;
+
+      // 打标记：只有这个类的表头会关掉页面自带的 1px 竖线，由我们这条线顶上。
+      // 放在「手柄是否已存在」之前 —— 手柄可能是别的版本建的，标记一样要补上。
+      th.classList.add("tm-has-resizer");
+
+      if (th.querySelector(":scope > .tm-col-resizer")) return;
+
+      const handle = document.createElement("div");
+      handle.className = "tm-col-resizer";
+      handle.dataset.header = column.header;
+      handle.dataset.domIndex = String(domIndex);
+      handle.title = `拖动可调整「${column.header}」列宽，双击恢复默认`;
+      th.appendChild(handle);
+    });
+  }
+
+  /********** 「操作」列头右侧的批量下载按钮 **********/
+  const BATCH_HEAD_BTN_CLASS = "tm-batch-head-btn";
+
+  function syncBatchHeadButton(button) {
+    if (!button) return;
+
+    const busy = !!batchState;
+    const text = busy
+      ? "停止 " + batchState.done + "/" + batchState.total
+      : "批量下载";
+    const title = busy
+      ? "点击停止后续提交"
+      : "勾选要下载的发票，格式可选 PDF / OFD / XML";
+
+    // ⚠️ 这三个属性必须「变了才写」。脚本自己挂着 MutationObserver 盯整张表，
+    //    哪怕写回同样的值也算一次变更 → 又会唤醒自己去重算 → 后台标签页里
+    //    同步执行时直接原地死循环（实测：页面卡死、CDP 都求不了值）。
+    if (button.textContent !== text) button.textContent = text;
+    if (button.title !== title) button.title = title;
+
+    const hasFlag = button.classList.contains("is-busy");
+    if (hasFlag !== busy) button.classList.toggle("is-busy", busy);
+  }
+
+  function refreshBatchHeadButtons() {
+    document
+      .querySelectorAll("." + BATCH_HEAD_BTN_CLASS)
+      .forEach((button) => syncBatchHeadButton(button));
+  }
+
+  let batchBtnEnsureAt = 0;
+  let batchBtnLastBuildAt = 0;
+  let batchBtnBuildBurst = 0;
+  let batchBtnCooldownUntil = 0;
+
+  function ensureBatchHeadButton() {
+    const tableRoot = observedTableRoot;
+    if (!tableRoot) return;
+
+    // ⚠️ 节流 + 熔断。这个函数每轮工作都会跑，而后台标签页里每轮都是同步执行的：
+    //    万一表头被站点的 React 反复重建（按钮刚插进去就被冲掉），就会变成
+    //    「插按钮 → 触发观察者 → 同步重跑 → 再插按钮」的无限循环，页面直接卡死
+    //    （实测：订单页注入后主线程 100% 占用，CDP 连 1+1 都求不出值）。
+    const now = Date.now();
+    if (now < batchBtnCooldownUntil) return;
+    if (now - batchBtnEnsureAt < 200) return;
+    batchBtnEnsureAt = now;
+
+    const opIndex = getHeaderIndexMap(tableRoot).get("操作");
+    if (opIndex === undefined) return;
+
+    const th = getHeaderCells(tableRoot)[opIndex];
+    if (!th) return;
+
+    let button = th.querySelector(":scope > ." + BATCH_HEAD_BTN_CLASS);
+    if (!button) {
+      batchBtnBuildBurst =
+        now - batchBtnLastBuildAt < 1000 ? batchBtnBuildBurst + 1 : 1;
+      batchBtnLastBuildAt = now;
+      if (batchBtnBuildBurst > 8) {
+        // 1 秒内建了 9 次 → 表头在自毁重建，先停 3 秒再试，别把页面拖死
+        batchBtnCooldownUntil = now + 3000;
+        batchBtnBuildBurst = 0;
+        return;
+      }
+
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = BATCH_HEAD_BTN_CLASS;
+
+      // 表头上的拖拽手柄 / 排序都靠 mousedown、click 触发，这里一并吃掉
+      button.addEventListener("mousedown", (event) => event.stopPropagation());
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (batchState) {
+          cancelBatchDownload();
+        } else {
+          openBatchPanel();
+        }
+      });
+
+      th.appendChild(button);
+    }
+
+    syncBatchHeadButton(button);
+  }
+
+  function finishColumnResize(commit) {
+    if (!columnResizeState) return;
+
+    const { tableRoot, domIndex, header, width, cells, frozen } = columnResizeState;
+    columnResizeState = null;
+    isResizingColumn = false;
+
+    if (resizeFrameId) {
+      cancelAnimationFrame(resizeFrameId);
+      resizeFrameId = 0;
+    }
+    // 先解锁站点省略号组件的宽度，再清掉拖动时逐格写的内联宽度，
+    // 让它跟着最终列宽重新截断一次（就这一次）
+    unfreezeCellEllipsis(frozen);
+    // 拖动时是逐格写的内联宽度，松手后要清掉，交给重建出来的 CSS 变量接管
+    (cells || []).forEach((cell) => {
+      cell.style.removeProperty("width");
+      cell.style.removeProperty("max-width");
+      cell.style.removeProperty("flex-basis");
+    });
+
+    document.body.classList.remove("tm-col-resizing");
+    document
+      .querySelectorAll(".tm-col-resizer.is-active")
+      .forEach((node) => node.classList.remove("is-active"));
+    if (tableRoot) tableRoot.style.removeProperty(`--tm-c${domIndex}`);
+
+    if (commit && width) {
+      columnWidths[header] = width;
+      persistSettings();
+    }
+
+    // ⚠️ 不能只交给 scheduleWork —— 它跑在 rAF 里，标签页在后台时压根不触发，
+    //    松手后列宽会弹回原值（实测）。这里同步重建一次兜底。
+    if (observedTableRoot) applyOrUpdateStyle();
+    scheduleWork(true);
+  }
+
+  document.addEventListener(
+    "mousedown",
+    (event) => {
+      const handle = event.target?.closest?.(".tm-col-resizer");
+      if (!handle || !enabled) return;
+
+      const th = handle.closest("th");
+      if (!th) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      handle.classList.add("is-active");
+      isResizingColumn = true;
+
+      const domIndex = Number(handle.dataset.domIndex);
+      // 一次找齐这一列的表头 + 所有表体格，拖动时不再查 DOM
+      const cells = collectColumnCells(observedTableRoot, domIndex);
+
+      columnResizeState = {
+        tableRoot: observedTableRoot,
+        domIndex,
+        header: handle.dataset.header,
+        startX: event.clientX,
+        startWidth: Math.round(th.getBoundingClientRect().width),
+        width: 0,
+        cells,
+        // 钉住站点省略号组件的内部宽度，别让它在拖动时逐行重算
+        frozen: freezeCellEllipsis(cells),
+      };
+
+      document.body.classList.add("tm-col-resizing");
+    },
+    true
+  );
+
+  /* 站点在「销方公司」这类列上用的是 antd 的 JS 省略号组件（.ant-typography-ellipsis），
+     不是纯 CSS 截断：列宽一变它就逐行重新计算截断位置，回写 title、重排子节点。
+     40 步拖窄实测能刷出 3722 次 DOM 变更、1653 次取文本、246 次写 title，
+     直接把拖动拖成幻灯片；「创建人」这种普通文本列同样的拖动只有 94 次变更、0 次写。
+
+     所以拖动期间把这些组件的内部宽度钉死：它们的 ResizeObserver 看到的尺寸不再变化，
+     重算自然不发生；松手立刻解锁，恢复成跟随列宽的常态截断。 */
+  function freezeCellEllipsis(cells) {
+    const frozen = [];
+    (cells || []).forEach((cell) => {
+      cell.querySelectorAll(".ant-typography").forEach((el) => {
+        if (el.dataset.tmFrozen === "1") return;
+        const width = Math.round(el.getBoundingClientRect().width);
+        if (!width) return;
+        el.dataset.tmFrozen = "1";
+        el.style.width = width + "px";
+        el.style.minWidth = width + "px";
+        el.style.maxWidth = width + "px";
+        frozen.push(el);
+      });
+    });
+    return frozen;
+  }
+
+  function unfreezeCellEllipsis(frozen) {
+    (frozen || []).forEach((el) => {
+      el.style.removeProperty("width");
+      el.style.removeProperty("min-width");
+      el.style.removeProperty("max-width");
+      delete el.dataset.tmFrozen;
+    });
+  }
+
+  // 拖动时要改这一列的所有单元格（表头 th + 每一行的 td）
+  function collectColumnCells(tableRoot, domIndex) {
+    if (!tableRoot) return [];
+    const cells = [];
+    const th = getHeaderCells(tableRoot)[domIndex];
+    if (th) cells.push(th);
+    getBodyRows(tableRoot).forEach((tr) => {
+      const td = tr.children[domIndex];
+      if (td) cells.push(td);
+    });
+    return cells;
+  }
+
+  /* 拖动中的宽度怎么落地，直接影响顺不顺：
+     ❌ 改 .ant-table 上的 CSS 变量 --tm-cN —— 全表 51 行 × 11 列的样式全部失效重算，
+        实测每改一次 ~8.8ms，鼠标一动就卡。
+     ✅ 只给这一列的 52 个格子写内联 width/flex-basis —— 失效范围只有这些格子，
+        实测每改一次 ~1.2ms，快 7 倍。
+     松手后清掉内联值，再由 applyOrUpdateStyle 用 CSS 变量接管（见 finishColumnResize）。 */
+  function applyResizeWidth() {
+    resizeFrameId = 0;
+    const state = columnResizeState;
+    if (!state) return;
+
+    const px = state.width + "px";
+    (state.cells || []).forEach((cell) => {
+      cell.style.width = px;
+      cell.style.maxWidth = px;
+      cell.style.flexBasis = px;
+    });
+  }
+
+  document.addEventListener(
+    "mousemove",
+    (event) => {
+      if (!columnResizeState) return;
+      event.preventDefault();
+
+      const delta = event.clientX - columnResizeState.startX;
+      const width = Math.min(
+        COLUMN_MAX_WIDTH,
+        Math.max(COLUMN_MIN_WIDTH, columnResizeState.startWidth + delta)
+      );
+
+      columnResizeState.width = Math.round(width);
+
+      // mousemove 可能一秒上百次，一帧只落一次宽度
+      if (document.hidden) {
+        applyResizeWidth();
+        return;
+      }
+      if (!resizeFrameId) resizeFrameId = requestAnimationFrame(applyResizeWidth);
+    },
+    true
+  );
+
+  document.addEventListener(
+    "mouseup",
+    () => finishColumnResize(true),
+    true
+  );
+
+  // 拖到窗口外松手时 mouseup 可能收不到，用 blur 兜底收尾：
+  // 否则「拖动中暂停重算」的标志会一直挂着，文案替换再也不刷新。
+  window.addEventListener("blur", () => finishColumnResize(true), true);
+
+  // 双击列边缘：这一列回到 COLUMN_LAYOUT 里的默认宽度
+  document.addEventListener(
+    "dblclick",
+    (event) => {
+      const handle = event.target?.closest?.(".tm-col-resizer");
+      if (!handle || !enabled) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const header = handle.dataset.header;
+      if (!header || !(header in columnWidths)) return;
+
+      delete columnWidths[header];
+      persistSettings();
+      if (observedTableRoot) applyOrUpdateStyle();
+      scheduleWork(true);
+    },
+    true
+  );
 
   function getAdjustableColumn() {
     return COLUMN_LAYOUT.find((column) => column.adjustable) || null;
@@ -466,6 +855,7 @@ const COLUMN_LAYOUT = [
 
       ${scope} .ant-table-header th {
         box-sizing: border-box;
+        position: relative;
         flex-shrink: 0;
         order: 999;
         padding: 0 12px;
@@ -571,12 +961,13 @@ const COLUMN_LAYOUT = [
           : "";
 
       css += `
+        ${scope} { --tm-c${domIndex}: ${width}px; }
         ${scope} .ant-table-header th:nth-child(${domIndex + 1}),
         ${scope} .ant-table-body td:nth-child(${domIndex + 1}) {
           order: ${visualIndex};
-          width: ${width}px;
-          flex: 0 0 ${width}px;
-          max-width: ${width}px;
+          width: var(--tm-c${domIndex});
+          flex: 0 0 var(--tm-c${domIndex});
+          max-width: var(--tm-c${domIndex});
           ${alignment}
         }
       `;
@@ -605,6 +996,83 @@ const COLUMN_LAYOUT = [
       }
     `;
 
+    css += `
+      /* 页面自带的表头竖线是 th::before（1px 淡灰），和我们那条蓝线会并排出现，
+         看着就是「两根线」。这里只在可拖的列上把它关掉，由我们这条线顶上，
+         视觉上永远只有一根。 */
+      ${scope} .ant-table-header th.tm-has-resizer::before {
+        display: none !important;
+      }
+
+      ${scope} .tm-col-resizer {
+        position: absolute;
+        top: 0;
+        right: 0;
+        width: 9px;
+        height: 100%;
+        cursor: col-resize;
+        z-index: 6;
+      }
+      /* 常态就站在原来那根线的位置上：一条淡蓝竖线，不再是「灰线 + 蓝线」两根 */
+      ${scope} .tm-col-resizer::after {
+        content: "";
+        position: absolute;
+        top: 6px;
+        bottom: 6px;
+        right: 0;
+        width: 2px;
+        background: rgba(35, 127, 254, 0.22);
+        border-radius: 1px;
+        transition: background 0.12s ease, box-shadow 0.12s ease, width 0.12s ease;
+      }
+      ${scope} .tm-col-resizer:hover::after {
+        width: 3px;
+        background: #237ffe;
+        box-shadow: 0 0 0 1px rgba(35, 127, 254, 0.35);
+      }
+      /* 正在拖的那一条：加粗 + 高亮光晕 */
+      ${scope} .tm-col-resizer.is-active::after {
+        width: 4px;
+        top: 0;
+        bottom: 0;
+        background: #0d5fd6;
+        box-shadow: 0 0 8px 2px rgba(13, 95, 214, 0.6);
+      }
+      body.tm-col-resizing,
+      body.tm-col-resizing * {
+        cursor: col-resize !important;
+        user-select: none !important;
+      }
+
+      /* 「操作」列头右侧的批量下载按钮 */
+      ${scope} .tm-batch-head-btn {
+        margin-left: 8px;
+        height: 20px;
+        padding: 0 8px;
+        border: 0;
+        border-radius: 4px;
+        background: #237ffe;
+        color: #fff;
+        font-size: 11px;
+        font-weight: 500;
+        line-height: 20px;
+        letter-spacing: 0;
+        cursor: pointer;
+        vertical-align: middle;
+        white-space: nowrap;
+      }
+      ${scope} .tm-batch-head-btn:hover {
+        background: #1a6fe0;
+        color: #fff;
+      }
+      ${scope} .tm-batch-head-btn.is-busy {
+        background: #ff4d4f;
+      }
+      ${scope} .tm-batch-head-btn.is-busy:hover {
+        background: #d9363e;
+      }
+    `;
+
     return css;
   }
 
@@ -622,6 +1090,8 @@ const COLUMN_LAYOUT = [
 
     styleEl.textContent = buildCss(getHeaderIndexMap(observedTableRoot));
     lastHeaderSignature = headerSignature;
+    ensureColumnResizers();
+    ensureBatchHeadButton();
     updateUiLabel();
   }
 
@@ -763,14 +1233,288 @@ const COLUMN_LAYOUT = [
     getBodyRows(tableRoot).forEach((tr) => processRow(tr, columnIndexes));
   }
 
+  /******************** 7.5) 设置面板：文案替换 + 列宽 ********************/
+  const SETTINGS_PANEL_ID = "tm-invoice-settings-panel";
+
+  function closeSettingsPanel() {
+    const panel = document.getElementById(SETTINGS_PANEL_ID);
+    if (panel) panel.style.display = "none";
+  }
+
+  function createSettingsRow(source, target) {
+    const row = document.createElement("div");
+    row.className = "tm-set-row";
+
+    const from = document.createElement("input");
+    from.className = "tm-set-input tm-set-from";
+    from.type = "text";
+    from.placeholder = "原文（页面上的文字）";
+    from.value = source || "";
+
+    const arrow = document.createElement("span");
+    arrow.className = "tm-set-arrow";
+    arrow.textContent = "→";
+
+    const to = document.createElement("input");
+    to.className = "tm-set-input tm-set-to";
+    to.type = "text";
+    to.placeholder = "改成什么（留空 = 不显示）";
+    to.value = target || "";
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "tm-set-remove";
+    remove.textContent = "×";
+    remove.title = "删除这一条";
+    remove.addEventListener("click", () => row.remove());
+
+    row.append(from, arrow, to, remove);
+    return row;
+  }
+
+  function ensureSettingsPanel() {
+    let panel = document.getElementById(SETTINGS_PANEL_ID);
+    if (panel) return panel;
+
+    const style = document.createElement("style");
+    style.id = SETTINGS_PANEL_ID + "-style";
+    style.textContent = `
+      #${SETTINGS_PANEL_ID} {
+        position: fixed; inset: 0; z-index: 2147483000; display: none;
+        background: rgba(15,23,42,.35);
+        font: 13px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        color: #1f2937;
+      }
+      #${SETTINGS_PANEL_ID} * { box-sizing: border-box; }
+      #${SETTINGS_PANEL_ID} .tm-set-box {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+        width: 580px; max-width: 92vw; max-height: 86vh;
+        display: flex; flex-direction: column;
+        background: #fff; border-radius: 10px; box-shadow: 0 20px 60px rgba(15,23,42,.28);
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-head {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 13px 18px; border-bottom: 1px solid #f0f0f0;
+        font-size: 15px; font-weight: 600;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-close {
+        cursor: pointer; color: #9ca3af; font-size: 18px; line-height: 1;
+        padding: 2px 4px; border-radius: 4px;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-close:hover { color: #ff4d4f; background: #fff1f0; }
+      #${SETTINGS_PANEL_ID} .tm-set-body { padding: 14px 18px; overflow: auto; }
+      #${SETTINGS_PANEL_ID} h4 { margin: 0 0 2px; font-size: 13px; font-weight: 600; }
+      #${SETTINGS_PANEL_ID} .tm-set-tip { margin: 0 0 10px; color: #9ca3af; font-size: 12px; }
+      #${SETTINGS_PANEL_ID} .tm-set-section + .tm-set-section {
+        margin-top: 16px; padding-top: 14px; border-top: 1px solid #f5f5f5;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-rows { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+      #${SETTINGS_PANEL_ID} .tm-set-row { display: flex; align-items: center; gap: 8px; }
+      #${SETTINGS_PANEL_ID} .tm-set-input {
+        flex: 1 1 0; min-width: 0; height: 30px; padding: 0 8px;
+        border: 1px solid #d9d9d9; border-radius: 6px;
+        font-size: 13px; color: #1f2937; background: #fff;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-input:focus {
+        outline: none; border-color: #237ffe; box-shadow: 0 0 0 2px rgba(35,127,254,.12);
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-arrow { color: #bfbfbf; flex: 0 0 auto; }
+      #${SETTINGS_PANEL_ID} .tm-set-remove {
+        flex: 0 0 auto; width: 26px; height: 26px; border: none; border-radius: 6px;
+        background: #f5f5f5; color: #8c8c8c; font-size: 15px; line-height: 1; cursor: pointer;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-remove:hover { background: #fff1f0; color: #ff4d4f; }
+      #${SETTINGS_PANEL_ID} .tm-set-add,
+      #${SETTINGS_PANEL_ID} .tm-set-reset {
+        height: 30px; padding: 0 12px; border: 1px dashed #d9d9d9; border-radius: 6px;
+        background: #fafafa; color: #595959; font-size: 12px; cursor: pointer;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-add:hover { border-color: #237ffe; color: #237ffe; background: #f4f8ff; }
+      #${SETTINGS_PANEL_ID} .tm-set-reset:hover { border-color: #ff4d4f; color: #ff4d4f; background: #fff8f7; }
+      #${SETTINGS_PANEL_ID} .tm-set-foot {
+        display: flex; align-items: center; gap: 8px;
+        padding: 12px 18px; border-top: 1px solid #f0f0f0;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-msg { flex: 1 1 auto; font-size: 12px; color: #16a34a; }
+      #${SETTINGS_PANEL_ID} .tm-set-btn {
+        height: 32px; padding: 0 16px; border-radius: 6px; border: 1px solid #d9d9d9;
+        background: #fff; color: #1f2937; font-size: 13px; cursor: pointer;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-btn:hover { border-color: #237ffe; color: #237ffe; }
+      #${SETTINGS_PANEL_ID} .tm-set-btn.primary {
+        background: #237ffe; border-color: #237ffe; color: #fff;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-btn.primary:hover { background: #1a6fe0; color: #fff; }
+    `;
+    document.head.appendChild(style);
+
+    panel = document.createElement("div");
+    panel.id = SETTINGS_PANEL_ID;
+
+    const box = document.createElement("div");
+    box.className = "tm-set-box";
+
+    const head = document.createElement("div");
+    head.className = "tm-set-head";
+    const title = document.createElement("span");
+    title.textContent = SCRIPT_VERSION ? `发票工具设置 · v${SCRIPT_VERSION}` : "发票工具设置";
+    const close = document.createElement("span");
+    close.className = "tm-set-close";
+    close.textContent = "×";
+    close.title = "关闭（Esc）";
+    close.addEventListener("click", closeSettingsPanel);
+    head.append(title, close);
+
+    const body = document.createElement("div");
+    body.className = "tm-set-body";
+
+    // ① 文案替换
+    const replaceSection = document.createElement("div");
+    replaceSection.className = "tm-set-section";
+
+    const replaceTitle = document.createElement("h4");
+    replaceTitle.textContent = "文案替换";
+    const replaceTip = document.createElement("p");
+    replaceTip.className = "tm-set-tip";
+    replaceTip.textContent =
+      "左边填页面原本的文字，右边填你希望看到的；只替换表格单元格里的文字。改完点保存会刷新页面。";
+
+    const rowsBox = document.createElement("div");
+    rowsBox.className = "tm-set-rows";
+
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "tm-set-add";
+    addBtn.textContent = "+ 添加一行";
+    addBtn.addEventListener("click", () => {
+      const row = createSettingsRow("", "");
+      rowsBox.appendChild(row);
+      row.querySelector(".tm-set-from").focus();
+      const bodyEl = panel.querySelector(".tm-set-body");
+      if (bodyEl) bodyEl.scrollTop = bodyEl.scrollHeight;
+    });
+
+    const resetTextBtn = document.createElement("button");
+    resetTextBtn.type = "button";
+    resetTextBtn.className = "tm-set-reset";
+    resetTextBtn.textContent = "恢复默认文案";
+    resetTextBtn.addEventListener("click", () => {
+      // 只把默认表填回输入框，点保存才真正写进去（留个反悔的余地）
+      rowsBox.textContent = "";
+      Object.entries(DEFAULT_TEXT_REPLACE).forEach(([source, target]) => {
+        rowsBox.appendChild(createSettingsRow(source, target));
+      });
+      panel.querySelector(".tm-set-msg").textContent =
+        "已填入默认文案，点「保存并刷新」才生效";
+    });
+
+    const replaceActions = document.createElement("div");
+    replaceActions.style.display = "flex";
+    replaceActions.style.gap = "8px";
+    replaceActions.append(addBtn, resetTextBtn);
+
+    replaceSection.append(replaceTitle, replaceTip, rowsBox, replaceActions);
+
+    // ② 列宽
+    const widthSection = document.createElement("div");
+    widthSection.className = "tm-set-section";
+
+    const widthTitle = document.createElement("h4");
+    widthTitle.textContent = "列宽";
+    const widthTip = document.createElement("p");
+    widthTip.className = "tm-set-tip";
+    widthTip.textContent =
+      "直接在表头每一列的右边缘左右拖动就能改宽度；在边缘双击可把该列恢复成默认值。";
+
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.className = "tm-set-reset";
+    resetBtn.textContent = "恢复全部默认列宽";
+    resetBtn.addEventListener("click", () => {
+      Object.keys(columnWidths).forEach((key) => delete columnWidths[key]);
+      persistSettings();
+      if (observedTableRoot) applyOrUpdateStyle();
+      scheduleWork(true);
+      panel.querySelector(".tm-set-msg").textContent = "列宽已恢复默认";
+    });
+
+    widthSection.append(widthTitle, widthTip, resetBtn);
+
+    body.append(replaceSection, widthSection);
+
+    const foot = document.createElement("div");
+    foot.className = "tm-set-foot";
+
+    const msg = document.createElement("span");
+    msg.className = "tm-set-msg";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "tm-set-btn tm-set-cancel";
+    cancelBtn.textContent = "取消";
+    cancelBtn.addEventListener("click", closeSettingsPanel);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "tm-set-btn tm-set-save primary";
+    saveBtn.textContent = "保存并刷新";
+    saveBtn.addEventListener("click", () => {
+      const next = {};
+      rowsBox.querySelectorAll(".tm-set-row").forEach((row) => {
+        const source = row.querySelector(".tm-set-from").value.trim();
+        const target = row.querySelector(".tm-set-to").value.trim();
+        if (source) next[source] = target;
+      });
+
+      TEXT_REPLACE = next;
+      persistSettings();
+
+      msg.textContent = "已保存，正在刷新页面…";
+      setTimeout(() => location.reload(), 600);
+    });
+
+    foot.append(msg, cancelBtn, saveBtn);
+    box.append(head, body, foot);
+    panel.appendChild(box);
+
+    // 点遮罩关闭（点面板本体不关）
+    panel.addEventListener("mousedown", (event) => {
+      if (event.target === panel) closeSettingsPanel();
+    });
+
+    panel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        closeSettingsPanel();
+      }
+    });
+
+    document.body.appendChild(panel);
+    return panel;
+  }
+
+  function openSettingsPanel() {
+    const panel = ensureSettingsPanel();
+    const rowsBox = panel.querySelector(".tm-set-rows");
+
+    rowsBox.textContent = "";
+    Object.entries(TEXT_REPLACE).forEach(([source, target]) => {
+      rowsBox.appendChild(createSettingsRow(source, target));
+    });
+
+    panel.querySelector(".tm-set-msg").textContent = "";
+    panel.style.display = "block";
+    panel.querySelector(".tm-set-body").scrollTop = 0;
+  }
+
   /******************** 8) UI：按钮 + 快捷键 ********************/
   function ensureUiButton() {
     if (uiBtn && document.body.contains(uiBtn)) return;
 
     uiBtn = document.createElement("button");
-    uiBtn.id = "tm-btn-widen-customer";
+    uiBtn.id = "tm-btn-invoice-settings";
     uiBtn.type = "button";
-    uiBtn.title = "左键加宽，右键缩窄；快捷键 Alt+= / Alt+-";
+    uiBtn.title = withVersion("发票工具设置：文案替换、列宽");
 
     Object.assign(uiBtn.style, {
       position: "fixed",
@@ -788,11 +1532,14 @@ const COLUMN_LAYOUT = [
       fontSize: "12px",
     });
 
-    uiBtn.addEventListener("click", () => changeCustomerWidth(WIDTH_STEP));
+    uiBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      openSettingsPanel();
+    });
 
     uiBtn.addEventListener("contextmenu", (event) => {
       event.preventDefault();
-      changeCustomerWidth(-WIDTH_STEP);
+      openSettingsPanel();
     });
 
     document.body.appendChild(uiBtn);
@@ -800,7 +1547,7 @@ const COLUMN_LAYOUT = [
   }
 
   function removeUiButton() {
-    const node = document.getElementById("tm-btn-widen-customer");
+    const node = document.getElementById("tm-btn-invoice-settings");
     if (node) node.remove();
     uiBtn = null;
   }
@@ -808,9 +1555,12 @@ const COLUMN_LAYOUT = [
   function updateUiLabel() {
     if (!uiBtn) return;
 
-    const customerColumn = getAdjustableColumn();
-    const currentWidth = customerColumn ? getColumnWidth(customerColumn) : 0;
-    uiBtn.textContent = `开票客户 +${WIDTH_STEP}px（当前 ${currentWidth}px）`;
+    uiBtn.textContent = "⚙ 设置";
+
+    const adjustable = getAdjustableColumn();
+    if (adjustable) {
+      uiBtn.title = withVersion(`发票工具设置：文案替换、列宽（Alt+= / Alt+- 也可调「${adjustable.header}」列宽）`);
+    }
   }
 
   window.addEventListener(
@@ -842,6 +1592,1050 @@ const COLUMN_LAYOUT = [
     true
   );
 
+  /******************** 8.5) 发票下载：左键直下 PDF，右键选格式，列头批量 ********************/
+  /* 站点原流程：点「下载发票」→ 调 /invoice/download/pdf 拿 pdfUrl/ofdUrl/xmlUrl → 弹窗让人选格式
+     → 再点「PDF格式」才真正下载。这里把中间那步跳掉：
+       · 左键 → 直接下 PDF（默认，不再弹窗）
+       · 右键 → 就地弹菜单：PDF / OFD / XML 任选直下，或「使用原网页弹窗」退回站点原流程
+       · 批量 → 「操作」列头右侧的「批量下载」按钮：表格里有勾选行就只列这些，没勾选就列本页全部，
+         面板里自己勾要下的、选 PDF / OFD / XML；串行提交，进度实时提示，进行中再点即停止
+
+     ⚠️ 实测口径（2026-10-27）：
+     ① 接口响应只有 293 字节，data = { pdfUrl:[], ofdUrl:[], xmlUrl:[] }（短链 xforceplus）；
+        本体由短链 301 到 tw-doc 才给，落地文件名取自响应头 Content-Disposition，不用自己起名。
+     ② 本机装了 IDM，下载被 IDM 接管 ⇒ Chrome 自己的下载记录显示「已取消 / 0 字节」属正常现象，
+        文件实际落在 IDM 的下载目录里，别据此判断失败。
+     ③ 三个短链一次性缓存 5 分钟：同一条记录重复点（含换格式、批量）不再请求接口，且下载落在用户手势内，
+        避免 Chrome「多次自动下载」把后一次挡掉。 */
+
+  const DOWNLOAD_LINK_TEXT = "下载发票";
+  const DOWNLOAD_API = "/soa/api/v1/invoice/download/pdf";
+  const DOWNLOAD_CACHE_TTL = 5 * 60 * 1000;
+  const DOWNLOAD_CACHE_MAX = 200;
+  const DOWNLOAD_TIP_ID = "tm-invoice-download-tip";
+  const DOWNLOAD_MENU_ID = "tm-invoice-download-menu";
+  const DOWNLOAD_FALLBACK_REGION = "XX";
+  const DOWNLOAD_BATCH_GAP = 700; // 批量时每张的提交间隔，太快会被浏览器/IDM 挤掉
+  const DOWNLOAD_FORMAT_LABEL = { pdf: "PDF", ofd: "OFD", xml: "XML" };
+  const DOWNLOAD_FORMAT_FIELD = { pdf: "pdfUrl", ofd: "ofdUrl", xml: "xmlUrl" };
+
+  const downloadUrlCache = new Map(); // applyCode → { urls, at }
+  const downloadPending = new Set(); // 正在取 URL 的 applyCode（防连点）
+  let downloadTipTimer = null;
+  let menuTargetLink = null; // 右键点中的那条「下载发票」
+  let bypassNextClick = false; // 放行一次点击，让站点自己的「选格式」弹窗出来
+  let batchState = null; // { format, total, done, cancelled }
+
+  // 行的申请单号：状态格里的 div#applyCode-xxx 就是接口要的 applyCode；退一步用 data-row-key
+  function getRowApplyCode(tr) {
+    const holder = tr?.querySelector('[id^="applyCode-"]');
+    if (holder) return holder.id.slice("applyCode-".length);
+    return (tr?.getAttribute("data-row-key") || "").trim();
+  }
+
+  // 判断这条链接是不是发票表格里的「下载发票」；是则返回链接元素，否则 null
+  function getDownloadLink(node) {
+    const link = node?.closest?.("a");
+    if (!link || normText(link.innerText) !== DOWNLOAD_LINK_TEXT) return null;
+    // 只管发票表格里的那个「下载发票」，别误伤别处的同名链接
+    if (!link.closest(TABLE_SELECTOR)) return null;
+    return link;
+  }
+
+  function triggerFileDownload(url) {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.rel = "noopener";
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    anchor.click();
+    // ⚠️ 不能立刻 remove —— 下载接管（含 IDM 抢链）要一拍时间，删早了会把下载一起取消
+    setTimeout(() => anchor.remove(), 20000);
+  }
+
+  function showDownloadTip(text, ok, holdMs) {
+    let tip = document.getElementById(DOWNLOAD_TIP_ID);
+
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.id = DOWNLOAD_TIP_ID;
+      Object.assign(tip.style, {
+        position: "fixed",
+        left: "50%",
+        bottom: "40px",
+        transform: "translateX(-50%)",
+        zIndex: "9999999",
+        padding: "10px 16px",
+        borderRadius: "8px",
+        fontSize: "13px",
+        lineHeight: "20px",
+        color: "#fff",
+        boxShadow: "0 4px 16px rgba(0,0,0,.18)",
+        pointerEvents: "none",
+        maxWidth: "60vw",
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+      });
+      document.body.appendChild(tip);
+    }
+
+    tip.style.background = ok ? "#16a34a" : "#dc2626";
+    tip.textContent = text;
+    tip.style.display = "block";
+
+    if (downloadTipTimer) clearTimeout(downloadTipTimer);
+    downloadTipTimer = setTimeout(
+      () => {
+        tip.style.display = "none";
+      },
+      holdMs || (ok ? 1600 : 3600)
+    );
+  }
+
+  /********** 接口：一次拿三种格式的短链 **********/
+  function pickFirstUrl(value) {
+    if (typeof value === "string") return value;
+    if (!Array.isArray(value) || !value.length) return "";
+    return String(value[0] || "");
+  }
+
+  async function fetchInvoiceUrls(applyCode, regionCode) {
+    const response = await fetch(DOWNLOAD_API, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        mnClientId: SOA_CLIENT_ID,
+      },
+      body: JSON.stringify({ regionCode, applyCode }),
+    });
+
+    const json = await response.json();
+    const data = (json && json.data) || {};
+    return {
+      pdf: pickFirstUrl(data.pdfUrl),
+      ofd: pickFirstUrl(data.ofdUrl),
+      xml: pickFirstUrl(data.xmlUrl),
+    };
+  }
+
+  async function getInvoiceUrls(applyCode) {
+    const cached = downloadUrlCache.get(applyCode);
+    if (cached && Date.now() - cached.at < DOWNLOAD_CACHE_TTL) return cached.urls;
+
+    let urls = await fetchInvoiceUrls(
+      applyCode,
+      soaRegionCode || DOWNLOAD_FALLBACK_REGION
+    );
+
+    // 页面记下的 regionCode 万一不对，退回站点一直在用的那个再试一次
+    const empty = !urls.pdf && !urls.ofd && !urls.xml;
+    if (empty && soaRegionCode && soaRegionCode !== DOWNLOAD_FALLBACK_REGION) {
+      urls = await fetchInvoiceUrls(applyCode, DOWNLOAD_FALLBACK_REGION);
+    }
+    if (empty && !urls.pdf && !urls.ofd && !urls.xml) return null;
+
+    if (downloadUrlCache.size >= DOWNLOAD_CACHE_MAX) {
+      downloadUrlCache.delete(downloadUrlCache.keys().next().value);
+    }
+    downloadUrlCache.set(applyCode, { urls, at: Date.now() });
+    return urls;
+  }
+
+  /********** 单张下载 **********/
+  async function startDownload(applyCode, type = "pdf") {
+    const format = DOWNLOAD_FORMAT_FIELD[type] ? type : "pdf";
+    const label = DOWNLOAD_FORMAT_LABEL[format];
+
+    // 命中缓存就地同步触发，保住用户手势（更不容易被「多次自动下载」挡掉）
+    const cached = downloadUrlCache.get(applyCode);
+    if (cached && Date.now() - cached.at < DOWNLOAD_CACHE_TTL) {
+      const url = cached.urls[format];
+      if (!url) {
+        showDownloadTip("这张发票没有可取到的 " + label + " 文件", false);
+        return;
+      }
+      triggerFileDownload(url);
+      showDownloadTip("已开始下载 " + label, true);
+      return;
+    }
+
+    if (downloadPending.has(applyCode)) {
+      showDownloadTip("正在获取下载链接，请稍候", false);
+      return;
+    }
+    downloadPending.add(applyCode);
+
+    try {
+      const urls = await getInvoiceUrls(applyCode);
+      const url = urls && urls[format];
+
+      if (!url) {
+        showDownloadTip("这张发票没有可取到的 " + label + " 文件", false);
+        return;
+      }
+
+      triggerFileDownload(url);
+      showDownloadTip("已开始下载 " + label, true);
+    } catch (error) {
+      showDownloadTip("获取发票 " + label + " 失败，请稍后重试", false);
+    } finally {
+      downloadPending.delete(applyCode);
+    }
+  }
+
+  /********** 批量下载 **********/
+  // 本页所有可下载的发票：申请单号 + 面板上给人看的几列
+  /* 开票客户格里是两个 div：名称 + 税号。批量面板要按客户分组上色，所以单独取出来。 */
+  function getCustomerOfRow(cell) {
+    if (!cell) return { customer: "", customerCode: "" };
+
+    const parts = cell.querySelectorAll(":scope > .ellipsis");
+    if (parts.length >= 2) {
+      const name = normText(parts[0].innerText || parts[0].getAttribute("title"));
+      const code = normText(parts[1].innerText || parts[1].getAttribute("title"));
+      if (name) return { customer: name, customerCode: code };
+    }
+
+    const full = normText(cell.innerText);
+    if (!full) return { customer: "", customerCode: "" };
+
+    // 退路：整格文本形如「客户名，91410100MA444YUR45」
+    const matched = full.match(/^([\s\S]*?)[，,]\s*([0-9A-Z]{15,20})$/);
+    if (matched) {
+      return { customer: normText(matched[1]), customerCode: matched[2] };
+    }
+
+    return { customer: full, customerCode: "" };
+  }
+
+  function collectInvoiceRows() {
+    const table = document.querySelector(TABLE_SELECTOR);
+    if (!table) return [];
+
+    const indexMap = getHeaderIndexMap(table);
+    const sellerIdx = indexMap.get("销方公司");
+    const customerIdx = indexMap.get("开票客户");
+    const amountIdx = indexMap.get(AMOUNT_COLUMN_HEADER);
+    const applyNoIdx =
+      indexMap.get("申请单号") !== undefined
+        ? indexMap.get("申请单号")
+        : indexMap.get("申请单");
+
+    // 表格里有勾选行就只列这些（站点以后加了行选择也能直接用上）
+    const rows = getBodyRows(table);
+    const selected = rows.filter((tr) =>
+      tr.classList.contains("ant-table-row-selected")
+    );
+    const pool = selected.length ? selected : rows;
+
+    const seen = new Set();
+    const list = [];
+
+    pool.forEach((tr) => {
+      const hasLink = [...tr.querySelectorAll("a")].some(
+        (a) => normText(a.innerText) === DOWNLOAD_LINK_TEXT
+      );
+      if (!hasLink) return;
+
+      const applyCode = getRowApplyCode(tr);
+      if (!applyCode || seen.has(applyCode)) return;
+      seen.add(applyCode);
+
+      list.push({
+        applyCode,
+        seller:
+          sellerIdx !== undefined
+            ? normText(tr.children[sellerIdx]?.innerText)
+            : "",
+        applyNo:
+          applyNoIdx !== undefined
+            ? normText(tr.children[applyNoIdx]?.innerText)
+            : "",
+        ...getCustomerOfRow(
+          customerIdx !== undefined ? tr.children[customerIdx] : null
+        ),
+        amount:
+          amountIdx !== undefined
+            ? normText(tr.children[amountIdx]?.innerText)
+            : "",
+      });
+    });
+
+    return list;
+  }
+
+  // 面板里一行怎么显示：开票客户优先，实在没有才退回销方 / 申请单号
+  function getBatchLabel(item) {
+    return [item.customer, item.seller, item.applyNo || item.applyCode]
+      .filter(Boolean)[0] || "";
+  }
+
+  function cancelBatchDownload() {
+    if (batchState) batchState.cancelled = true;
+  }
+
+  async function startBatchDownload(type, codes) {
+    if (batchState) return;
+
+    const format = DOWNLOAD_FORMAT_FIELD[type] ? type : "pdf";
+    const label = DOWNLOAD_FORMAT_LABEL[format];
+    const targets =
+      Array.isArray(codes) && codes.length
+        ? codes
+        : collectInvoiceRows().map((item) => item.applyCode);
+
+    if (!targets.length) {
+      showDownloadTip("没有可批量下载的发票", false);
+      return;
+    }
+
+    batchState = { format, total: targets.length, done: 0, cancelled: false };
+    refreshBatchHeadButtons();
+    showDownloadTip("正在下载 " + label + " 0/" + targets.length, true, 600000);
+
+    let ok = 0;
+    let skipped = 0;
+    let cancelled = false;
+
+    for (let index = 0; index < targets.length; index += 1) {
+      if (batchState.cancelled) {
+        cancelled = true;
+        break;
+      }
+
+      let url = "";
+      try {
+        const urls = await getInvoiceUrls(targets[index]);
+        url = (urls && urls[format]) || "";
+      } catch (error) {
+        url = "";
+      }
+
+      if (url) {
+        triggerFileDownload(url);
+        ok += 1;
+      } else {
+        skipped += 1;
+      }
+
+      batchState.done = index + 1;
+      refreshBatchHeadButtons();
+      showDownloadTip(
+        "正在下载 " + label + " " + (index + 1) + "/" + targets.length,
+        true,
+        600000
+      );
+
+      // 最后一张不用等；间隔给浏览器/IDM 一点处理时间
+      if (index < targets.length - 1 && !batchState.cancelled) {
+        await new Promise((resolve) => setTimeout(resolve, DOWNLOAD_BATCH_GAP));
+      }
+    }
+
+    if (batchState.cancelled) cancelled = true;
+    batchState = null;
+    refreshBatchHeadButtons();
+
+    if (cancelled) {
+      showDownloadTip("已停止，已提交 " + ok + " 张 " + label, false);
+      return;
+    }
+    if (skipped) {
+      showDownloadTip(
+        "已提交 " + ok + " 张 " + label + "，" + skipped + " 张没有该格式",
+        false
+      );
+      return;
+    }
+    showDownloadTip("已提交 " + ok + " 张 " + label + " 下载", true);
+  }
+
+  // 什么都不拦，放站点自己的 onClick 跑一遍（弹回原来的「选择发票格式」窗口）
+  function openSiteDialog(link) {
+    bypassNextClick = true;
+    // 兜底：万一这次 click 没进到拦截器（例如链接被重渲染），1s 后自动复位
+    setTimeout(() => {
+      bypassNextClick = false;
+    }, 1000);
+    link.click();
+  }
+
+  /********** 批量下载面板：自己勾选要下哪几张、用哪种格式 **********/
+  function ensureBatchPanel() {
+    const panelId = DOWNLOAD_MENU_ID + "-batch";
+    let panel = document.getElementById(panelId);
+
+    // 新旧两版并存时，同名面板可能是旧版建的（结构、样式都对不上），校验后重建
+    if (panel && panel.dataset.tmBuild !== "2") {
+      panel.remove();
+      const oldStyle = document.getElementById(panelId + "-style");
+      if (oldStyle) oldStyle.remove();
+      panel = null;
+    }
+    if (panel) return panel;
+
+    const style = document.createElement("style");
+    style.id = panelId + "-style";
+    style.textContent = `
+      #${panelId} {
+        position: fixed; inset: 0; z-index: 2147483000; display: none;
+        background: rgba(15,23,42,.35);
+        font: 13px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        color: #1f2937;
+      }
+      #${panelId} * { box-sizing: border-box; }
+      #${panelId} .tm-batch-box {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+        width: 620px; max-width: 92vw; max-height: 84vh;
+        display: flex; flex-direction: column;
+        background: #fff; border-radius: 10px; box-shadow: 0 20px 60px rgba(15,23,42,.28);
+      }
+      #${panelId} .tm-batch-head {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 13px 16px; border-bottom: 1px solid #f0f0f0;
+        font-size: 15px; font-weight: 600;
+      }
+      #${panelId} .tm-batch-close {
+        cursor: pointer; color: #9ca3af; font-size: 18px; line-height: 1; padding: 2px 4px;
+        border-radius: 4px;
+      }
+      #${panelId} .tm-batch-close:hover { color: #ff4d4f; background: #fff1f0; }
+      #${panelId} .tm-batch-formats { display: flex; align-items: center; gap: 8px; padding: 12px 16px 0; }
+      #${panelId} .tm-batch-fmt-label { font-size: 12px; color: #8c8c8c; margin-right: 2px; }
+      #${panelId} .tm-batch-fmt {
+        height: 30px; padding: 0 14px; border: 1px solid #d9d9d9; border-radius: 6px;
+        background: #fff; color: #595959; font-size: 13px; cursor: pointer;
+      }
+      #${panelId} .tm-batch-fmt:hover { border-color: #237ffe; color: #237ffe; }
+      #${panelId} .tm-batch-fmt.is-active {
+        border-color: #237ffe; color: #237ffe; background: #f4f8ff;
+      }
+      #${panelId} .tm-batch-bar {
+        display: flex; align-items: center; gap: 8px;
+        padding: 10px 16px 8px; font-size: 12px; color: #595959; cursor: pointer;
+      }
+      #${panelId} .tm-batch-count { margin-left: auto; color: #9ca3af; }
+      #${panelId} .tm-batch-list {
+        margin: 0 16px 12px; border: 1px solid #f0f0f0; border-radius: 8px;
+        overflow: auto; max-height: 44vh; min-height: 60px;
+      }
+      #${panelId} .tm-batch-item {
+        display: flex; align-items: center; gap: 8px;
+        padding: 7px 10px 7px 8px; cursor: pointer; border-bottom: 1px solid #fafafa;
+        /* 同一家客户：左侧色条 + 同色极浅底色，一眼看出哪几行是一家的 */
+        border-left: 4px solid var(--tm-group-color, transparent);
+        background: color-mix(in srgb, var(--tm-group-color, #fff) 7%, #fff);
+      }
+      #${panelId} .tm-batch-item:last-child { border-bottom: none; }
+      #${panelId} .tm-batch-item:hover {
+        background: color-mix(in srgb, var(--tm-group-color, #237ffe) 15%, #fff);
+      }
+      #${panelId} .tm-batch-item input { flex: 0 0 auto; margin: 0; }
+      #${panelId} .tm-batch-item-text {
+        flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px;
+      }
+      #${panelId} .tm-batch-item-name {
+        flex: 0 1 auto; min-width: 0; font-weight: 600; color: #1f2937;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #${panelId} .tm-batch-item-code {
+        flex: 0 1 auto; min-width: 0; color: #a8b0bd; font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #${panelId} .tm-batch-item-amount {
+        flex: 0 0 auto; min-width: 72px; text-align: right;
+        color: #595959; font-style: normal;
+        font-variant-numeric: tabular-nums;
+      }
+      #${panelId} .tm-batch-foot {
+        display: flex; justify-content: flex-end; gap: 8px;
+        padding: 12px 16px; border-top: 1px solid #f0f0f0;
+      }
+      #${panelId} .tm-batch-btn {
+        height: 32px; padding: 0 16px; border-radius: 6px; border: 1px solid #d9d9d9;
+        background: #fff; color: #1f2937; font-size: 13px; cursor: pointer;
+      }
+      #${panelId} .tm-batch-btn:hover { border-color: #237ffe; color: #237ffe; }
+      #${panelId} .tm-batch-btn.primary {
+        background: #237ffe; border-color: #237ffe; color: #fff;
+      }
+      #${panelId} .tm-batch-btn.primary:hover { background: #1a6fe0; color: #fff; }
+    `;
+    document.head.appendChild(style);
+
+    panel = document.createElement("div");
+    panel.id = panelId;
+    panel.dataset.tmBuild = "2";
+
+    const box = document.createElement("div");
+    box.className = "tm-batch-box";
+
+    const head = document.createElement("div");
+    head.className = "tm-batch-head";
+    const title = document.createElement("span");
+    title.className = "tm-batch-title";
+    title.textContent = "批量下载发票";
+    const close = document.createElement("span");
+    close.className = "tm-batch-close";
+    close.textContent = "×";
+    close.title = "关闭";
+    head.append(title, close);
+
+    const formats = document.createElement("div");
+    formats.className = "tm-batch-formats";
+    const formatsLabel = document.createElement("span");
+    formatsLabel.className = "tm-batch-fmt-label";
+    formatsLabel.textContent = "格式";
+    formats.appendChild(formatsLabel);
+
+    ["pdf", "ofd", "xml"].forEach((format) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className =
+        "tm-batch-fmt" + (format === "pdf" ? " is-active" : "");
+      button.dataset.format = format;
+      button.textContent = DOWNLOAD_FORMAT_LABEL[format];
+      button.addEventListener("click", () => {
+        formats.querySelectorAll(".tm-batch-fmt").forEach((node) => {
+          node.classList.toggle("is-active", node.dataset.format === format);
+        });
+      });
+      formats.appendChild(button);
+    });
+
+    const bar = document.createElement("label");
+    bar.className = "tm-batch-bar";
+    const allBox = document.createElement("input");
+    allBox.type = "checkbox";
+    allBox.className = "tm-batch-all";
+    const barText = document.createElement("span");
+    barText.textContent = "全选";
+    const count = document.createElement("span");
+    count.className = "tm-batch-count";
+    bar.append(allBox, barText, count);
+
+    const list = document.createElement("div");
+    list.className = "tm-batch-list";
+
+    const foot = document.createElement("div");
+    foot.className = "tm-batch-foot";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "tm-batch-btn tm-batch-cancel";
+    cancel.textContent = "取消";
+    const start = document.createElement("button");
+    start.type = "button";
+    start.className = "tm-batch-btn tm-batch-start primary";
+    start.textContent = "开始下载";
+    foot.append(cancel, start);
+
+    box.append(head, formats, bar, list, foot);
+    panel.appendChild(box);
+    document.body.appendChild(panel);
+
+    const syncCount = () => {
+      const boxes = [...list.querySelectorAll(".tm-batch-item input")];
+      const checked = boxes.filter((input) => input.checked).length;
+
+      count.textContent = "已选 " + checked + "/" + boxes.length;
+      allBox.checked = checked > 0 && checked === boxes.length;
+      allBox.indeterminate = checked > 0 && checked < boxes.length;
+
+      const disabled = checked === 0;
+      start.disabled = disabled;
+      start.style.opacity = disabled ? ".5" : "1";
+      start.style.cursor = disabled ? "not-allowed" : "pointer";
+    };
+
+    allBox.addEventListener("change", () => {
+      list.querySelectorAll(".tm-batch-item input").forEach((input) => {
+        input.checked = allBox.checked;
+      });
+      syncCount();
+    });
+
+    list.addEventListener("change", syncCount);
+
+    const hide = () => {
+      panel.style.display = "none";
+    };
+
+    close.addEventListener("click", hide);
+    cancel.addEventListener("click", hide);
+    panel.addEventListener("mousedown", (event) => {
+      if (event.target === panel) hide();
+    });
+
+    // ESC 关面板。只在自己开着的时候拦，别把按键连带吞给站点。
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key !== "Escape" && event.key !== "Esc") return;
+        if (panel.style.display === "none") return;
+        event.preventDefault();
+        event.stopPropagation();
+        hide();
+      },
+      true
+    );
+
+    start.addEventListener("click", () => {
+      const codes = [...list.querySelectorAll(".tm-batch-item input")]
+        .filter((input) => input.checked)
+        .map((input) => input.value);
+      if (!codes.length) return;
+
+      const active = formats.querySelector(".tm-batch-fmt.is-active");
+      const format = active ? active.dataset.format : "pdf";
+
+      hide();
+      startBatchDownload(format, codes);
+    });
+
+    panel.tmSyncCount = syncCount;
+    return panel;
+  }
+
+  /* 批量面板的分组色条：只有「同一客户出现 2 张及以上」才上色（才需要区分），
+     只出现一次的那种用素色，免得整列五颜六色反而看不清重点。 */
+  const BATCH_SINGLE_COLOR = "#e8ebf0";
+  const BATCH_GROUP_COLORS = [
+    "#237ffe",
+    "#00b96b",
+    "#fa8c16",
+    "#eb2f96",
+    "#722ed1",
+    "#13c2c2",
+    "#f5222d",
+    "#52c41a",
+    "#2f54eb",
+    "#d48806",
+    "#08979c",
+    "#c41d7f",
+    "#8c6e2f",
+    "#3f6600",
+    "#ad4e00",
+    "#003a8c",
+  ];
+
+  function openBatchPanel() {
+    const items = collectInvoiceRows();
+    if (!items.length) {
+      showDownloadTip("没有可批量下载的发票", false);
+      return;
+    }
+
+    const panel = ensureBatchPanel();
+    const title = panel.querySelector(".tm-batch-title");
+    const list = panel.querySelector(".tm-batch-list");
+
+    title.textContent = "批量下载发票（共 " + items.length + " 张）";
+    list.textContent = "";
+
+    // 同一家客户在清单里用同一个颜色条：按首次出现的顺序从调色板取色，
+    // 行的顺序保持页面原样，不重排。
+    const countByCustomer = new Map();
+    items.forEach((item) => {
+      const key =
+        safeReplaceText(item.customer || "") ||
+        item.seller ||
+        item.applyNo ||
+        item.applyCode;
+      countByCustomer.set(key, (countByCustomer.get(key) || 0) + 1);
+    });
+
+    const colorByCustomer = new Map();
+    const colorOf = (key) => {
+      if ((countByCustomer.get(key) || 0) < 2) return BATCH_SINGLE_COLOR;
+      if (!colorByCustomer.has(key)) {
+        colorByCustomer.set(
+          key,
+          BATCH_GROUP_COLORS[colorByCustomer.size % BATCH_GROUP_COLORS.length]
+        );
+      }
+      return colorByCustomer.get(key);
+    };
+
+    items.forEach((item) => {
+      const row = document.createElement("label");
+      row.className = "tm-batch-item";
+
+      // 表里显示的是替换后的客户名（和页面上看到的一致），所以配色也按它分
+      const customer = safeReplaceText(item.customer || "");
+      const fallback = item.seller || item.applyNo || item.applyCode;
+      const shown = customer || fallback;
+      row.style.setProperty("--tm-group-color", colorOf(shown));
+
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.value = item.applyCode;
+      box.checked = true;
+
+      const text = document.createElement("span");
+      text.className = "tm-batch-item-text";
+
+      const name = document.createElement("b");
+      name.className = "tm-batch-item-name";
+      name.textContent = shown;
+
+      const code = document.createElement("span");
+      code.className = "tm-batch-item-code";
+      code.textContent = item.customerCode || "";
+
+      text.append(name, code);
+      text.title = [
+        customer || item.customer,
+        item.customerCode,
+        item.seller,
+        item.applyNo || item.applyCode,
+        item.amount,
+      ]
+        .filter(Boolean)
+        .join(" ｜ ");
+
+      const amount = document.createElement("em");
+      amount.className = "tm-batch-item-amount";
+      amount.textContent = item.amount;
+
+      row.append(box, text, amount);
+      list.appendChild(row);
+    });
+
+    panel.style.display = "block";
+    list.scrollTop = 0;
+    if (panel.tmSyncCount) panel.tmSyncCount();
+  }
+
+  /********** 悬浮提示：让人知道能点、也能右键 **********/
+  const HOVER_TIP_ID = DOWNLOAD_MENU_ID + "-hover";
+  let hoverTipTimer = null;
+
+  function hideHoverTip() {
+    if (hoverTipTimer) {
+      clearTimeout(hoverTipTimer);
+      hoverTipTimer = null;
+    }
+    const tip = document.getElementById(HOVER_TIP_ID);
+    if (tip) tip.style.display = "none";
+  }
+
+  function showHoverTip(link) {
+    let tip = document.getElementById(HOVER_TIP_ID);
+
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.id = HOVER_TIP_ID;
+      Object.assign(tip.style, {
+        position: "fixed",
+        zIndex: "2147483500",
+        display: "none",
+        padding: "8px 10px",
+        borderRadius: "8px",
+        background: "rgba(17,24,39,.94)",
+        color: "#fff",
+        fontSize: "12px",
+        lineHeight: "18px",
+        boxShadow: "0 8px 20px rgba(0,0,0,.22)",
+        pointerEvents: "none",
+        whiteSpace: "nowrap",
+        fontFamily:
+          '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif',
+      });
+      tip.innerHTML =
+        "<b>左键</b>：直接下载 PDF<br><b>右键</b>：选格式 / 原弹窗";
+      document.body.appendChild(tip);
+    }
+
+    tip.style.display = "block";
+    tip.style.left = "0px";
+    tip.style.top = "0px";
+
+    const rect = link.getBoundingClientRect();
+    const tipRect = tip.getBoundingClientRect();
+    const gap = 6;
+
+    let left = rect.left + rect.width / 2 - tipRect.width / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tipRect.width - 8));
+
+    let top = rect.bottom + gap;
+    if (top + tipRect.height > window.innerHeight - 8) {
+      top = Math.max(8, rect.top - tipRect.height - gap);
+    }
+
+    tip.style.left = Math.round(left) + "px";
+    tip.style.top = Math.round(top) + "px";
+  }
+
+  document.addEventListener(
+    "mouseover",
+    (event) => {
+      if (!enabled) return;
+
+      const link = getDownloadLink(event.target);
+      if (!link) return;
+      if (event.relatedTarget && link.contains(event.relatedTarget)) return;
+
+      hideHoverTip();
+      hoverTipTimer = setTimeout(() => {
+        hoverTipTimer = null;
+        if (link.isConnected) showHoverTip(link);
+      }, 350);
+    },
+    true
+  );
+
+  document.addEventListener(
+    "mouseout",
+    (event) => {
+      const link = getDownloadLink(event.target);
+      if (!link) return;
+      if (event.relatedTarget && link.contains(event.relatedTarget)) return;
+      hideHoverTip();
+    },
+    true
+  );
+
+  /********** 右键菜单 **********/
+  function isMenuVisible() {
+    const menu = document.getElementById(DOWNLOAD_MENU_ID);
+    return !!menu && menu.style.display !== "none";
+  }
+
+  function hideDownloadMenu() {
+    const menu = document.getElementById(DOWNLOAD_MENU_ID);
+    if (menu) menu.style.display = "none";
+    menuTargetLink = null;
+  }
+
+  function buildMenuItem(label, hint, type) {
+    const item = document.createElement("div");
+    item.className = "tm-inv-menu-item";
+    item.dataset.type = type;
+
+    const text = document.createElement("span");
+    text.className = "tm-inv-menu-label";
+    text.textContent = label;
+    item.appendChild(text);
+
+    if (hint) {
+      const note = document.createElement("span");
+      note.className = "tm-inv-menu-hint";
+      note.textContent = hint;
+      item.appendChild(note);
+    }
+    return item;
+  }
+
+  function ensureDownloadMenu() {
+    let menu = document.getElementById(DOWNLOAD_MENU_ID);
+
+    // 页面上可能残留别的版本建的同名菜单（例如新旧两版并存时装过），结构对不上就重建
+    if (menu && menu.dataset.tmBuild !== "3") {
+      menu.remove();
+      menu = null;
+    }
+    if (menu) return menu;
+
+    const style = document.createElement("style");
+    style.id = DOWNLOAD_MENU_ID + "-style";
+    style.textContent = [
+      "div#" + DOWNLOAD_MENU_ID + "{position:fixed;z-index:2147483600;display:none;",
+      "min-width:150px;padding:6px 0;background:#fff;border:1px solid #e8e8e8;border-radius:8px;",
+      "box-shadow:0 8px 24px rgba(15,23,42,.16);color:#1f2937;",
+      "font:13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;",
+      "user-select:none;-webkit-user-select:none}",
+      "div#" + DOWNLOAD_MENU_ID + " .tm-inv-menu-item{display:flex;align-items:center;",
+      "justify-content:space-between;gap:16px;padding:7px 14px;cursor:pointer;white-space:nowrap}",
+      "div#" + DOWNLOAD_MENU_ID + " .tm-inv-menu-item:hover{background:#f4f0ff;color:#6d28d9}",
+      "div#" + DOWNLOAD_MENU_ID + " .tm-inv-menu-item.is-disabled{opacity:.4;cursor:not-allowed;",
+      "pointer-events:none}",
+      "div#" + DOWNLOAD_MENU_ID + " .tm-inv-menu-item.is-busy .tm-inv-menu-label{color:#6d28d9}",
+      "div#" + DOWNLOAD_MENU_ID + " .tm-inv-menu-hint{color:#9ca3af;font-size:12px}",
+      "div#" + DOWNLOAD_MENU_ID + " .tm-inv-menu-item:hover .tm-inv-menu-hint{color:#a78bfa}",
+      "div#" + DOWNLOAD_MENU_ID + " .tm-inv-menu-sep{height:1px;margin:5px 0;background:#f0f0f0}",
+    ].join("");
+    document.head.appendChild(style);
+
+    menu = document.createElement("div");
+    menu.id = DOWNLOAD_MENU_ID;
+    menu.dataset.tmBuild = "3";
+    menu.appendChild(buildMenuItem("PDF 格式", "左键直下", "pdf"));
+    menu.appendChild(buildMenuItem("OFD 格式", "", "ofd"));
+    menu.appendChild(buildMenuItem("XML 格式", "", "xml"));
+
+    const sep = document.createElement("div");
+    sep.className = "tm-inv-menu-sep";
+    menu.appendChild(sep);
+
+    menu.appendChild(buildMenuItem("使用原网页弹窗", "选格式", "origin"));
+
+    // 菜单内的按下不能被外层的「点空白关闭」抢先吃掉
+    menu.addEventListener("mousedown", (event) => event.stopPropagation(), true);
+
+    menu.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const item = event.target?.closest?.(".tm-inv-menu-item");
+      if (!item || item.classList.contains("is-disabled")) return;
+
+      const link = menuTargetLink;
+      const type = item.dataset.type;
+      hideDownloadMenu();
+
+      // 链接被重渲染掉了就放弃，别让这次点击毫无反应
+      if (!link || !link.isConnected) return;
+
+      if (type === "origin") {
+        openSiteDialog(link);
+        return;
+      }
+
+      const applyCode = getRowApplyCode(link.closest("tr"));
+      if (!applyCode) {
+        openSiteDialog(link);
+        return;
+      }
+      startDownload(applyCode, type);
+    });
+
+    document.body.appendChild(menu);
+    return menu;
+  }
+
+  // 打开菜单时刷新：按缓存灰掉这张发票没有的格式
+  function syncMenuAvailability(menu, applyCode) {
+    const cached = downloadUrlCache.get(applyCode);
+    const fresh =
+      cached && Date.now() - cached.at < DOWNLOAD_CACHE_TTL ? cached.urls : null;
+
+    menu.querySelectorAll(".tm-inv-menu-item").forEach((item) => {
+      const type = item.dataset.type || "";
+      if (!DOWNLOAD_FORMAT_FIELD[type]) return;
+
+      const available = !fresh || !!fresh[type];
+      item.classList.toggle("is-disabled", !available);
+      item.title = available
+        ? ""
+        : "这张发票没有 " + DOWNLOAD_FORMAT_LABEL[type] + " 文件";
+    });
+
+  }
+
+  function showDownloadMenu(link, clientX, clientY) {
+    hideHoverTip();
+    const menu = ensureDownloadMenu();
+    menuTargetLink = link;
+    syncMenuAvailability(menu, getRowApplyCode(link.closest("tr")));
+
+    menu.style.display = "block";
+    menu.style.left = "0px";
+    menu.style.top = "0px";
+
+    const rect = menu.getBoundingClientRect();
+    const gap = 8;
+    const maxLeft = window.innerWidth - rect.width - gap;
+    const maxTop = window.innerHeight - rect.height - gap;
+
+    const left = Math.min(Math.max(gap, clientX), Math.max(gap, maxLeft));
+    const top = Math.min(Math.max(gap, clientY), Math.max(gap, maxTop));
+
+    menu.style.left = Math.round(left) + "px";
+    menu.style.top = Math.round(top) + "px";
+  }
+
+  // 抢在站点自己的 onClick 之前接管（document 捕获阶段，React 的委托跑在后面）
+  document.addEventListener(
+    "click",
+    (event) => {
+      if (!enabled) return;
+
+      const link = getDownloadLink(event.target);
+      if (!link) return;
+
+      // 右键菜单选了「使用原网页弹窗」：放行这一次，让站点自己弹「选格式」
+      if (bypassNextClick) {
+        bypassNextClick = false;
+        return;
+      }
+
+      // 拿不到申请单号就放行，退回站点原来的「选格式」弹窗，不至于点不动
+      const applyCode = getRowApplyCode(link.closest("tr"));
+      if (!applyCode) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+
+      hideDownloadMenu();
+      hideHoverTip();
+      startDownload(applyCode, "pdf");
+    },
+    true
+  );
+
+  // 右键「下载发票」：接管浏览器原生右键菜单，换成格式菜单
+  document.addEventListener(
+    "contextmenu",
+    (event) => {
+      if (!enabled) return;
+
+      const link = getDownloadLink(event.target);
+      if (!link) return;
+
+      // 没有申请单号的发票不接管，保留浏览器原生右键菜单
+      if (!getRowApplyCode(link.closest("tr"))) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      showDownloadMenu(link, event.clientX, event.clientY);
+    },
+    true
+  );
+
+  // 点别处 / Esc / 滚动 / 改窗口大小 都收起菜单
+  document.addEventListener(
+    "mousedown",
+    (event) => {
+      if (!isMenuVisible()) return;
+      const menu = document.getElementById(DOWNLOAD_MENU_ID);
+      if (menu && menu.contains(event.target)) return;
+      hideDownloadMenu();
+    },
+    true
+  );
+
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key === "Escape" && isMenuVisible()) {
+        hideDownloadMenu();
+      }
+    },
+    true
+  );
+
+  window.addEventListener(
+    "scroll",
+    () => {
+      hideDownloadMenu();
+      hideHoverTip();
+    },
+    true
+  );
+  window.addEventListener(
+    "resize",
+    () => {
+      hideDownloadMenu();
+      hideHoverTip();
+    },
+    true
+  );
+
   /******************** 9) 复制：按页面可视列顺序输出 ********************/
   function selectionIntersectsNode(selection, node) {
     if (!selection || !node) return false;
@@ -855,8 +2649,79 @@ const COLUMN_LAYOUT = [
     return false;
   }
 
-  function getClipboardCellText(cell, header) {
+  /* ---- 框选复制：先判断「整格都被选中」还是「只选了一部分」 ---- */
+  // 某个 selection range 是否完整覆盖这个节点
+  function rangeCoversNode(range, node) {
+    try {
+      const nodeRange = document.createRange();
+      nodeRange.selectNodeContents(node);
+
+      return (
+        range.compareBoundaryPoints(Range.START_TO_START, nodeRange) <= 0 &&
+        range.compareBoundaryPoints(Range.END_TO_END, nodeRange) >= 0
+      );
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // 格子里的文字全被选中 → true（用格式化输出，例如「客户名，税号」）
+  function isCellFullySelected(selection, cell) {
+    const textNodes = getMeaningfulTextNodes(cell);
+    if (!textNodes.length) return false;
+
+    const ranges = [];
+    for (let index = 0; index < selection.rangeCount; index += 1) {
+      ranges.push(selection.getRangeAt(index));
+    }
+    if (!ranges.length) return false;
+
+    return textNodes.every((node) =>
+      ranges.some((range) => rangeCoversNode(range, node))
+    );
+  }
+
+  // 只把框选到的那部分文字取出来（框选半格就只复制半格）
+  function getSelectedTextInCell(selection, cell) {
+    const pieces = [];
+    const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (!node.nodeValue) continue;
+
+      for (let index = 0; index < selection.rangeCount; index += 1) {
+        const range = selection.getRangeAt(index);
+        if (!range.intersectsNode(node)) continue;
+
+        try {
+          const piece = document.createRange();
+          piece.selectNodeContents(node);
+
+          if (range.compareBoundaryPoints(Range.START_TO_START, piece) > 0) {
+            piece.setStart(range.startContainer, range.startOffset);
+          }
+          if (range.compareBoundaryPoints(Range.END_TO_END, piece) < 0) {
+            piece.setEnd(range.endContainer, range.endOffset);
+          }
+
+          const text = piece.toString();
+          if (text) pieces.push(text);
+        } catch (error) {}
+        break;
+      }
+    }
+
+    return normText(pieces.join(" "));
+  }
+
+  function getClipboardCellText(cell, header, selection) {
     if (!cell) return "";
+
+    // 只框到格子里的一部分文字 → 就复制那一部分，别把整格（含税号）一起带出来
+    if (selection && !isCellFullySelected(selection, cell)) {
+      return getSelectedTextInCell(selection, cell);
+    }
 
     if (header === "开票客户") {
       const parts = cell.querySelectorAll(":scope > .ellipsis");
@@ -935,11 +2800,16 @@ const COLUMN_LAYOUT = [
     }
 
     selectedRows.forEach((row) => {
-      rows.push(
-        selectedColumns.map((column) =>
-          getClipboardCellText(row.children[column.domIndex], column.header)
+      const values = selectedColumns.map((column) =>
+        getClipboardCellText(
+          row.children[column.domIndex],
+          column.header,
+          selection
         )
       );
+
+      // 只被选区边界擦到、其实一个字都没选中的行，别输出一堆空串
+      if (values.some((value) => String(value).trim())) rows.push(values);
     });
 
     return rows.length ? { rows, includeHeader } : null;
@@ -1068,12 +2938,16 @@ const COLUMN_LAYOUT = [
   function scheduleWork(forceStyle = false) {
     if (!enabled) return;
 
+    // 拖列宽时把文案替换、金额量宽这些重活全停掉：拖动本身只改宽度，可站点重排会
+    // 带出一串 DOM 变化，观察者一遍遍叫我们重算 51 行 × 11 列，拖起来就是卡的。
+    // 松手时 finishColumnResize 会同步补一次。
+    if (isResizingColumn) return;
+
     pendingForceStyle = pendingForceStyle || forceStyle;
     if (scheduled) return;
     scheduled = true;
 
-    requestAnimationFrame(() => {
-      scheduled = false;
+    const run = () => {
       if (!enabled) {
         pendingForceStyle = false;
         return;
@@ -1097,6 +2971,7 @@ const COLUMN_LAYOUT = [
       }
 
       ensureUiButton();
+      ensureBatchHeadButton();
       processRowsIncremental(observedTableRoot);
 
       // 金额列宽跟着内容走：量宽放在行处理之后，这样量到的是去过千分位逗号的
@@ -1107,6 +2982,19 @@ const COLUMN_LAYOUT = [
       ) {
         applyOrUpdateStyle(headerSignature);
       }
+    };
+
+    // ⚠️ 后台标签页的 rAF 会被挂起（实测：后台打开发票页一行样式都不生效，
+    //    切回前台才补上）。这种时候直接同步跑一次，别把工作全压在 rAF 上。
+    if (document.hidden) {
+      scheduled = false;
+      run();
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      scheduled = false;
+      run();
     });
   }
 
@@ -1201,7 +3089,8 @@ const COLUMN_LAYOUT = [
     if (!url || !url.includes("/invoice/")) return false;
     if (String(method || "GET").toUpperCase() === "GET") return false;
 
-    return !/\/(query|list|detail|page|statistics|total|count|type|goods|org|company|template)/i.test(
+    // 下载类端点也算读（否则自己取 pdfUrl 会被当成写接口，白补一轮销方公司真值）
+    return !/\/(query|list|detail|page|statistics|total|count|type|goods|org|company|template|download)/i.test(
       url
     );
   }
@@ -1378,6 +3267,7 @@ const COLUMN_LAYOUT = [
     disconnectRootObserver();
     removeStyle();
     removeUiButton();
+    closeSettingsPanel();
 
     customerWidthDelta = 0;
     lastPageKey = null;
