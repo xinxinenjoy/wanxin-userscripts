@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.2订单页面
 // @namespace    https://tampermonkey.net/soa-order-invoice/
-// @version      1.20
+// @version      1.27
 // @description  发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -29,24 +29,61 @@
     location.hash.startsWith(TARGET_HASH_PREFIX);
 
   /******************** 1) 配置 ********************/
-  /*需要隐藏的表头填在这个位置，换行用逗号隔开*/
-  const HIDDEN_COLUMNS = [
-    "卡类开票",
-    "预开票",
-    "发票类型",
+  /* ---- 列定义 ----------------------------------------------------------------
+     id     记住「顺序 / 显隐」用的稳定标识（表头文字变了也不会丢配置）
+     header 站点表头上的文字，用来在 DOM 里找到这一列
+     width  默认宽度（用户拖过就以拖出来的为准，存 localStorage）
+     align  "right" = 数字列，右对齐 + 等宽数字
+     hidden 默认不显示
+     virtual 站点没有这一列，由脚本自己造（表头 + 每行一格）——目前只有「税号」 */
+  const COLUMN_DEFS = [
+    // 2026-10-27 按用户浏览器里实际在用的设置固化为默认（顺序 / 显隐 / 列宽），
+    // 换机器、清了缓存再装上去就是这个样子，不用再手动调一遍。
+    // 销方公司替换成简称后是「高新（玫瑰园）」这种 7~8 个字，130 刚好，
+    // 再窄会被站点那格 antd 的 JS 省略组件截掉半截。
+    { id: "seller", header: "销方公司", width: 130, align: "right" },
+    { id: "customer", header: "开票客户", width: 314, adjustable: true },
+    { id: "taxno", header: "税号", width: 200, virtual: true },
+    { id: "amount", header: "发票金额", width: 80, align: "right" },
+    { id: "status", header: "当前状态", width: 110 },
+    { id: "creator", header: "创建人", width: 222 },
+    { id: "actions", header: "操作", width: 260 },
+    { id: "applyNo", header: "申请单", width: 217 },
+    { id: "advance", header: "预开票", width: 64 },
+    { id: "card", header: "卡类开票", width: 74 },
+    { id: "corpCode", header: "申请开票单位代码", width: 150, hidden: true },
+    // 「来源」表头里带着站点的筛选勾选框（不显示非SOA开票），窄了会被裁掉，给够 174
+    { id: "source", header: "来源", width: 174 },
+    { id: "type", header: "发票类型", width: 100, hidden: true },
   ];
 
-const COLUMN_LAYOUT = [
-    { header: "销方公司", width: 100, align: "right"  },
-    { header: "开票客户", width: 530, adjustable: true },
-    { header: "发票金额", width: 80, align: "right" },
-    { header: "当前状态", width: 110 },
-    { header: "创建人", width: 150 },
-    { header: "操作", width: 260 },
-    { header: "申请单", width: 230 },
-    { header: "申请开票单位代码", width: 150 },
-    { header: "来源", width: 80 },
-  ];
+  const COLUMN_DEF_BY_ID = new Map(COLUMN_DEFS.map((def) => [def.id, def]));
+
+  // 设置面板里改过的顺序 / 显隐（loadSettings 会覆盖）
+  let columnOrder = COLUMN_DEFS.map((def) => def.id);
+  let hiddenColumnIds = new Set(
+    COLUMN_DEFS.filter((def) => def.hidden).map((def) => def.id)
+  );
+
+  /* 现有代码全部按 COLUMN_LAYOUT 的数组顺序决定视觉位置（buildCss 里 order = 下标），
+     所以这里只需要把它按配置重排一遍，其它逻辑不用动。 */
+  let COLUMN_LAYOUT = [];
+
+  function rebuildColumnLayout() {
+    const known = new Set(COLUMN_DEFS.map((def) => def.id));
+
+    // 配置里可能有已经删掉的列（脚本升级后），过滤掉；没配置到的列按原顺序补在最后
+    const ordered = columnOrder.filter((id) => known.has(id));
+    COLUMN_DEFS.forEach((def) => {
+      if (!ordered.includes(def.id)) ordered.push(def.id);
+    });
+
+    columnOrder = ordered;
+    COLUMN_LAYOUT = ordered.map((id) => {
+      const def = COLUMN_DEF_BY_ID.get(id);
+      return { ...def, hidden: hiddenColumnIds.has(id) };
+    });
+  }
 
   const DEFAULT_TEXT_REPLACE = {
     "全电普通发票（电子）": "电子普票",
@@ -99,6 +136,17 @@ const COLUMN_LAYOUT = [
           }
         });
       }
+
+      if (Array.isArray(data.columnOrder)) {
+        const ids = data.columnOrder.filter((id) => typeof id === "string");
+        if (ids.length) columnOrder = ids;
+      }
+
+      if (Array.isArray(data.hiddenColumns)) {
+        hiddenColumnIds = new Set(
+          data.hiddenColumns.filter((id) => typeof id === "string")
+        );
+      }
     } catch (error) {}
   }
 
@@ -106,12 +154,18 @@ const COLUMN_LAYOUT = [
     try {
       localStorage.setItem(
         SETTINGS_STORAGE_KEY,
-        JSON.stringify({ textReplace: TEXT_REPLACE, columnWidths })
+        JSON.stringify({
+          textReplace: TEXT_REPLACE,
+          columnWidths,
+          columnOrder,
+          hiddenColumns: [...hiddenColumnIds],
+        })
       );
     } catch (error) {}
   }
 
   loadSettings();
+  rebuildColumnLayout();
 
 
   /* 「发票金额」列宽自适应。
@@ -122,6 +176,22 @@ const COLUMN_LAYOUT = [
   const AMOUNT_COLUMN_HEADER = "发票金额";
   const AMOUNT_COLUMN_MIN = 80;
   const AMOUNT_COLUMN_MAX = 240;
+
+  /* ---- 商品明细：列表里看不到，得逐张查「详情」接口拿 taxableList ----
+     接口实测（2026-10-27）：POST /invoice/query/detail → data.taxableList[]
+     每项 = { taxableName 商品名称, unit 单位, taxableCustCount 数量, amount 本行价税合计 }。
+     ⚠️ 数量留空 = 这个键**根本不存在**（undefined），不是 0 —— 别拿 0 当「没填」。
+     商品名称几乎恒为「医疗服务（体检费）」，所以明细的差异只在「数量 ↔ 金额」的配对。 */
+  /* 明细缓存直接落 localStorage：已开票的商品明细是**不会变**的（真要改只能红冲重开，
+     那时申请单号也会变），所以没必要每次刷新页面都重新拉一遍 50 次详情接口。
+     ⚠️ 1.1 和 1.2 共用这一个 key，在全局页拉过的行，进订单页直接命中。 */
+  const DETAIL_STORE_KEY = "tm-fapiao-detail-store";
+  const DETAIL_STORE_VERSION = 2;
+  const DETAIL_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 天
+  const DETAIL_CACHE_MAX = 800;
+  const DETAIL_FETCH_GAP = 70; // 两次详情请求的间隔，别把接口打满
+  const DETAIL_FAIL_STOP = 6; // 连续失败这么多次就停手，别反复刷
+  const DETAIL_POP_ID = "tm-order-invoice-detail-pop";
 
   const TABLE_MARKER = "data-tm-invoice-table";
   const TABLE_SELECTOR = `.ant-table[${TABLE_MARKER}="1"]`;
@@ -160,6 +230,15 @@ const COLUMN_LAYOUT = [
   let soaRegionCode = "XX";
   let lastTruthRefreshAt = 0;
 
+  /* 商品明细：applyCode → { items, at }；items = [{ name, unit, qty, unitPrice, amount }] */
+  const detailCache = new Map();
+  const detailFailed = new Set(); // 取不到的行，本次会话不再重试
+  const detailRequested = new Set(); // 已入队 / 已请求
+  let detailQueue = [];
+  let detailRunning = false;
+  let detailFailStreak = 0;
+  let detailPopTimer = null;
+
   /******************** 3) 表格与基础工具 ********************/
   const normText = (value) => (value || "").replace(/\s+/g, " ").trim();
 
@@ -168,15 +247,37 @@ const COLUMN_LAYOUT = [
     return header ? [...header.querySelectorAll("th")] : [];
   }
 
-  // 表头文字。会先克隆一份、摘掉我们自己塞进去的按钮/拖拽手柄再取文本，
-  // 否则「操作」表头会变成「操作批量下载」，列名匹配和列宽记忆全乱。
+  // 表头文字。只取「开头的那个纯文本块」，不取整格 textContent。
+  // 站点会在表头里塞自己的控件：批量的按钮、拖拽手柄、来源列的筛选 checkbox。
+  // 整格取会把它们一起读进来（「来源 不显示非SOA开票」「操作 批量下载」），
+  // 列名就对不上 COLUMN_LAYOUT 里的 "来源" 了 —— 那一列宽度会被漏掉，
+  // 表头 179px / 表体 72px，整排右边全错位（订单页实测）。
   function headerText(th) {
     if (!th) return "";
-    const clone = th.cloneNode(true);
-    clone
-      .querySelectorAll(".tm-batch-head-btn, .tm-col-resizer")
-      .forEach((node) => node.remove());
-    return normText(clone.textContent);
+
+    const parts = [];
+    for (const node of th.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        parts.push(node.nodeValue || "");
+        if (parts.join("").trim()) break;
+        continue;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+
+      // 我们自己挂的东西、站点的控件，一律不算列名
+      if (
+        node.matches(
+          ".tm-col-resizer, .tm-batch-head-btn, .ant-checkbox-wrapper, svg, .anticon"
+        )
+      ) {
+        break;
+      }
+
+      parts.push(node.textContent || "");
+      break;
+    }
+
+    return normText(parts.join(""));
   }
 
   function getBodyRows(tableRoot = observedTableRoot) {
@@ -247,7 +348,9 @@ const COLUMN_LAYOUT = [
     if (column.header === AMOUNT_COLUMN_HEADER) return amountColumnWidth;
 
     const delta = column.adjustable ? customerWidthDelta : 0;
-    return Math.max(80, column.width + delta);
+    // 下限用 COLUMN_MIN_WIDTH（60）而不是写死的 80：预开票 / 卡类开票这两列用户调到了 64 / 74，
+    // 写死 80 会让「默认值」和「用户拖出来的值」对不上（2026-10-27 固化默认配置时发现）
+    return Math.max(COLUMN_MIN_WIDTH, column.width + delta);
   }
 
   /* 量「发票金额」列实际需要多宽：逐行取该格内容的宽度（含站点自己挂的
@@ -276,9 +379,21 @@ const COLUMN_LAYOUT = [
       }
 
       let content = 0;
+      let hintWidth = 0;
 
       td.childNodes.forEach((node) => {
         if (node.nodeType === Node.ELEMENT_NODE) {
+          // 明细小字是第二行，宽度不该和金额相加（否则量出来的列宽会指数膨胀）。
+          // ⚠️ 不能读 scrollWidth —— 它是 flex 子项、又被 overflow:hidden，读到的
+          //    只是当前可用宽度（实测 84），真正的文本宽要用 Range 量（92）。
+          if (node.classList && node.classList.contains("tm-qty-hint")) {
+            if (node.textContent) {
+              const range = document.createRange();
+              range.selectNodeContents(node);
+              hintWidth = Math.max(hintWidth, range.getBoundingClientRect().width);
+            }
+            return;
+          }
           content += node.getBoundingClientRect().width;
         } else if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
           const range = document.createRange();
@@ -287,6 +402,7 @@ const COLUMN_LAYOUT = [
         }
       });
 
+      content = Math.max(content, hintWidth);
       if (content > widest) widest = content;
     }
 
@@ -321,6 +437,7 @@ const COLUMN_LAYOUT = [
     const columnByDomIndex = new Map();
 
     COLUMN_LAYOUT.forEach((column) => {
+      if (column.hidden) return; // 隐藏的列不用拖
       const domIndex = indexMap.get(column.header);
       if (domIndex !== undefined) columnByDomIndex.set(domIndex, column);
     });
@@ -342,6 +459,23 @@ const COLUMN_LAYOUT = [
       handle.title = `拖动可调整「${column.header}」列宽，双击恢复默认`;
       th.appendChild(handle);
     });
+
+    // 虚拟列「税号」的表头是脚本补的，不在这批 th 里，单独挂一个手柄
+    const taxColumn = COLUMN_DEF_BY_ID.get(TAX_COL_ID);
+    if (taxColumn && !taxColumn.hidden) {
+      const taxTh = tableRoot.querySelector(".ant-table-header th[data-tm-taxhdr]");
+      if (taxTh) {
+        taxTh.classList.add("tm-has-resizer");
+        if (!taxTh.querySelector(":scope > .tm-col-resizer")) {
+          const handle = document.createElement("div");
+          handle.className = "tm-col-resizer";
+          handle.dataset.header = taxColumn.header;
+          handle.dataset.virtual = "1";
+          handle.title = `拖动可调整「${taxColumn.header}」列宽，双击恢复默认`;
+          taxTh.appendChild(handle);
+        }
+      }
+    }
   }
 
   /********** 「操作」列头右侧的批量下载按钮 **********/
@@ -487,7 +621,15 @@ const COLUMN_LAYOUT = [
 
       const domIndex = Number(handle.dataset.domIndex);
       // 一次找齐这一列的表头 + 所有表体格，拖动时不再查 DOM
-      const cells = collectColumnCells(observedTableRoot, domIndex);
+      const cells =
+        handle.dataset.virtual === "1"
+          ? [
+              th,
+              ...getBodyRows(observedTableRoot).map((tr) =>
+                tr.querySelector(":scope > td[data-tm-taxtd]")
+              ),
+            ].filter(Boolean)
+          : collectColumnCells(observedTableRoot, domIndex);
 
       columnResizeState = {
         tableRoot: observedTableRoot,
@@ -708,47 +850,59 @@ const COLUMN_LAYOUT = [
   }
 
   /******************** 5) 单元格处理：保留原节点结构 ********************/
+  /* 站点在「销方公司」用的是 antd 的 JS 省略组件，被省略的后半截不在可见文本里：
+
+       <span class="ant-typography ant-typography-ellipsis" title="">
+         <span>新乡美年大
+           <span title="健康管理有限公司高新门诊部" aria-hidden="true">...</span>
+         </span>
+       </span>
+
+     直接读 innerText 只能拿到「新乡美年大...」，文案替换表里那串全名永远匹配不上
+     —— 订单页 2026-10-27 实测：全局页靠接口旁听拿到真值所以没露馅，订单页没有真值就露了。
+     这里按 DOM 顺序把文本拼回来：带非空 title 的节点直接用 title 顶替（它就是被省略的那段），
+     纯省略号（"..." / "…"）丢掉。 */
+  function readEllipsisFullText(root) {
+    const box = root.querySelector(".ant-typography-ellipsis");
+    if (!box) return "";
+
+    let out = "";
+
+    const walk = (node) => {
+      node.childNodes.forEach((child) => {
+        if (child.nodeType === 3) {
+          out += child.nodeValue;
+          return;
+        }
+        if (child.nodeType !== 1) return;
+
+        const title = (child.getAttribute("title") || "").trim();
+        if (title) {
+          out += title;
+          return;
+        }
+
+        walk(child);
+      });
+    };
+
+    walk(box);
+
+    return normText(out.replace(/[.．·]{2,}/g, ""));
+  }
+
   function getCellFullText(td) {
-    // 站点维护的真值优先（数据变化时它会更新，而可见文本可能不重画）
+    const ellipsisText = readEllipsisFullText(td);
+    if (ellipsisText) return ellipsisText;
+
+    const titled = td.querySelector("[title]");
+    if (titled && titled.getAttribute("title")) {
+      const text = titled.getAttribute("title").trim();
+      if (text) return text;
+    }
+
     const ownTitle = (td.getAttribute("title") || "").trim();
     if (ownTitle) return ownTitle;
-
-    // 兼容 Ant Design ellipsis：
-    // 例如：
-    // <span>
-    //   新乡美年大健康管理有限公
-    //   <span title="司门诊部">...</span>
-    // </span>
-    // 需要拼接成完整名称。
-
-    const ellipsisNodes = td.querySelectorAll(
-      ".ant-typography-ellipsis span"
-    );
-
-    if (ellipsisNodes.length) {
-      let result = "";
-
-      ellipsisNodes.forEach(node => {
-        node.childNodes.forEach(child => {
-
-          if (child.nodeType === Node.TEXT_NODE) {
-            result += child.nodeValue || "";
-          }
-
-          if (
-            child.nodeType === Node.ELEMENT_NODE &&
-            child.getAttribute("title")
-          ) {
-            result += child.getAttribute("title");
-          }
-
-        });
-      });
-
-      result = normText(result);
-
-      if (result) return result;
-    }
 
     return normText(td.innerText);
   }
@@ -766,23 +920,32 @@ const COLUMN_LAYOUT = [
   }
 
   // 只改已有文本节点的 nodeValue，不使用 innerHTML/textContent 删除 React 管理的子节点。
-  function setCellTextKeepStructure(td, newText) {
-
+  function setCellTextKeepStructure(td, newText, options = {}) {
     const textNodes = getMeaningfulTextNodes(td);
-
     if (!textNodes.length) return false;
 
-    // 只修改已有文本节点，避免破坏 React 管理的 DOM
     textNodes[0].nodeValue = newText;
+    for (let index = 1; index < textNodes.length; index += 1) {
+      textNodes[index].nodeValue = "";
+    }
 
-    for (let i = 1; i < textNodes.length; i++) {
-      textNodes[i].nodeValue = "";
+    // keepTitle：留给「销方公司」这类由站点维护 title 真值的格子，不能覆盖。
+    if (!options.keepTitle) {
+      if (td.hasAttribute("title")) td.setAttribute("title", newText);
+      const titled = td.querySelector("[title]");
+      if (titled && titled.getAttribute("title")) {
+        titled.setAttribute("title", newText);
+      }
     }
 
     return true;
   }
 
   // 开票客户：不重建 DOM，只用 CSS 将原有名称和税号排成一行。
+  /* ⚠️ 两段之间的「，」必须是**真实文本节点**，不能用 CSS ::after 画。
+     伪元素不参与选区：框选时「公司名 → 税号」之间会留一道白缺口，
+     看着就像数据丢了（其实复制出来是完整的），2026-10-27 用户反馈。
+     换成真节点后，高亮是连续的一整块，选中的文字也和看到的一致。 */
   function prepareCustomerCell(td) {
     const divs = td.querySelectorAll(":scope > .ellipsis");
     if (divs.length !== 2) return;
@@ -793,6 +956,73 @@ const COLUMN_LAYOUT = [
 
     td.setAttribute("data-tm-customer", "1");
     td.setAttribute("title", `${name}，${code}`);
+
+    // 幂等 + 不抖动：已就位就别再动 DOM（反复 remove/insert 会一直触发表格观察器）
+    const prev = divs[1].previousElementSibling;
+    if (!prev || !prev.classList.contains("tm-cust-sep")) {
+      td.querySelectorAll(":scope > .tm-cust-sep").forEach((node) => node.remove());
+      const sep = document.createElement("span");
+      sep.className = "tm-cust-sep";
+      sep.textContent = "，";
+      divs[1].before(sep);
+    }
+  }
+
+  /* ---- 虚拟列「税号」 --------------------------------------------------------
+     站点把「公司名 + 税号」塞在同一个格子里（两个 .ellipsis）。要在列表上分成两列，
+     只能由脚本自己补：表头补一个 th、每行末尾补一个 td。
+
+     ⚠️ 必须追加在**末尾**，绝不能插到中间 —— 整张表的 CSS 全是按 td:nth-child(N)
+        定位的，插中间会让后面每一列的下标整体错位。视觉位置交给 flex 的 order，
+        所以放在 DOM 末尾完全不影响它在屏幕上的位置。 */
+  const TAX_COL_ID = "taxno";
+
+  const taxColumnVisible = () => !hiddenColumnIds.has(TAX_COL_ID);
+
+  function updateTaxSplitMarker(tableRoot = observedTableRoot) {
+    if (!tableRoot) return;
+    if (taxColumnVisible()) tableRoot.setAttribute("data-tm-taxsplit", "1");
+    else tableRoot.removeAttribute("data-tm-taxsplit");
+  }
+
+  function ensureTaxHeader(tableRoot = observedTableRoot) {
+    const headerRow = tableRoot?.querySelector(".ant-table-header tr");
+    if (!headerRow) return null;
+
+    let th = headerRow.querySelector(":scope > th[data-tm-taxhdr]");
+    if (!th) {
+      th = document.createElement("th");
+      th.className = "ant-table-cell";
+      th.setAttribute("data-tm-taxhdr", "1");
+      th.textContent = "税号";
+      headerRow.appendChild(th);
+    }
+    return th;
+  }
+
+  // 每行的税号格：内容取「开票客户」格里的第二个 .ellipsis（站点那里放的就是税号）
+  function syncTaxCell(tr, customerIdx) {
+    if (!tr || customerIdx === undefined) return;
+
+    const cell = tr.children[customerIdx];
+    const parts = cell ? [...cell.querySelectorAll(":scope > .ellipsis")] : [];
+    const code = parts.length === 2 ? normText(parts[1].textContent) : "";
+
+    let td = tr.querySelector(":scope > td[data-tm-taxtd]");
+    if (!td) {
+      td = document.createElement("td");
+      td.className = "ant-table-cell";
+      td.setAttribute("data-tm-taxtd", "1");
+      tr.appendChild(td);
+    }
+
+    // 变了才写：脚本自己挂着 MutationObserver，反复写同一个值会把自己叫醒
+    if (td.textContent !== code) td.textContent = code;
+    if (code) {
+      if (td.getAttribute("title") !== code) td.setAttribute("title", code);
+    } else if (td.hasAttribute("title")) {
+      td.removeAttribute("title");
+    }
   }
 
   // 创建人：保留两个原始 div；空姓名通过 CSS 伪元素显示“手工开票”。
@@ -858,15 +1088,13 @@ const COLUMN_LAYOUT = [
         border: 0 !important;
       }
 
+      ${scope} .ant-table-body { overflow-x: auto !important; }
+      ${scope} .ant-table-body::-webkit-scrollbar { height: 0 !important; }
+      ${scope} .ant-table-body::-webkit-scrollbar-thumb { background: transparent !important; }
+      ${scope} .ant-table-body::-webkit-scrollbar-track { background: transparent !important; }
       ${scope} .ant-table-body {
-        overflow-x: hidden !important;
         scrollbar-width: none !important;
         -ms-overflow-style: none !important;
-      }
-
-      ${scope} .ant-table-header,
-      ${scope} .ant-table-body {
-        width: 100% !important;
       }
 
       ${scope} .ant-table-header tr {
@@ -896,6 +1124,15 @@ const COLUMN_LAYOUT = [
         overflow: hidden;
       }
 
+      /* 订单页这张表用的是 antd 默认尺寸（td 上下 12px），比全局页整体矮一档的
+         全局页（.ant-table-small 上下 8px）高出 8px，行高 49 而不是 41。
+         这里只压上下内边距、并且避开金额格（那一格要留 5/2 给小字），
+         改完行高回到 41px，与全局页一致。 */
+      ${scope} .ant-table-body td:not([data-tm-amount="1"]) {
+        padding-top: 8px !important;
+        padding-bottom: 8px !important;
+      }
+
       ${scope} .ant-table-body td {
         box-sizing: border-box;
         flex-shrink: 0;
@@ -910,6 +1147,17 @@ const COLUMN_LAYOUT = [
 
       ${scope} .ant-table-header table,
       ${scope} .ant-table-body table { min-width: max-content !important; }
+
+      /* 订单页站点的 colgroup 比我们配的列宽总和宽（实测 2170 vs 1952）：表头和表体
+         是两张独立的 table，各自按 colgroup 定宽 —— 表体就比表头多出 218px，
+         一旦横向滚动两边的列全部错位（用户看到的就是「表头对不上、排版乱」）。
+         这里把两张表都锁成容器宽，列宽只由每个格子的 flex-basis 决定，两边永远一致。 */
+      ${scope} .ant-table-header table,
+      ${scope} .ant-table-body table {
+        width: 100% !important;
+        min-width: 0 !important;
+        table-layout: auto !important;
+      }
 
       ${scope} .ant-table-cell-scrollbar { display: none !important; }
       ${scope} .ant-table-cell-fix-right,
@@ -933,8 +1181,9 @@ const COLUMN_LAYOUT = [
         text-overflow: clip !important;
         max-width: none !important;
       }
-      ${scope} td[data-tm-customer="1"] > .ellipsis:first-child::after {
-        content: "，";
+      /* 名称与税号之间的「，」由 prepareCustomerCell 插入真节点，这里只保证它不被样式化 */
+      ${scope} td[data-tm-customer="1"] > .tm-cust-sep {
+        display: inline;
       }
 
       ${scope} td[data-tm-creator="1"] {
@@ -958,36 +1207,117 @@ const COLUMN_LAYOUT = [
         content: "手工开票";
       }
 
+      /* 「发票金额」格：金额照旧右对齐，下面挂一行 11px 灰字（数量 × 单价）。
+         ⚠️ 这格要塞进原来 41px 的行高里：底边距 5 + 金额行 15 + 小字行 13 + 下边距 2 = 35
+            ⇒ 行高一点不涨（默认金额行高 21 + 小字 15 + padding 16 会撑到 54）。
+         ⚠️ align-content 必须用 space-between、不能用 center：center 把两行压到一起
+            （实测金额墨迹 4~22、小字 21~34，重叠 1px）；space-between 拉开到
+            金额 3~21、小字 25~38，上下留白各 3px。
+         ⚠️ 必须带 .ant-table-body：站点 antd 的 .ant-table-small ... > td { padding:8px }
+            排在最后且特异性 (0,3,1)，只写 td[data-tm-amount] 会被它盖回 8px（实测）。
+         ⚠️ 本段是模板字符串，注释里绝不能再出现反引号（会截断字符串）。 */
+      ${scope} .ant-table-body td[data-tm-amount="1"] {
+        flex-wrap: wrap;
+        align-content: space-between;
+        justify-content: flex-end;
+        padding-top: 5px;
+        padding-bottom: 2px;
+        line-height: 15px;
+      }
+      ${scope} .ant-table-body td[data-tm-amount="1"] > .tm-qty-hint {
+        flex: 0 0 100%;
+        text-align: right;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 11px;
+        line-height: 13px;
+        font-weight: 400;
+        color: #97a1ae;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0;
+      }
+      ${scope} .ant-table-body td[data-tm-amount="1"] > .tm-qty-hint.is-empty {
+        color: #c2c8d0;
+      }
+
       ${scope} tr.tm-row-refund,
       ${scope} tr.tm-row-refund * { color: #ff4d4f !important; }
+
+      /* 同名客户（颜色由 paintDuplicateCustomers 写在行内的 --tm-dup-line）：
+         2026-10-27 用户反馈「同名分散在页面各处时，整片底色除了乱没别的用处」，
+         所以不再铺整行底色，只留两处克制的小标记 ——
+           ① 视觉第一列最左边一条 4px 同色竖线（规则在下面按列生成）；
+           ② 客户格右上角一个 ×N 角标（这里）。
+         ⚠️ 竖线用 box-shadow: inset 而不是 border-left：border 会算进
+            box-sizing:border-box 的宽度里，把这一列的内容区压窄 4px，表头表体就对不齐。
+         ⚠️ 角标用伪元素 + attr()：不新增 DOM 节点，也不进选区（复制出来没有它）。 */
+      ${scope} .ant-table-body td[data-tm-customer="1"] {
+        position: relative;
+      }
+      ${scope} .ant-table-body td[data-tm-customer="1"][data-tm-dup-count] {
+        padding-right: 26px;
+      }
+      ${scope} .ant-table-body td[data-tm-customer="1"][data-tm-dup-count]::after {
+        content: attr(data-tm-dup-count);
+        position: absolute;
+        top: 2px;
+        right: 3px;
+        padding: 0 4px;
+        font-size: 10px;
+        line-height: 13px;
+        color: #fff;
+        background: var(--tm-dup-line);
+        border-radius: 7px;
+        opacity: 0.85;
+        pointer-events: none;
+        user-select: none;
+      }
 
       ${scope} tr.tm-row-fail > td { background: rgb(35,127,254) !important; }
       ${scope} tr.tm-row-fail,
       ${scope} tr.tm-row-fail * { color: #fff !important; }
     `;
 
-    HIDDEN_COLUMNS.forEach((header) => {
-      const domIndex = headerIndexMap.get(header);
-
-      if (domIndex !== undefined) {
-        css += `
-          ${scope} .ant-table-header th:nth-child(${domIndex + 1}),
-          ${scope} .ant-table-body td:nth-child(${domIndex + 1}) {
-            display:none !important;
-          }
-        `;
-      }
-    });
+    // 同名客户的竖线只画在「视觉第一列」上，所以先找出排第一且没隐藏的那一列
+    const firstVisibleColumn = COLUMN_LAYOUT.find((column) => !column.hidden);
 
     COLUMN_LAYOUT.forEach((column, visualIndex) => {
-      const domIndex = headerIndexMap.get(column.header);
-      if (domIndex === undefined) return;
-
       const width = getColumnWidth(column);
       const alignment =
         column.align === "right"
           ? "justify-content:flex-end !important;text-align:right !important;font-variant-numeric:tabular-nums;"
           : "";
+      const hide = column.hidden ? "display:none !important;" : "";
+
+      // 虚拟列（税号）由脚本自己造，DOM 里没有固定的 nth-child 下标 —— 用属性选择器定位。
+      if (column.virtual) {
+        css += `
+          ${scope} { --tm-c-tax: ${width}px; }
+          ${scope} .ant-table-header th[data-tm-taxhdr],
+          ${scope} .ant-table-body td[data-tm-taxtd] {
+            order: ${visualIndex};
+            width: var(--tm-c-tax);
+            flex: 0 0 var(--tm-c-tax);
+            max-width: var(--tm-c-tax);
+            ${alignment}
+            ${hide}
+          }
+        `;
+
+        if (column === firstVisibleColumn) {
+          css += `
+            ${scope} .ant-table-body tbody tr[data-tm-dup] > td[data-tm-taxtd] {
+              box-shadow: inset 4px 0 0 var(--tm-dup-line);
+            }
+          `;
+        }
+
+        return;
+      }
+
+      const domIndex = headerIndexMap.get(column.header);
+      if (domIndex === undefined) return;
 
       css += `
         ${scope} { --tm-c${domIndex}: ${width}px; }
@@ -998,9 +1328,27 @@ const COLUMN_LAYOUT = [
           flex: 0 0 var(--tm-c${domIndex});
           max-width: var(--tm-c${domIndex});
           ${alignment}
+          ${hide}
         }
       `;
+
+      if (column === firstVisibleColumn) {
+        css += `
+          ${scope} .ant-table-body tbody tr[data-tm-dup] > td:nth-child(${domIndex + 1}) {
+            box-shadow: inset 4px 0 0 var(--tm-dup-line);
+          }
+        `;
+      }
     });
+
+    // 「税号」列开着的时候，开票客户格只显示公司名（税号已经单独一列了）；
+    // 关掉时恢复成「名称，税号」挤在一格里。
+    css += `
+      ${scope}[data-tm-taxsplit="1"] td[data-tm-customer="1"] > .ellipsis:last-of-type,
+      ${scope}[data-tm-taxsplit="1"] td[data-tm-customer="1"] > .tm-cust-sep {
+        display: none !important;
+      }
+    `;
 
     // 「当前状态」格：必须放开溢出（通用 td 规则是 nowrap + overflow:hidden，会把格内一切裁掉）。
     // 站点自己的「完整文案气泡」就挂在这个格子内部 —— 异常状态时那个红色小图标上的 antd Tooltip，
@@ -1113,19 +1461,21 @@ const COLUMN_LAYOUT = [
 
     if (!styleEl) {
       styleEl = document.createElement("style");
-      styleEl.id = "tm-order-invoice-style";
+      styleEl.id = "tm-antd-style";
       document.head.appendChild(styleEl);
     }
 
     styleEl.textContent = buildCss(getHeaderIndexMap(observedTableRoot));
     lastHeaderSignature = headerSignature;
+    updateTaxSplitMarker(observedTableRoot);
+    ensureTaxHeader(observedTableRoot);
     ensureColumnResizers();
     ensureBatchHeadButton();
     updateUiLabel();
   }
 
   function removeStyle() {
-    const node = document.getElementById("tm-order-invoice-style");
+    const node = document.getElementById("tm-antd-style");
     if (node) node.remove();
     styleEl = null;
     lastHeaderSignature = "";
@@ -1184,13 +1534,25 @@ const COLUMN_LAYOUT = [
       !cells[customerIdx].querySelector("a,button")
     ) {
       prepareCustomerCell(cells[customerIdx]);
+      syncTaxCell(tr, customerIdx);
     }
 
+    if (
+      creatorIdx !== undefined &&
+      cells[creatorIdx] &&
+      !cells[creatorIdx].querySelector("a,button")
+    ) {
+      prepareCreatorCell(cells[creatorIdx]);
+    }
 
     // 跳过操作链接和按钮，避免破坏操作列。
     for (let index = 0; index < cells.length; index += 1) {
       const cell = cells[index];
       if (!cell || cell.querySelector("a,button")) continue;
+
+      // 金额格不参与文案替换：它下面挂着明细小字，替换会「首节点写整串、其余文本清空」，
+      // 把小字一起抹掉（金额本身也不需要替换，只去千分位逗号）。
+      if (index === amountIdx) continue;
 
       const rawFull = getCellFullText(cell);
       if (!rawFull) continue;
@@ -1227,6 +1589,7 @@ const COLUMN_LAYOUT = [
       !cells[amountIdx].querySelector("a,button")
     ) {
       cleanAmountCell(cells[amountIdx]);
+      ensureDetailHint(tr, amountIdx);
     }
 
     if (statusIdx === undefined || !cells[statusIdx]) return;
@@ -1248,15 +1611,152 @@ const COLUMN_LAYOUT = [
     }
   }
 
+  /******************** 6.6) 相同开票客户：同色分组 ********************/
+  /* 当前页里如果有多张发票的「开票客户」完全一致（名称 + 税号），给它们同一个底色，
+     方便一眼看出这家客户被拆成了几张票 / 有没有重复开。
+     只给**重复组**上色，只出现一次的客户保持白底，免得整张表花掉。
+     颜色按「首次出现的顺序」分配，所以同一组在两次刷新里颜色不会变。 */
+  /* 调色板换成「线条色」：现在只在行首画一条 4px 竖线 + 一个 ×N 角标，
+     原来那套极浅的底色当线条画出来等于没画。10 个是为了让一页 7、8 组重复客户不撞色。 */
+  const DUP_PALETTE = [
+    "#faad14", // 橙
+    "#4c9aff", // 蓝
+    "#52c41a", // 绿
+    "#9254de", // 紫
+    "#eb2f96", // 粉
+    "#13c2c2", // 青
+    "#d4b106", // 黄
+    "#8c7c66", // 卡其
+    "#597ef7", // 靛
+    "#f2674f", // 砖
+  ];
+
+  function hashString(value) {
+    let hash = 0;
+    for (let index = 0; index < value.length; index += 1) {
+      hash = (hash * 31 + value.charCodeAt(index)) | 0;
+    }
+    return Math.abs(hash);
+  }
+
+  /* 配色 key 的唯一来源：名称 + 税号。表格的 readCustomerKey 和批量下载清单
+     都必须走这里，否则两边哈希的输入不一样，同一个客户会算出两个颜色
+     —— 2026-10-27 用户要求「清单里的颜色逻辑跟列表一样」，就是为了能跨视图对上。 */
+  function customerColorKey(name, code) {
+    const safeName = normText(name || "");
+    const safeCode = normText(code || "");
+    if (safeName && safeCode) return safeName + "，" + safeCode;
+    return safeName || safeCode;
+  }
+
+  /* 同名客户配色的唯一分配点（表格竖线 × N 角标 / 批量清单色条都调它）：
+       ① 色号 = key 的哈希，不按出现顺序取号 ⇒ 同一个客户换页、刷新、
+          在列表和清单之间切换，都是同一个颜色；
+       ② 一屏里两组撞到同一格就顺延一格，避免看着像一家；
+       ③ 只出现 1 次的不上色（没有区分需求）。
+     返回 Map<key, { color, count }>。 */
+  function buildCustomerColorMarks(keys) {
+    const counts = new Map();
+
+    keys.forEach((key) => {
+      if (!key) return;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    });
+
+    const marks = new Map();
+    const usedSlots = new Set();
+
+    // 先按 key 排序再分配：同一屏里行序变了（翻页、重新打开面板），
+    // 撞色顺延的结果也不会跟着飘
+    [...counts.keys()]
+      .filter((key) => counts.get(key) >= 2)
+      .sort()
+      .forEach((key) => {
+        let slot = hashString(key) % DUP_PALETTE.length;
+        for (
+          let guard = 0;
+          usedSlots.has(slot) && guard < DUP_PALETTE.length;
+          guard += 1
+        ) {
+          slot = (slot + 1) % DUP_PALETTE.length;
+        }
+        usedSlots.add(slot);
+
+        marks.set(key, { color: DUP_PALETTE[slot], count: counts.get(key) });
+      });
+
+    return marks;
+  }
+
+  function readCustomerKey(cell) {
+    if (!cell) return "";
+    const parts = [...cell.querySelectorAll(":scope > .ellipsis")];
+    if (parts.length === 2) {
+      // 用 textContent 不用 innerText：这里每趟都要跑 50 行，innerText 会强制同步布局
+      const name = normText(parts[0].textContent);
+      const code = normText(parts[1].textContent);
+      // 只要名字在就用 customerColorKey：税号为空时（「个人」「聂俊霞」这类）
+      // 两边都必须退化成「只有名字」，否则表格用整格文本、批量清单用名字，
+      // 同一个客户会分成两个 key，清单里就查不到表格算出的颜色。
+      if (name) return customerColorKey(name, code);
+    }
+    return normText(cell.textContent);
+  }
+
+  /* 同名客户只做两件事：行首 4px 同色竖线 + 客户格右上角 ×N（这组一共几张）。
+     颜色按客户名哈希定，同一个客户换页、刷新都是同一个颜色，翻页也能对上；
+     一页里万一两组撞到同一个色号，后面的顺延一格，避免看着像一组。 */
+  function paintDuplicateCustomers(tableRoot = observedTableRoot) {
+    if (!tableRoot || !enabled) return;
+
+    const customerIdx = getHeaderIndexMap(tableRoot).get("开票客户");
+    if (customerIdx === undefined) return;
+
+    const rows = getBodyRows(tableRoot);
+
+    // 分配逻辑统一在 buildCustomerColorMarks 里（批量下载清单用的是同一个函数），
+    // 同一个客户在这里的竖线和在清单里的色条保证是同一个色号
+    const marks = new Map();
+    buildCustomerColorMarks(
+      rows.map((tr) => readCustomerKey(tr.children[customerIdx]))
+    ).forEach((mark, key) => {
+      marks.set(key, { line: mark.color, count: "×" + mark.count });
+    });
+
+    rows.forEach((tr) => {
+      const key = readCustomerKey(tr.children[customerIdx]);
+      const mark = marks.get(key);
+      const cell = tr.children[customerIdx];
+
+      if (!mark) {
+        if (tr.hasAttribute("data-tm-dup")) {
+          tr.removeAttribute("data-tm-dup");
+          tr.style.removeProperty("--tm-dup-line");
+        }
+        if (cell) cell.removeAttribute("data-tm-dup-count");
+        return;
+      }
+
+      if (tr.style.getPropertyValue("--tm-dup-line") !== mark.line) {
+        tr.setAttribute("data-tm-dup", "1");
+        tr.style.setProperty("--tm-dup-line", mark.line);
+      }
+      if (cell && cell.getAttribute("data-tm-dup-count") !== mark.count) {
+        cell.setAttribute("data-tm-dup-count", mark.count);
+      }
+    });
+  }
+
   function processRowsIncremental(tableRoot = observedTableRoot) {
     if (!tableRoot) return;
 
     const columnIndexes = getHeaderIndexMap(tableRoot);
     getBodyRows(tableRoot).forEach((tr) => processRow(tr, columnIndexes));
+    paintDuplicateCustomers(tableRoot);
   }
 
   /******************** 7.5) 设置面板：文案替换 + 列宽 ********************/
-  const SETTINGS_PANEL_ID = "tm-order-invoice-settings-panel";
+  const SETTINGS_PANEL_ID = "tm-invoice-settings-panel";
 
   function closeSettingsPanel() {
     const panel = document.getElementById(SETTINGS_PANEL_ID);
@@ -1291,6 +1791,57 @@ const COLUMN_LAYOUT = [
     remove.addEventListener("click", () => row.remove());
 
     row.append(from, arrow, to, remove);
+    return row;
+  }
+
+  // 设置面板里「列」那一行：勾选框 + 列名 + ↑↓
+  function createColumnSettingRow(id) {
+    const def = COLUMN_DEF_BY_ID.get(id);
+    if (!def) return null;
+
+    const row = document.createElement("div");
+    row.className = "tm-set-col";
+    row.dataset.id = id;
+
+    const label = document.createElement("label");
+
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "tm-set-col-check";
+    box.checked = !hiddenColumnIds.has(id);
+
+    const name = document.createElement("span");
+    name.className = "tm-set-col-name";
+    name.textContent = def.header;
+
+    label.append(box, name);
+
+    if (def.virtual) {
+      const tag = document.createElement("span");
+      tag.className = "tm-set-col-tag";
+      tag.textContent = "新增列";
+      label.appendChild(tag);
+    }
+
+    const up = document.createElement("button");
+    up.type = "button";
+    up.className = "tm-set-move";
+    up.dataset.dir = "-1";
+    up.textContent = "↑";
+    up.title = "往前移一列";
+
+    const down = document.createElement("button");
+    down.type = "button";
+    down.className = "tm-set-move";
+    down.dataset.dir = "1";
+    down.textContent = "↓";
+    down.title = "往后移一列";
+
+    const sync = () => row.classList.toggle("is-off", !box.checked);
+    box.addEventListener("change", sync);
+    sync();
+
+    row.append(label, up, down);
     return row;
   }
 
@@ -1367,6 +1918,37 @@ const COLUMN_LAYOUT = [
         background: #237ffe; border-color: #237ffe; color: #fff;
       }
       #${SETTINGS_PANEL_ID} .tm-set-btn.primary:hover { background: #1a6fe0; color: #fff; }
+
+      /* 列设置：一行 = 勾选框 + 列名 + 上下移 */
+      #${SETTINGS_PANEL_ID} .tm-set-cols {
+        display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-col {
+        display: flex; align-items: center; gap: 8px;
+        padding: 4px 6px; border: 1px solid #f0f0f0; border-radius: 6px; background: #fcfcfd;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-col.is-off { opacity: .45; }
+      #${SETTINGS_PANEL_ID} .tm-set-col label {
+        flex: 1 1 auto; display: flex; align-items: center; gap: 7px;
+        cursor: pointer; min-width: 0;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-col input { margin: 0; cursor: pointer; }
+      #${SETTINGS_PANEL_ID} .tm-set-col-name {
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-col-tag {
+        flex: 0 0 auto; padding: 0 5px; border-radius: 3px; font-size: 11px;
+        color: #237ffe; background: #eef4ff;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-move {
+        flex: 0 0 auto; width: 24px; height: 24px; padding: 0;
+        border: 1px solid #e5e7eb; border-radius: 5px; background: #fff;
+        color: #6b7280; font-size: 12px; line-height: 1; cursor: pointer;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-move:hover:not(:disabled) {
+        border-color: #237ffe; color: #237ffe;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-move:disabled { opacity: .3; cursor: default; }
     `;
     document.head.appendChild(style);
 
@@ -1462,7 +2044,90 @@ const COLUMN_LAYOUT = [
 
     widthSection.append(widthTitle, widthTip, resetBtn);
 
-    body.append(replaceSection, widthSection);
+    // ③ 列的顺序 + 显隐
+    const colSection = document.createElement("div");
+    colSection.className = "tm-set-section";
+
+    const colTitle = document.createElement("h4");
+    colTitle.textContent = "列的顺序与显示";
+    const colTip = document.createElement("p");
+    colTip.className = "tm-set-tip";
+    colTip.textContent =
+      "↑ ↓ 调整左右顺序，取消勾选就隐藏（例如只留公司名、把税号列关掉）。改完点「保存并刷新」生效。";
+
+    const colBox = document.createElement("div");
+    colBox.className = "tm-set-cols";
+
+    const syncMoveButtons = () => {
+      const rows = [...colBox.children];
+      rows.forEach((row, index) => {
+        const up = row.querySelector('.tm-set-move[data-dir="-1"]');
+        const down = row.querySelector('.tm-set-move[data-dir="1"]');
+        if (up) up.disabled = index === 0;
+        if (down) down.disabled = index === rows.length - 1;
+      });
+    };
+
+    const renderColumnRows = () => {
+      rebuildColumnLayout();
+      colBox.textContent = "";
+      columnOrder.forEach((id) => {
+        const row = createColumnSettingRow(id);
+        if (row) colBox.appendChild(row);
+      });
+      syncMoveButtons();
+    };
+
+    colBox.addEventListener("click", (event) => {
+      const button = event.target.closest(".tm-set-move");
+      if (!button) return;
+      event.preventDefault();
+
+      const row = button.closest(".tm-set-col");
+      if (!row) return;
+
+      if (button.dataset.dir === "-1" && row.previousElementSibling) {
+        colBox.insertBefore(row, row.previousElementSibling);
+      } else if (button.dataset.dir === "1" && row.nextElementSibling) {
+        colBox.insertBefore(row.nextElementSibling, row);
+      }
+      syncMoveButtons();
+    });
+
+    colSection.append(colTitle, colTip, colBox);
+    // 每次打开面板时重画一遍（用户在别处拖过列宽、切过显示都不会丢）
+    panel.__tmRenderColumns = renderColumnRows;
+
+    // ④ 商品明细缓存
+    const detailSection = document.createElement("div");
+    detailSection.className = "tm-set-section";
+
+    const detailTitle = document.createElement("h4");
+    detailTitle.textContent = "商品明细缓存";
+
+    const detailTip = document.createElement("p");
+    detailTip.className = "tm-set-tip";
+    detailTip.textContent =
+      "已开票的明细不会变，脚本会把它们存在本机（30 天），刷新页面不再重复请求接口。怀疑某张票数据不对时可以清空重取。";
+
+    const clearDetailBtn = document.createElement("button");
+    clearDetailBtn.type = "button";
+    clearDetailBtn.className = "tm-set-reset";
+    clearDetailBtn.textContent = "清空明细缓存";
+    clearDetailBtn.addEventListener("click", () => {
+      clearDetailStore();
+      clearDetailBtn.textContent = "已清空，刷新后重新拉取";
+      clearDetailBtn.disabled = true;
+    });
+
+    detailSection.append(detailTitle, detailTip, clearDetailBtn);
+    panel.__tmResetDetailBtn = () => {
+      clearDetailBtn.textContent = "清空明细缓存";
+      clearDetailBtn.disabled = false;
+    };
+
+    // 「列」放在最上面：文案替换有十几行，放后面每次都要滚很久才看得到
+    body.append(colSection, replaceSection, widthSection, detailSection);
 
     const foot = document.createElement("div");
     foot.className = "tm-set-foot";
@@ -1489,6 +2154,23 @@ const COLUMN_LAYOUT = [
       });
 
       TEXT_REPLACE = next;
+
+      // 列顺序 + 显隐：按面板里现在的行序读回来
+      const colBox = panel.querySelector(".tm-set-cols");
+      if (colBox) {
+        const rows = [...colBox.querySelectorAll(".tm-set-col")];
+        const nextHidden = rows
+          .filter((row) => {
+            const box = row.querySelector(".tm-set-col-check");
+            return box && !box.checked;
+          })
+          .map((row) => row.dataset.id);
+
+        columnOrder = rows.map((row) => row.dataset.id);
+        hiddenColumnIds = new Set(nextHidden);
+        rebuildColumnLayout();
+      }
+
       persistSettings();
 
       msg.textContent = "已保存，正在刷新页面…";
@@ -1524,6 +2206,9 @@ const COLUMN_LAYOUT = [
       rowsBox.appendChild(createSettingsRow(source, target));
     });
 
+    if (typeof panel.__tmRenderColumns === "function") panel.__tmRenderColumns();
+    if (typeof panel.__tmResetDetailBtn === "function") panel.__tmResetDetailBtn();
+
     panel.querySelector(".tm-set-msg").textContent = "";
     panel.style.display = "block";
     panel.querySelector(".tm-set-body").scrollTop = 0;
@@ -1534,7 +2219,7 @@ const COLUMN_LAYOUT = [
     if (uiBtn && document.body.contains(uiBtn)) return;
 
     uiBtn = document.createElement("button");
-    uiBtn.id = "tm-order-btn-invoice-settings";
+    uiBtn.id = "tm-btn-invoice-settings";
     uiBtn.type = "button";
     uiBtn.title = withVersion("发票工具设置：文案替换、列宽");
 
@@ -1569,7 +2254,7 @@ const COLUMN_LAYOUT = [
   }
 
   function removeUiButton() {
-    const node = document.getElementById("tm-order-btn-invoice-settings");
+    const node = document.getElementById("tm-btn-invoice-settings");
     if (node) node.remove();
     uiBtn = null;
   }
@@ -1634,8 +2319,8 @@ const COLUMN_LAYOUT = [
   const DOWNLOAD_API = "/soa/api/v1/invoice/download/pdf";
   const DOWNLOAD_CACHE_TTL = 5 * 60 * 1000;
   const DOWNLOAD_CACHE_MAX = 200;
-  const DOWNLOAD_TIP_ID = "tm-order-invoice-download-tip";
-  const DOWNLOAD_MENU_ID = "tm-order-invoice-download-menu";
+  const DOWNLOAD_TIP_ID = "tm-invoice-download-tip";
+  const DOWNLOAD_MENU_ID = "tm-invoice-download-menu";
   const DOWNLOAD_FALLBACK_REGION = "XX";
   const DOWNLOAD_BATCH_GAP = 700; // 批量时每张的提交间隔，太快会被浏览器/IDM 挤掉
   const DOWNLOAD_FORMAT_LABEL = { pdf: "PDF", ofd: "OFD", xml: "XML" };
@@ -1832,6 +2517,16 @@ const COLUMN_LAYOUT = [
     return { customer: full, customerCode: "" };
   }
 
+  // 金额格的纯金额文本（去掉「数量 × 单价」那行小字），批量面板/复制都用它
+  function getAmountText(cell) {
+    if (!cell) return "";
+    if (!cell.querySelector(":scope > .tm-qty-hint")) return normText(cell.innerText);
+
+    const clone = cell.cloneNode(true);
+    clone.querySelectorAll(".tm-qty-hint").forEach((node) => node.remove());
+    return normText(clone.innerText);
+  }
+
   function collectInvoiceRows() {
     const table = document.querySelector(TABLE_SELECTOR);
     if (!table) return [];
@@ -1880,7 +2575,7 @@ const COLUMN_LAYOUT = [
         ),
         amount:
           amountIdx !== undefined
-            ? normText(tr.children[amountIdx]?.innerText)
+            ? getAmountText(tr.children[amountIdx])
             : "",
       });
     });
@@ -2046,29 +2741,31 @@ const COLUMN_LAYOUT = [
       #${panelId} .tm-batch-item {
         display: flex; align-items: center; gap: 8px;
         padding: 7px 10px 7px 8px; cursor: pointer; border-bottom: 1px solid #fafafa;
-        /* 同一家客户：左侧色条 + 同色极浅底色，一眼看出哪几行是一家的 */
+        /* 同一家客户只留左边一条 4px 同色竖线，与表格里的同名标记完全一致
+           （2026-10-27 统一）：整行铺淡底会和勾选框的选中态混在一起，清单一长就显花。 */
         border-left: 4px solid var(--tm-group-color, transparent);
-        background: color-mix(in srgb, var(--tm-group-color, #fff) 7%, #fff);
       }
       #${panelId} .tm-batch-item:last-child { border-bottom: none; }
-      #${panelId} .tm-batch-item:hover {
-        background: color-mix(in srgb, var(--tm-group-color, #237ffe) 15%, #fff);
-      }
+      #${panelId} .tm-batch-item:hover { background: #fafafa; }
       #${panelId} .tm-batch-item input { flex: 0 0 auto; margin: 0; }
+      /* 名称 / 税号 分成两列（原来税号紧跟名字后面，名字一长就被推走 ⇒ 整列参差不齐）。
+         两列都定宽 + ellipsis，右边金额再定宽右对齐，三列才能各就各位。 */
       #${panelId} .tm-batch-item-text {
-        flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px;
+        flex: 1 1 auto; min-width: 0;
+        display: grid; grid-template-columns: minmax(0, 1fr) 138px;
+        align-items: center; column-gap: 10px;
       }
       #${panelId} .tm-batch-item-name {
-        flex: 0 1 auto; min-width: 0; font-weight: 600; color: #1f2937;
+        min-width: 0; font-weight: 600; color: #1f2937;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
       #${panelId} .tm-batch-item-code {
-        flex: 0 1 auto; min-width: 0; color: #a8b0bd; font-size: 12px;
+        min-width: 0; color: #a8b0bd; font-size: 12px;
         font-variant-numeric: tabular-nums;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
       #${panelId} .tm-batch-item-amount {
-        flex: 0 0 auto; min-width: 72px; text-align: right;
+        flex: 0 0 auto; width: 84px; text-align: right;
         color: #595959; font-style: normal;
         font-variant-numeric: tabular-nums;
       }
@@ -2221,27 +2918,9 @@ const COLUMN_LAYOUT = [
     return panel;
   }
 
-  /* 批量面板的分组色条：只有「同一客户出现 2 张及以上」才上色（才需要区分），
-     只出现一次的那种用素色，免得整列五颜六色反而看不清重点。 */
-  const BATCH_SINGLE_COLOR = "#e8ebf0";
-  const BATCH_GROUP_COLORS = [
-    "#237ffe",
-    "#00b96b",
-    "#fa8c16",
-    "#eb2f96",
-    "#722ed1",
-    "#13c2c2",
-    "#f5222d",
-    "#52c41a",
-    "#2f54eb",
-    "#d48806",
-    "#08979c",
-    "#c41d7f",
-    "#8c6e2f",
-    "#3f6600",
-    "#ad4e00",
-    "#003a8c",
-  ];
+  /* 批量面板的分组色条已并入表格那套（buildCustomerColorMarks），
+     原来按「首次出现顺序」取号的 BATCH_GROUP_COLORS 已删除：
+     顺序取号会导致同一个客户在列表和清单里颜色不一致。 */
 
   function openBatchPanel() {
     const items = collectInvoiceRows();
@@ -2257,39 +2936,40 @@ const COLUMN_LAYOUT = [
     title.textContent = "批量下载发票（共 " + items.length + " 张）";
     list.textContent = "";
 
-    // 同一家客户在清单里用同一个颜色条：按首次出现的顺序从调色板取色，
-    // 行的顺序保持页面原样，不重排。
-    const countByCustomer = new Map();
-    items.forEach((item) => {
-      const key =
-        safeReplaceText(item.customer || "") ||
-        item.seller ||
-        item.applyNo ||
-        item.applyCode;
-      countByCustomer.set(key, (countByCustomer.get(key) || 0) + 1);
-    });
-
-    const colorByCustomer = new Map();
-    const colorOf = (key) => {
-      if ((countByCustomer.get(key) || 0) < 2) return BATCH_SINGLE_COLOR;
-      if (!colorByCustomer.has(key)) {
-        colorByCustomer.set(
-          key,
-          BATCH_GROUP_COLORS[colorByCustomer.size % BATCH_GROUP_COLORS.length]
-        );
-      }
-      return colorByCustomer.get(key);
-    };
+    // 同一家客户在清单里用同一个色条，而且要求和列表里「一模一样」。
+    // 只靠哈希还差一步：撞色时要顺延一格，顺延结果取决于「这一屏有哪几个重复组」，
+    // 表格按 50 行算、清单只有 44 张（没下下载链接的行不在清单里），
+    // 两边的组集合不同就会把顺延结果算歪 —— 2026-10-27 实测 7 组里有 2 组错开。
+    // 所以这里不自己算：直接拿表格这一屏的客户 key 走同一个分配函数
+    // （paintDuplicateCustomers 用的也是它，同样的 key、同样的排序），
+    // 算出来必然和列表里一致。清单里是蓝的，回到列表里也是蓝的。
+    const colorKeyOf = (item) => customerColorKey(item.customer, item.customerCode);
+    const colorTableRoot = observedTableRoot || document.querySelector(TABLE_SELECTOR);
+    const colorCustomerIdx = colorTableRoot
+      ? getHeaderIndexMap(colorTableRoot).get("开票客户")
+      : undefined;
+    const screenKeys =
+      colorTableRoot && colorCustomerIdx !== undefined
+        ? getBodyRows(colorTableRoot).map((tr) =>
+            readCustomerKey(tr.children[colorCustomerIdx])
+          )
+        : [];
+    const colorMarks = buildCustomerColorMarks(
+      screenKeys.length ? screenKeys : items.map(colorKeyOf)
+    );
 
     items.forEach((item) => {
       const row = document.createElement("label");
       row.className = "tm-batch-item";
 
-      // 表里显示的是替换后的客户名（和页面上看到的一致），所以配色也按它分
+      // 显示的是替换后的客户名（和页面上看到的一致），但配色按「原名 + 税号」算，
+      // 替换只是换个叫法，同一家还是同一家，得和列表里一个色
       const customer = safeReplaceText(item.customer || "");
       const fallback = item.seller || item.applyNo || item.applyCode;
       const shown = customer || fallback;
-      row.style.setProperty("--tm-group-color", colorOf(shown));
+
+      const mark = colorMarks.get(colorKeyOf(item));
+      if (mark) row.style.setProperty("--tm-group-color", mark.color);
 
       const box = document.createElement("input");
       box.type = "checkbox";
@@ -2658,6 +3338,580 @@ const COLUMN_LAYOUT = [
     true
   );
 
+  /******************** 8.6) 商品明细：详情接口 → 金额格小字 + 悬停浮层 ********************/
+  /* 列表接口（/invoice/merge/list）只给一个 custCount 汇总人数，逐行明细只存在详情接口里。
+     ⇒ 对当前页每一行单独查一次详情（串行 + 间隔 70ms + 缓存 10 分钟），拿到 taxableList 后：
+        ① 金额格下面挂一行「数量 × 单价」；
+        ② 鼠标停在金额格上 → 浮层里看完整明细（商品名称 / 单位 / 数量 / 单价 / 价税合计）。
+
+     单价页面不提供，用 amount / taxableCustCount 现算（4200 / 12 = 350）。
+     ⚠️ 数量留空时这个键是 undefined（不是 0）⇒ 算不出单价，就标「数量未填」，不瞎猜。 */
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function formatQty(value) {
+    if (!Number.isFinite(value)) return "";
+    return String(Math.round(value * 10000) / 10000);
+  }
+
+  function formatPrice(value) {
+    if (!Number.isFinite(value)) return "";
+    return String(Math.round(value * 100) / 100);
+  }
+
+  function normalizeDetailItems(list) {
+    if (!Array.isArray(list)) return [];
+
+    return list.map((item) => {
+      const rawQty = item && item.taxableCustCount;
+      const qty =
+        rawQty === null || rawQty === undefined || rawQty === ""
+          ? null
+          : Number(rawQty);
+      const safeQty = Number.isFinite(qty) ? qty : null;
+      // 数量 0 等同于没填：算不出单价，单价 = 金额 / 0 会变成 Infinity。
+      // 而且真实业务里「0 人」的发票行没有意义（2026-10-27 实测确有 qty=0 的数据，
+      // 不拦的话金额格小字会显示成孤零零一个「0」）。
+      const usableQty = safeQty && safeQty > 0 ? safeQty : null;
+      const amount = Number(item && item.amount);
+
+      return {
+        name: normText(item && item.taxableName) || "—",
+        unit: normText(item && item.unit),
+        qty: usableQty,
+        // 单价 = 本行价税合计 / 数量；数量为 0 或缺失就没有单价
+        unitPrice: usableQty ? (Number.isFinite(amount) ? amount / usableQty : null) : null,
+        amount: Number.isFinite(amount) ? amount : 0,
+      };
+    });
+  }
+
+  function getCachedDetail(applyCode) {
+    const entry = detailCache.get(applyCode);
+    if (!entry) return null;
+    if (Date.now() - entry.at > DETAIL_CACHE_TTL) {
+      detailCache.delete(applyCode);
+      return null;
+    }
+    return entry.items;
+  }
+
+  let detailPersistTimer = 0;
+
+  /* 只写「精简版」：字段名压成一个字母、跳过空值，800 条约 60KB —— 太大容易碰到
+     localStorage 5MB 的单域名上限（站点自己也在用）。 */
+  function detailStoreSnapshot() {
+    const items = {};
+    detailCache.forEach((entry, code) => {
+      items[code] = {
+        at: entry.at,
+        i: entry.items.map((item) => [
+          item.name,
+          item.unit,
+          item.qty,
+          item.unitPrice,
+          item.amount,
+        ]),
+      };
+    });
+    return { v: DETAIL_STORE_VERSION, items };
+  }
+
+  function saveDetailStore() {
+    detailPersistTimer = 0;
+
+    if (detailCache.size > DETAIL_CACHE_MAX) {
+      // 超上限：把最久没写入的挤出去（Map 的插入顺序 ≈ 访问先后）
+      const extra = detailCache.size - DETAIL_CACHE_MAX;
+      let removed = 0;
+      for (const code of detailCache.keys()) {
+        if (removed >= extra) break;
+        detailCache.delete(code);
+        removed += 1;
+      }
+    }
+
+    try {
+      localStorage.setItem(DETAIL_STORE_KEY, JSON.stringify(detailStoreSnapshot()));
+    } catch (error) {
+      // 写不进去（配额满 / 隐私模式）：清掉重试一次，还不行就只留内存
+      try {
+        localStorage.removeItem(DETAIL_STORE_KEY);
+        localStorage.setItem(DETAIL_STORE_KEY, JSON.stringify(detailStoreSnapshot()));
+      } catch (inner) {}
+    }
+  }
+
+  // 一次写整张表会反复序列化，攒一下再写
+  function scheduleDetailPersist() {
+    if (detailPersistTimer) return;
+    detailPersistTimer = setTimeout(saveDetailStore, 1200);
+  }
+
+  function loadDetailStore() {
+    try {
+      const raw = localStorage.getItem(DETAIL_STORE_KEY);
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      if (!data || data.v !== DETAIL_STORE_VERSION || !data.items) return;
+
+      const now = Date.now();
+      Object.entries(data.items).forEach(([code, entry]) => {
+        if (!entry || !Array.isArray(entry.i)) return;
+        if (!entry.at || now - entry.at > DETAIL_CACHE_TTL) return;
+
+        const items = entry.i.map((row) => ({
+          name: row[0] || "—",
+          unit: row[1] || "",
+          qty: Number.isFinite(row[2]) ? row[2] : null,
+          unitPrice: Number.isFinite(row[3]) ? row[3] : null,
+          amount: Number.isFinite(row[4]) ? row[4] : 0,
+        }));
+
+        detailCache.set(code, { items, at: entry.at });
+      });
+    } catch (error) {}
+  }
+
+  function clearDetailStore() {
+    detailCache.clear();
+    detailFailed.clear();
+    detailRequested.clear();
+    try {
+      localStorage.removeItem(DETAIL_STORE_KEY);
+    } catch (error) {}
+  }
+
+  function setDetailCache(applyCode, items) {
+    if (detailCache.size >= DETAIL_CACHE_MAX) {
+      detailCache.delete(detailCache.keys().next().value);
+    }
+    detailCache.set(applyCode, { items, at: Date.now() });
+    detailFailed.delete(applyCode);
+    scheduleDetailPersist();
+  }
+
+  loadDetailStore();
+
+  // 攒着的那次写入没落地就关页面/刷新 → 立刻补写，别白拉一遍接口
+  window.addEventListener(
+    "pagehide",
+    () => {
+      if (!detailPersistTimer) return;
+      clearTimeout(detailPersistTimer);
+      saveDetailStore();
+    },
+    true
+  );
+
+  // 金额格下面那行小字：单行「12 × 350」；多行只写「多条明细」。
+  /* ⚠️ 多行**不算**「合计人数 × 均价」（用户 2026-10-27 明确否掉）：
+     不同商品单价本来就不一样，把人数相加再拿总金额除，得到的「均价」没有参考意义。
+     而且「4 项 · 522 × 335.63」这种长串会把金额列硬生生撑宽。
+     想看每一行的人数/单价 → 鼠标停在金额格上，浮层里逐行列着，那才是有意义的。 */
+  function buildDetailSummary(items) {
+    if (!items.length) return "无商品明细";
+
+    if (items.length === 1) {
+      const item = items[0];
+      if (item.qty === null) return "数量未填";
+      if (item.unitPrice === null) return formatQty(item.qty);
+      return formatQty(item.qty) + " × " + formatPrice(item.unitPrice);
+    }
+
+    return "多条明细";
+  }
+
+  function renderDetailHint(cell, items) {
+    if (!cell) return;
+
+    const text = buildDetailSummary(items);
+    cell.setAttribute("data-tm-amount", "1");
+
+    let hint = cell.querySelector(":scope > .tm-qty-hint");
+    if (!hint) {
+      hint = document.createElement("span");
+      hint.className = "tm-qty-hint";
+      // append 到末尾 ⇒ flex-wrap 里落到金额下面那一行
+      cell.appendChild(hint);
+    }
+
+    // ⚠️ 同值不写：脚本自己盯着整张表，写回一样的值也算一次变更
+    if (hint.textContent !== text) hint.textContent = text;
+    hint.classList.toggle(
+      "is-empty",
+      text === "数量未填" || text === "无商品明细" || text.indexOf("数量未填") !== -1
+    );
+  }
+
+  // 每行处理时都会走到这里：缓存命中直接画，没命中就排队
+  function ensureDetailHint(tr, amountIdx) {
+    const cell = tr && tr.children[amountIdx];
+    if (!cell) return;
+
+    const applyCode = getRowApplyCode(tr);
+    if (!applyCode) return;
+
+    const items = getCachedDetail(applyCode);
+    if (items) {
+      renderDetailHint(cell, items);
+      return;
+    }
+    if (detailFailed.has(applyCode)) return;
+
+    queueDetailFetch(applyCode);
+  }
+
+  function refreshRowHint(applyCode) {
+    const items = getCachedDetail(applyCode);
+    if (!items || !observedTableRoot) return;
+
+    const row = getBodyRows(observedTableRoot).find(
+      (tr) => getRowApplyCode(tr) === applyCode
+    );
+    if (!row) return;
+
+    const amountIdx = getHeaderIndexMap(observedTableRoot).get(AMOUNT_COLUMN_HEADER);
+    if (amountIdx === undefined) return;
+
+    renderDetailHint(row.children[amountIdx], items);
+
+    // 浮层正开着这一行 → 内容跟着更新
+    const pop = document.getElementById(DETAIL_POP_ID);
+    if (pop && pop.style.display !== "none" && pop.dataset.applyCode === applyCode) {
+      renderDetailPop(pop, applyCode, items);
+      positionDetailPop(pop, row.children[amountIdx]);
+    }
+  }
+
+  function queueDetailFetch(applyCode) {
+    if (!applyCode || !enabled) return;
+    if (detailRequested.has(applyCode)) return;
+
+    detailRequested.add(applyCode);
+    detailQueue.push(applyCode);
+    runDetailQueue();
+  }
+
+  async function fetchDetailData(applyCode) {
+    try {
+      const response = await fetch(TRUTH_DETAIL_URL, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          mnClientId: SOA_CLIENT_ID,
+        },
+        body: JSON.stringify({
+          applyCode,
+          regionCode: soaRegionCode || DOWNLOAD_FALLBACK_REGION,
+        }),
+      });
+      const json = await response.json();
+      return (json && json.data) || null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async function runDetailQueue() {
+    if (detailRunning) return;
+    detailRunning = true;
+
+    try {
+      while (detailQueue.length) {
+        // 连续失败太多次就别硬刷了（接口挂了 / 掉登录），剩下的行标灰不显示
+        if (!enabled || detailFailStreak >= DETAIL_FAIL_STOP) {
+          detailQueue = [];
+          break;
+        }
+
+        const applyCode = detailQueue.shift();
+
+        if (getCachedDetail(applyCode)) {
+          refreshRowHint(applyCode);
+          continue;
+        }
+
+        const data = await fetchDetailData(applyCode);
+
+        if (data) {
+          detailFailStreak = 0;
+          absorbDetailData(data);
+          refreshRowHint(applyCode);
+        } else {
+          detailFailStreak += 1;
+          detailFailed.add(applyCode);
+        }
+
+        await sleep(DETAIL_FETCH_GAP);
+      }
+    } finally {
+      detailRunning = false;
+    }
+  }
+
+  /* 详情响应既能拿明细，也带着 contractCompanyName —— 顺手把销方公司真值也记上，一次请求两用。 */
+  function absorbDetailData(data) {
+    if (!data || typeof data !== "object") return false;
+
+    const applyCode = typeof data.applyCode === "string" ? data.applyCode : "";
+    if (!applyCode) return false;
+
+    setDetailCache(applyCode, normalizeDetailItems(data.taxableList));
+
+    const sellerName =
+      typeof data.contractCompanyName === "string" ? data.contractCompanyName : "";
+    if (sellerName && sellerTruth.get(applyCode) !== sellerName) {
+      sellerTruth.set(applyCode, sellerName);
+      scheduleWork(false);
+    }
+
+    return true;
+  }
+
+  // 旁听页面自己点「详情」时的那次响应（这样点过一遍的行，列表立刻就有小字，不用等队列）
+  function readDetailFromText(text) {
+    if (!text || text.length < 20 || text.length > 2000000) return false;
+    if (text.indexOf("taxableList") === -1) return false;
+
+    try {
+      return absorbDetailData(JSON.parse(text).data);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /********** 浮层：鼠标停在金额格上看完整明细 **********/
+  function ensureDetailPop() {
+    let pop = document.getElementById(DETAIL_POP_ID);
+    if (pop) return pop;
+
+    const style = document.createElement("style");
+    style.id = DETAIL_POP_ID + "-style";
+    style.textContent = `
+      #${DETAIL_POP_ID} {
+        position: fixed; z-index: 2147483400; display: none;
+        min-width: 300px; max-width: 440px;
+        padding: 9px 12px 7px;
+        background: #fff; border: 1px solid #e8ebf0; border-radius: 10px;
+        box-shadow: 0 10px 30px rgba(15,23,42,.16);
+        font: 12px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        color: #1f2937; pointer-events: none;
+      }
+      #${DETAIL_POP_ID} .tm-detail-head {
+        display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+        padding-bottom: 6px; border-bottom: 1px solid #eef1f5;
+        font-size: 12px; font-weight: 500;
+      }
+      #${DETAIL_POP_ID} .tm-detail-head em {
+        font-style: normal; font-weight: 400; font-size: 11px; color: #97a1ae;
+      }
+      #${DETAIL_POP_ID} .tm-detail-row {
+        display: flex; align-items: baseline; gap: 8px; padding: 4px 0;
+      }
+      #${DETAIL_POP_ID} .tm-detail-row + .tm-detail-row { border-top: 1px solid #f7f8fa; }
+      #${DETAIL_POP_ID} .tm-detail-row.is-head {
+        color: #97a1ae; font-size: 11px; padding: 6px 0 3px; border-top: 0;
+      }
+      #${DETAIL_POP_ID} .tm-detail-name {
+        flex: 1 1 auto; min-width: 0; overflow: hidden;
+        text-overflow: ellipsis; white-space: nowrap;
+      }
+      #${DETAIL_POP_ID} .tm-detail-unit {
+        flex: 0 0 24px; text-align: center; color: #97a1ae; font-size: 11px;
+      }
+      #${DETAIL_POP_ID} .tm-detail-qty {
+        flex: 0 0 44px; text-align: right; font-variant-numeric: tabular-nums;
+      }
+      #${DETAIL_POP_ID} .tm-detail-price {
+        flex: 0 0 62px; text-align: right; color: #5f6b7a;
+        font-variant-numeric: tabular-nums;
+      }
+      #${DETAIL_POP_ID} .tm-detail-amount {
+        flex: 0 0 74px; text-align: right; font-variant-numeric: tabular-nums;
+      }
+      #${DETAIL_POP_ID} .tm-detail-total {
+        border-top: 1px solid #e8ebf0; margin-top: 3px; padding-top: 6px; font-weight: 500;
+      }
+      #${DETAIL_POP_ID} .tm-detail-empty { color: #97a1ae; padding: 8px 0 2px; }
+    `;
+    document.head.appendChild(style);
+
+    pop = document.createElement("div");
+    pop.id = DETAIL_POP_ID;
+    document.body.appendChild(pop);
+    return pop;
+  }
+
+  function buildDetailCell(className, text) {
+    const node = document.createElement("span");
+    node.className = className;
+    node.textContent = text;
+    return node;
+  }
+
+  function renderDetailPop(pop, applyCode, items) {
+    pop.textContent = "";
+    pop.dataset.applyCode = applyCode;
+
+    const head = document.createElement("div");
+    head.className = "tm-detail-head";
+    const headTitle = document.createElement("span");
+    headTitle.textContent = "商品明细";
+    const headMeta = document.createElement("em");
+    headMeta.textContent = items.length ? items.length + " 项" : "";
+    head.append(headTitle, headMeta);
+    pop.appendChild(head);
+
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "tm-detail-empty";
+      empty.textContent = "这张发票没有商品明细";
+      pop.appendChild(empty);
+      return;
+    }
+
+    const headerRow = document.createElement("div");
+    headerRow.className = "tm-detail-row is-head";
+    headerRow.append(
+      buildDetailCell("tm-detail-name", "商品名称"),
+      buildDetailCell("tm-detail-unit", "单位"),
+      buildDetailCell("tm-detail-qty", "数量"),
+      buildDetailCell("tm-detail-price", "单价"),
+      buildDetailCell("tm-detail-amount", "价税合计")
+    );
+    pop.appendChild(headerRow);
+
+    items.forEach((item) => {
+      const row = document.createElement("div");
+      row.className = "tm-detail-row";
+      row.append(
+        buildDetailCell("tm-detail-name", item.name),
+        buildDetailCell("tm-detail-unit", item.unit || "—"),
+        buildDetailCell("tm-detail-qty", item.qty === null ? "—" : formatQty(item.qty)),
+        buildDetailCell(
+          "tm-detail-price",
+          item.unitPrice === null ? "—" : formatPrice(item.unitPrice)
+        ),
+        buildDetailCell("tm-detail-amount", formatPrice(item.amount))
+      );
+      pop.appendChild(row);
+    });
+
+    const knownQty = items.filter((item) => item.qty !== null);
+    const totalQty = knownQty.reduce((sum, item) => sum + item.qty, 0);
+    const totalAmount = items.reduce((sum, item) => sum + item.amount, 0);
+    const unitSet = new Set(knownQty.map((item) => item.unit).filter(Boolean));
+    const unit = unitSet.size === 1 ? [...unitSet][0] : "";
+
+    const totalRow = document.createElement("div");
+    totalRow.className = "tm-detail-row tm-detail-total";
+    const totalLabel = document.createElement("span");
+    totalLabel.className = "tm-detail-name";
+    totalLabel.textContent =
+      "合计 " +
+      items.length +
+      " 项" +
+      (knownQty.length ? " · " + formatQty(totalQty) + (unit ? " " + unit : "") : " · 数量未填");
+    totalRow.append(
+      totalLabel,
+      buildDetailCell("tm-detail-amount", formatPrice(totalAmount))
+    );
+    pop.appendChild(totalRow);
+  }
+
+  function positionDetailPop(pop, cell) {
+    const rect = cell.getBoundingClientRect();
+    const popRect = pop.getBoundingClientRect();
+    const gap = 6;
+
+    // 右对齐金额格，别一开就顶到屏幕右边
+    let left = rect.right - popRect.width;
+    left = Math.max(8, Math.min(left, window.innerWidth - popRect.width - 8));
+
+    let top = rect.bottom + gap;
+    if (top + popRect.height > window.innerHeight - 8) {
+      top = Math.max(8, rect.top - popRect.height - gap);
+    }
+
+    pop.style.left = Math.round(left) + "px";
+    pop.style.top = Math.round(top) + "px";
+  }
+
+  function hideDetailPop() {
+    if (detailPopTimer) {
+      clearTimeout(detailPopTimer);
+      detailPopTimer = null;
+    }
+    const pop = document.getElementById(DETAIL_POP_ID);
+    if (pop) pop.style.display = "none";
+  }
+
+  function showDetailPop(cell) {
+    const tr = cell.closest("tr");
+    const applyCode = tr ? getRowApplyCode(tr) : "";
+    if (!applyCode) return;
+
+    const pop = ensureDetailPop();
+    const items = getCachedDetail(applyCode);
+
+    pop.style.display = "block";
+    pop.style.left = "0px";
+    pop.style.top = "0px";
+
+    if (items) {
+      renderDetailPop(pop, applyCode, items);
+    } else {
+      pop.textContent = "";
+      pop.dataset.applyCode = applyCode;
+      const head = document.createElement("div");
+      head.className = "tm-detail-head";
+      const title = document.createElement("span");
+      title.textContent = "商品明细";
+      head.appendChild(title);
+      const loading = document.createElement("div");
+      loading.className = "tm-detail-empty";
+      loading.textContent = detailFailed.has(applyCode) ? "没能取到明细" : "正在读取明细…";
+      pop.append(head, loading);
+      if (!detailFailed.has(applyCode)) queueDetailFetch(applyCode);
+    }
+
+    positionDetailPop(pop, cell);
+  }
+
+  document.addEventListener(
+    "mouseover",
+    (event) => {
+      if (!enabled) return;
+
+      const cell = event.target?.closest?.('td[data-tm-amount="1"]');
+      if (!cell) return;
+      if (event.relatedTarget && cell.contains(event.relatedTarget)) return;
+
+      hideDetailPop();
+      detailPopTimer = setTimeout(() => {
+        detailPopTimer = null;
+        if (cell.isConnected) showDetailPop(cell);
+      }, 220);
+    },
+    true
+  );
+
+  document.addEventListener(
+    "mouseout",
+    (event) => {
+      const cell = event.target?.closest?.('td[data-tm-amount="1"]');
+      if (!cell) return;
+      if (event.relatedTarget && cell.contains(event.relatedTarget)) return;
+      hideDetailPop();
+    },
+    true
+  );
+
+  window.addEventListener("scroll", hideDetailPop, true);
+  window.addEventListener("resize", hideDetailPop, true);
+
   /******************** 9) 复制：按页面可视列顺序输出 ********************/
   function selectionIntersectsNode(selection, node) {
     if (!selection || !node) return false;
@@ -2770,6 +4024,15 @@ const COLUMN_LAYOUT = [
           .filter(Boolean)
           .join(" ");
       }
+    }
+
+    // 金额格下面挂着「数量 × 单价」那行小字，复制时不该被带出去
+    if (cell.querySelector(":scope > .tm-qty-hint")) {
+      const clone = cell.cloneNode(true);
+      clone.querySelectorAll(".tm-qty-hint").forEach((node) => node.remove());
+      return normText(clone.innerText)
+        .replace(/\t/g, " ")
+        .replace(/[\r\n]+/g, " ");
     }
 
     return normText(cell.innerText)
@@ -3198,6 +4461,8 @@ const COLUMN_LAYOUT = [
                 .text()
                 .then((text) => {
                   if (readSellerTruthFromText(text)) scheduleWork(false);
+                  // 页面自己点「详情」时也顺手把明细缓存下来
+                  readDetailFromText(text);
                 })
                 .catch(() => {});
             })
@@ -3233,6 +4498,7 @@ const COLUMN_LAYOUT = [
             }
 
             if (readSellerTruthFromText(this.responseText)) scheduleWork(false);
+            readDetailFromText(this.responseText);
           } catch (error) {}
         });
       }
@@ -3290,11 +4556,35 @@ const COLUMN_LAYOUT = [
     removeStyle();
     removeUiButton();
     closeSettingsPanel();
+    hideDetailPop();
+    detailQueue = [];
+    detailRequested.clear();
+    detailFailStreak = 0;
 
     customerWidthDelta = 0;
     lastPageKey = null;
     lastHeaderSignature = "";
     pendingForceStyle = false;
+
+    // 虚拟列「税号」是我们自己补的格子，关掉时要还原成站点的原样
+    document
+      .querySelectorAll("th[data-tm-taxhdr], td[data-tm-taxtd]")
+      .forEach((node) => node.remove());
+    document
+      .querySelectorAll('[data-tm-taxsplit="1"]')
+      .forEach((node) => node.removeAttribute("data-tm-taxsplit"));
+
+    // 关掉后别把分组底色留在行上（样式表已移除，但行内变量还在，重开时会错乱）
+    if (observedTableRoot) {
+      getBodyRows(observedTableRoot).forEach((tr) => {
+        tr.removeAttribute("data-tm-dup");
+        tr.style.removeProperty("--tm-dup");
+        tr.style.removeProperty("--tm-dup-line");
+      });
+      observedTableRoot
+        .querySelectorAll("td[data-tm-dup-count]")
+        .forEach((node) => node.removeAttribute("data-tm-dup-count"));
+    }
   }
 
   function routeCheck() {
