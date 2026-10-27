@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         片源挑选助手
 // @namespace    local.wanxin.pick-source
-// @version      1.12.2
+// @version      1.13.0
 // @description  影视资源列表页自动打分（按电视/电脑/手机口径可调），挑出前 3 个版本，一键推送到 115 网盘离线。
 
 // @match        *://xn--wcv59z.com/*
@@ -74,12 +74,22 @@
  *    如果它显示「未识别」，点一下会弹出诊断面板，把里面的内容发我就能定位。
  * 10) 同域内某个页面没自动接管时，网址后加 ?psb_force=1 强制跑一次；
  *     站点整体换域名则要先改 @match（只加 allowHosts 已经不管用了）。
+ * 11) **站点自己的「中字」分类也算字幕证据（v1.13.0）**：
+ *     他的原话：「有些带字幕的片源并没有在文件里写，这个时候怎么办？…网页本身是带了一个
+ *     字幕分类的，可以用来做参考」。
+ *     详情页「磁力下载」那排筛选（`全部 / 4K / 中字4K / 1080P / 中字1080P / 720P`）背后有数据：
+ *     `GET /res/downurl<当前路径>` 会回每条的 infohash 与类型码。脚本拿它跟行内的磁力
+ *     **按 infohash 对齐**，命中「中字」分类的照样算带中文字幕 —— 文件名没写也不会再吃亏。
+ *     ⚠️ 它**只加分、不减分**：没被归进「中字」不等于没字幕（大部分资源压根没被站方归类）。
+ *     ⚠️ 类型码每部片都不一样（末世行者 i18=中字1080P，不存在的罪人 i2=中字1080P）
+ *     ⇒ 只能靠接口自带的 `type.a`/`type.b` 下标映射，写死码值必错。
+ *     标签上会区分来源：文件名写的显示「中字」，只有站点标的显示「中字·站」，悬停可看分类名。
  */
 (function () {
   'use strict';
   if (window.__PSB__ && window.__PSB__.version) return;
 
-  var VERSION = '1.12.2';
+  var VERSION = '1.13.0';
 
   // 是否跑在 iframe 里（资源表格被站点塞进 iframe 的情况要能覆盖到）
   var IN_FRAME = (function () {
@@ -633,6 +643,111 @@
     });
   }
 
+  /* ======================= 站点「中字」分类（v1.13.0）=======================
+   * 起因（2026-10-27 他的原话）：
+   *   「有些带字幕的片源并没有在文件里写，这个时候怎么办？…网页本身是带了一个字幕分类的，
+   *     可以用来做参考」。
+   *
+   * 实测（360 · 9223 · 教父 xn--wcv59z.com）：详情页「磁力下载」那排筛选
+   *   全部 / 4K / 中字4K / 1080P / 中字1080P / 720P
+   * 不是纯装饰，背后有 JSON：
+   *   GET /res/downurl<location.pathname>  →  { downlist: {
+   *     type: { a: ["4K","中字4K","1080P","中字1080P","720P"],
+   *             b: ["i3","i19","i7","i2","i17"] },        // 同下标的类型码
+   *     list: { m: ["<infohash>", …], p: ["i7","i19", …] } // 每条的 infohash 与类型码
+   *   }}
+   *
+   * ⚠️⚠️ **类型码不是全局固定的**：末世行者是 i6=4K/i9=1080P/i18=中字1080P/i8=720P，
+   *   不存在的罪人是 i3=4K/i19=中字4K/i7=1080P/i2=中字1080P/i17=720P。
+   *   ⇒ 只能按 `type.a` ↔ `type.b` 的**下标**映射，⛔ 绝不能硬编码 i2 / i19。
+   *
+   * 三条设计约束：
+   *   ① **只加分、不减分** —— 没被归入「中字」≠ 没字幕（实测一整页 35 条只有 1 条被标）。
+   *   ② **按 infohash 对齐**，不按名称也不按行序：名称有空格/大小写差异，行序还会随
+   *      分页与排序漂移（实测接口 35 条、DOM 34 行就对不齐）。
+   *   ③ 拿不到就静默降级，退回只看文件名 —— 接口 404 / 未登录 / 跨域都不该影响打分。
+   */
+  var SITE = { path: '', asked: '', cats: null, map: null };
+
+  // 只认详情页（/mv|/tv|/ac + 短 id）；列表页、搜索页没有这份接口
+  function sitePathKey() {
+    var p = String(location.pathname || '').replace(/\/+$/, '');
+    return /^\/(mv|tv|ac)\/[A-Za-z0-9]+$/.test(p) ? p : '';
+  }
+
+  var B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  // base32 infohash（32 位）→ 40 位 hex，和接口里的 m 数组同一个写法
+  function b32ToHex(s) {
+    var out = '', buf = 0, bits = 0;
+    for (var i = 0; i < s.length; i++) {
+      var v = B32.indexOf(s.charAt(i).toUpperCase());
+      if (v < 0) return '';
+      buf = (buf << 5) | v; bits += 5;
+      while (bits >= 8) {
+        bits -= 8;
+        out += ('0' + ((buf >>> bits) & 0xff).toString(16)).slice(-2);
+        buf &= (1 << bits) - 1;
+      }
+    }
+    return out.length === 40 ? out : '';
+  }
+
+  // 行内磁力 → infohash。每行有 3 个 magnet 链接（磁力/种子/离线），取第一个够用。
+  function infohashOf(row) {
+    if (!row || !row.querySelector) return '';
+    var el = null, u = '';
+    try { el = row.querySelector(MAG_SEL); } catch (e) {}
+    if (el) u = magnetFromAttrs(el) || String(el.getAttribute('href') || '');
+    if (!u) return '';
+    var m = u.match(/btih:([0-9a-f]{40})/i);
+    if (m) return m[1].toLowerCase();
+    m = u.match(/btih:([a-zA-Z2-7]{32})/);
+    if (m) return b32ToHex(m[1]);
+    return '';
+  }
+
+  function siteCatOf(row) {
+    if (!SITE.map) return '';
+    var h = infohashOf(row);
+    return h ? (SITE.map[h] || '') : '';
+  }
+
+  function loadSiteMeta() {
+    var path = sitePathKey();
+    if (!path || SITE.asked === path) return;
+    SITE.asked = path;   // 失败也只问一次，别在 MutationObserver 里反复打接口
+    // 站内跳到另一部片：先把上一部片的映射清掉，别拿旧表去匹配新行
+    if (SITE.path !== path) { SITE.map = null; SITE.cats = null; }
+    if (typeof fetch !== 'function') return;
+    try {
+      fetch('/res/downurl' + path, { credentials: 'include' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          var dl = d && d.downlist, L = dl && dl.list;
+          if (!L || !L.m) return;
+          var a = (dl.type && dl.type.a) || [], b = (dl.type && dl.type.b) || [];
+          var code = {}, cats = [], i;
+          for (i = 0; i < b.length; i++) {
+            code[b[i]] = a[i] || '';
+            if (a[i]) cats.push(a[i]);
+          }
+          var map = {}, ms = L.m || [], ps = L.p || [];
+          for (i = 0; i < ms.length; i++) {
+            var cat = code[ps[i]] || '';
+            if (!cat) continue;
+            var hs = String(ms[i] || '').split(/[\s,]+/);
+            for (var k = 0; k < hs.length; k++) {
+              if (hs[k]) map[hs[k].toLowerCase()] = cat;
+            }
+          }
+          SITE.path = path; SITE.cats = cats; SITE.map = map;
+          log('站点分类已载入（' + cats.join(' / ') + '）：' + Object.keys(map).length + ' 条');
+          safeScan();   // 站点数据晚于首屏到达时，重打一次分
+        })
+        .catch(function () { /* 接口不通就退回只看文件名 */ });
+    } catch (e) { /* 没 fetch 也不该影响打分 */ }
+  }
+
   /* ======================= 解析层 ======================= */
 
   var RE = {
@@ -788,7 +903,7 @@
     return order;
   }
 
-  function analyze(text) {
+  function analyze(text, siteCat) {
     var t = sq(text);
     var w = effW();
     var p = {
@@ -819,6 +934,11 @@
     p.audUnknown = !p.lossless && !p.lossyMark;
     p.lossy = !p.lossless;
     p.audioCodec = codecOf(t);
+
+    // 站点自己的「中字」归类（v1.13.0）：文件名没写字幕的靠它兜。
+    // 只认「中字」二字：「4K」「1080P」「720P」「原盘」「未知」都不含它，天然不会误命中。
+    p.siteCat = siteCat || '';
+    p.siteSub = /中字/.test(p.siteCat);
 
     // 音轨估算体积：无损一条按 3.2GB、有损一条按 0.55GB
     var agb = Math.round(p.audioN * (p.lossless ? w.audioTrackLossless : w.audioTrackLossy) * 100) / 100;
@@ -897,8 +1017,19 @@
     else if (p.cantonese) { score += w.cantoneseOnly; hit('lang', '仅粤语', w.cantoneseOnly); why.push('仅粤语（无国语） ' + N(w.cantoneseOnly)); }
 
     // 字幕：先判「明确没有」，否则 `无字幕` 会被「字幕」关键词吃掉
-    if (p.noSub) { score += w.noSub; hit('sub', '无字幕', w.noSub); why.push('标注无字幕（要另找字幕） ' + N(w.noSub)); }
-    else if (p.sub) { score += w.subCn; hit('sub', '中字', w.subCn); why.push('带中文字幕 +' + N(w.subCn)); }
+    if (p.noSub) {
+      score += w.noSub; hit('sub', '无字幕', w.noSub);
+      why.push('标注无字幕（要另找字幕） ' + N(w.noSub) +
+        (p.siteSub ? '；但站点把这条归在「' + p.siteCat + '」，两者矛盾，建议点开确认' : ''));
+    } else if (p.sub) {
+      score += w.subCn; hit('sub', '中字', w.subCn);
+      why.push('带中文字幕 +' + N(w.subCn) + (p.siteSub ? '（站点同标「' + p.siteCat + '」）' : ''));
+    } else if (p.siteSub) {
+      // v1.13.0：文件名没写字幕，但站点把它归进了「中字4K / 中字1080P」这类分类。
+      // 与文件名同分（+10）—— 他要的就是「别因为没写就吃亏」。
+      score += w.subCn; hit('sub', '中字', w.subCn);
+      why.push('文件名没写字幕，但站点归在「' + p.siteCat + '」⇒ 按带中文字幕计 +' + N(w.subCn));
+    }
 
     // 码率：先扣掉音轨估算值，只看「视频那部分」是否落在该分辨率的甜点区。
     // 这样「视频一般、音轨堆了三四条」的版本不会因为文件大就被当成高码好片。
@@ -948,8 +1079,8 @@
     // v1.12.0：每个标签带上「它值多少分」（k = 跨行比较用的键，v = 分值）。
     // 卡片只在**同一键的分值有差异**时才把 v 显示出来 —— 三条都有的 4K +30 是共同项，
     // 写出来对选片毫无帮助；只有 DTS/DDP、补帧、体积这种真正拉开差距的才标数字。
-    function add(t, tone, rank, k, v) {
-      out.push({ t: t, tone: tone, rank: rank, k: k || '', v: (v || 0) });
+    function add(t, tone, rank, k, v, tip) {
+      out.push({ t: t, tone: tone, rank: rank, k: k || '', v: (v || 0), tip: tip || '' });
     }
     var band = effBand(p.res);
 
@@ -990,7 +1121,14 @@
     if (p.mandarin) add('国语', 'good', 6, 'lang', w.mandarin);
     else if (p.cantonese) add('仅粤语', 'warn', 6, 'lang', w.cantoneseOnly);
     // 「无字幕」里含「字幕」二字，会被 p.sub 一起命中 ⇒ 必须互斥，否则同一行自相矛盾
-    if (!p.noSub && p.sub) add('中字', 'good', 7, 'sub', w.subCn);
+    // v1.13.0：`p.sub` 是文件名里写的，`p.siteSub` 是站点「中字」分类给的 ——
+    // 两者同分（跨行比较时算同键同分，不会因此被点亮成差异），但文案要能看出证据来源。
+    if (!p.noSub && (p.sub || p.siteSub)) {
+      add(p.sub ? '中字' : '中字·站', 'good', 7, 'sub', w.subCn,
+        p.sub
+          ? (p.siteSub ? '站点同标「' + p.siteCat + '」' : '')
+          : '文件名没写字幕，是站点把它归在「' + p.siteCat + '」分类里');
+    }
 
     // 8 来源 → 9 帧率（补帧是中性事实，压最后，别抢画质的注意力）
     if (p.remux) add('REMUX', 'good', 8, 'src', w.remux);
@@ -2061,7 +2199,8 @@
           var vs = vStat[tk.k];
           var showV = nTop >= 2 && !!tk.k && vs && vs.diff && Math.abs(tk.v) >= 0.05;
           // 体积分的口径与别项不同（档内相对量，不是总分），悬停说明一下，避免被当成重复计分
-          var tip = tk.k === 'vol' ? '同档内以体积最小的那条为基准，多占一成记 −1' : '';
+          // v1.13.0：token 自带 tip 的优先（「中字·站」要说明证据来源）
+          var tip = tk.tip || (tk.k === 'vol' ? '同档内以体积最小的那条为基准，多占一成记 −1' : '');
           h += '<span class="w ' + (hi ? 'hi t-' + tk.tone : 'same') + '"' +
             (tip ? ' title="' + esc(tip) + '"' : '') + '>' + esc(tk.t) +
             (showV ? '<i class="dv">' + (tk.v > 0 ? '+' : '') + N(tk.v) + '</i>' : '') + '</span>';
@@ -2681,6 +2820,10 @@
       : (state.acc && state.acc.err ? '取不到 · ' + state.acc.err : '未读取')));
     L.push('推荐口径：' + profileLabel() + ' · 权重：' +
       (JSON.stringify(cfg().w) === JSON.stringify(W) ? '默认' : '已自定义'));
+    // v1.13.0：站点「中字」分类有没有读到 —— 字幕判定的第三方证据，排查时先看这行
+    L.push('站点字幕分类：' + (SITE.map
+      ? ((SITE.cats || []).join(' / ') + ' · 已关联 ' + Object.keys(SITE.map).length + ' 条')
+      : (sitePathKey() ? '未载入（接口没回 / 还没请求）' : '非详情页，不适用')));
     var sample = '';
     try {
       var trs = document.querySelectorAll('tr');
@@ -2762,12 +2905,14 @@
   }
 
   function scan() {
+    // v1.13.0：首次进详情页时拉一次站点「中字」分类；同一路径只问一次，失败静默
+    loadSiteMeta();
     var rows = candidates();
     state.rows = rows;
     if (!rows.length) return 0;
 
     var infos = rows.map(function (row) {
-      return analyze(rowText(row) + ' ' + (row.getAttribute('title') || ''));
+      return analyze(rowText(row) + ' ' + (row.getAttribute('title') || ''), siteCatOf(row));
     });
     state.infos = infos;
 
@@ -2921,6 +3066,9 @@
     tokensOf: tokensOf,
     summaryOf: summaryOf,
     AUD: AUD, FPS: FPS, RATE: RATE,
+    SITE: SITE,
+    loadSiteMeta: loadSiteMeta,
+    siteCatOf: siteCatOf,
     factors: function () { return factors(cfg().prof); },
     profileLabel: profileLabel,
     showDiag: showDiag,
