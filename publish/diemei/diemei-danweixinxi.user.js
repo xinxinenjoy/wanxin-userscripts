@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.1单位信息填充
 // @namespace    https://dime.health-100.cn/
-// @version      7.9.0
+// @version      7.9.2
 // @description  蝶美自动填充单位信息：按输入字段自适应填写，支持重复运行跳过、缺失字段跳过、行业/经济末级匹配、地区、单位类型、社会信用代码、企业规模及人数等字段。
 
 //
@@ -26,7 +26,7 @@
   const POSITION_KEY = TOOL_ID + "-position";
   const WIDTH_KEY = TOOL_ID + "-width";
   const COLLAPSED_KEY = TOOL_ID + "-collapsed";
-  const TEXTAREA_HEIGHT_KEY = TOOL_ID + "-textarea-height";
+  const TEXTAREA_HEIGHT_KEY = TOOL_ID + "-textarea-height-v3";
 
   document.getElementById(TOOL_ID)?.remove();
   document.getElementById(STYLE_ID)?.remove();
@@ -3442,7 +3442,11 @@
     }
 
     #${TOOL_ID} textarea{
-      box-sizing:border-box;width:100%;height:225px;padding:10px;
+      box-sizing:border-box;width:100%;padding:10px;
+      /* v7.9.2 折中高度：225px 太矮（9 行看不清全貌），400px 又太占屏。
+         取 200~300 区间跟窗口联动：1080p 屏约 300px（≈13 行），
+         不够用可以自己往下拖（resize:vertical，拖过的高度会记住）。 */
+      height:clamp(200px,calc(100vh - 640px),300px);min-height:170px;
       border:1px solid #dcdfe6;border-radius:5px;outline:none;resize:vertical;
       font-family:Consolas,"Microsoft YaHei",sans-serif;font-size:13px;line-height:1.65
     }
@@ -3459,7 +3463,7 @@
       margin-top:10px;padding:9px;border-radius:5px;
       background:#f5f7fa;color:#606266;font-size:13px;
       line-height:1.5;white-space:normal;word-break:break-word;
-      max-height:155px;overflow:auto
+      max-height:150px;overflow:auto
     }
     #${TOOL_ID} .tool-log-head{
       font-weight:800;line-height:1.45
@@ -3537,7 +3541,7 @@
   tool.id = TOOL_ID;
   tool.innerHTML = `
     <div class="tool-header">
-      <strong>单位信息自动填写工具 v7.9.0</strong>
+      <strong>单位信息自动填写工具 v7.9.2</strong>
       <div class="tool-header-actions">
         <button class="tool-header-button tool-collapse" type="button" title="折叠工具">−</button>
         <button class="tool-header-button tool-close" type="button" title="收起到快捷按钮">×</button>
@@ -3549,6 +3553,8 @@
         <summary>使用说明（点击展开）</summary>
         <div class="tool-tip">
           跟着「编辑单位信息」弹窗走：弹窗一开，本面板自动出现在它右侧；弹窗关掉，面板一起消失。位置不再记忆，也不会挡住表单。<br>
+          <b>v7.9.1 起：面板每次重新出现都会把粘贴框清空</b>（状态回到「等待粘贴数据」），避免把上一家单位的数据写进新单位；页面表单上已有的值不受影响。<br>
+          <b>输入框高度按屏幕自动取 200~300px</b>（1080p 屏约 300px、13 行）；不够用就拖右下角，拖过的高度会记住，下次照样用。
           面板宽度固定 420px，位置由弹窗决定，不用再手动拖；窗口太窄时自动贴到窗口右缘。<br>
           使用条件等待减少无效停顿，并锁定当前字段对应的下拉弹层。<br>
           地区缺少省级时自动补“河南省”，支持斜杠、反斜杠、空格、顿号、逗号、横杠、箭头等分隔；网页地区树出现连续同名层级时会自动跨越。<br>
@@ -4336,8 +4342,33 @@
     updateLauncherState(false);
   }
 
+  /*
+   * v7.9.1 每次呼出都从空白开始（v7.9.2 未改这一行为）。
+   *
+   * 面板是跟着「编辑单位信息」弹窗自动显隐的：弹窗关掉面板隐藏，下一个单位再打开
+   * 弹窗面板又出现。上一家单位粘进来的文字如果留在框里，很容易直接点「自动填写」
+   * 把上一条数据写进新单位 —— 所以面板重新出现时把粘贴框清空、状态回到等待。
+   * 只动本工具自己的输入框，页面表单上已填的值一个字都不碰。
+   */
+  function resetInputOnOpen() {
+    /* 正在跑就别动：这一轮还没跑完时面板被重新唤起（页面重绘），
+       清空输入框和状态会让人以为它跑完了。 */
+    if (runButton && runButton.disabled) return;
+
+    try {
+      if (textBox.value) textBox.value = "";
+      textBox.scrollTop = 0;
+    } catch {}
+
+    try {
+      setStatus("等待粘贴数据");
+    } catch {}
+  }
+
   function showToolPanel() {
     if (!tool.isConnected) return;
+
+    resetInputOnOpen();
 
     tool.style.display = "block";
     updateLauncherState(true);
@@ -4385,11 +4416,17 @@
   }
 
   function getMinimumTextAreaHeight() {
-    return 120;
+    return 170;
   }
 
+  /* 上限 340：面板还有标题、说明、状态框、按钮要占地方，
+     输入框再高就会把整块面板顶出屏幕（v7.9.2 之前上限放到 400，
+     1080p 屏上整块面板比视口还高）。 */
   function getMaximumTextAreaHeight() {
-    return Math.max(getMinimumTextAreaHeight(), window.innerHeight - 260);
+    return Math.min(
+      340,
+      Math.max(getMinimumTextAreaHeight(), window.innerHeight - 560)
+    );
   }
 
   function saveTextAreaHeight() {
@@ -4673,5 +4710,5 @@
   });
 
   textBox.focus();
-  console.log("单位信息自动填写工具 v7.9.0 最后一项弹层收起版 已加载。");
+  console.log("单位信息自动填写工具 v7.9.2 紧凑高度版 已加载。");
 })();
