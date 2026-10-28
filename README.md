@@ -8,7 +8,7 @@
 
 GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动更新。
 
-当前正式发布 **17** 个脚本 · 最近修改 **2026-10-27 23:10**
+当前正式发布 **17** 个脚本 · 最近修改 **2026-10-28 11:59**
 
 </div>
 
@@ -54,8 +54,8 @@ GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动�
 | 脚本 | 版本 | 修改时间 | 功能说明 | 安装 |
 |---|---:|---|---|---|
 | **前台-1.1批量预约工具** | `1.19` | 2026-09-24 17:29 | 前台批量预约工具：在前台批量登记页面增加工具窗口，自动识别粘贴的14位预约单号并自动进行登记填写。同时在“已到检”页签中自动勾选“仅当日”，并在请求层强制将首次列表查询改为仅当日。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/qiantai/qiantai-piliangyuyue.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/qiantai/qiantai-piliangyuyue.user.js) |
-| **发票-1.1全局页面** | `6.35` | 2026-10-27 23:10 | 发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/fapiao/fapiao-quanju.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/fapiao/fapiao-quanju.user.js) |
-| **发票-1.2订单页面** | `1.27` | 2026-10-27 23:10 | 发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/fapiao/fapiao-dingdan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/fapiao/fapiao-dingdan.user.js) |
+| **发票-1.1全局页面** | `6.38` | 2026-10-28 11:59 | 发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/fapiao/fapiao-quanju.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/fapiao/fapiao-quanju.user.js) |
+| **发票-1.2订单页面** | `1.30` | 2026-10-28 11:59 | 发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/fapiao/fapiao-dingdan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/fapiao/fapiao-dingdan.user.js) |
 | **扁鹊-1.1首页模块排序** | `4.8` | 2026-09-24 17:29 | SOA首页模块排序：支持网页原始顺序/脚本排序两种图标方案，并支持拖拽保存、列数、模块宽度及列间距设置。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-shouye.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-shouye.user.js) |
 | **扁鹊-1.2订单智能审批** | `2.17` | 2026-10-01 15:44 | SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-dingdanauto.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-dingdanauto.user.js) |
 | **扁鹊-1.3体检数据查询** | `1.11.9` | 2026-09-26 11:50 | SOA体检数据：自动读取落单数据、体检汇总与三类卡数量；卡类数量/状态左键看卡片明细（自动按制卡批次带出备注）、右键跳卡池。注意：卡类查询需要账号对应权限 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-dingdandata.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-dingdandata.user.js) |
