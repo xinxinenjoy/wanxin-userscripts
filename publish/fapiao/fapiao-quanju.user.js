@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.35
+// @version      6.38
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -46,12 +46,15 @@
     { id: "amount", header: "发票金额", width: 80, align: "right" },
     { id: "status", header: "当前状态", width: 100 },
     { id: "creator", header: "创建人", width: 222 },
+    // 全局页的「来源」在「创建人」右边、「操作」左边（2026-10-28 按用户截图固化的默认顺序）。
+    // 注意：1.2 订单页是反过来的 —— 那边「来源」排在「卡类开票」之后，两页默认顺序本就不同，
+    // 所以列顺序必须各存各的 key，不能共用。
+    // 「来源」表头里带着站点的筛选勾选框（不显示非SOA开票），窄了会被裁掉，给够 174
+    { id: "source", header: "来源", width: 174 },
     { id: "actions", header: "操作", width: 250 },
     { id: "applyNo", header: "申请单号", width: 200 },
     { id: "advance", header: "预开票", width: 64 },
     { id: "card", header: "卡类开票", width: 74 },
-    // 「来源」表头里带着站点的筛选勾选框（不显示非SOA开票），窄了会被裁掉，给够 174
-    { id: "source", header: "来源", width: 174 },
     { id: "type", header: "发票类型", width: 100, hidden: true },
   ];
 
@@ -102,59 +105,88 @@
 
   const WIDTH_STEP = 60;
 
-  /* ---- 用户设置：文案替换表 + 列宽，存 localStorage，两个发票脚本共用一份 ---- */
+  /* ---- 用户设置：文案替换表 + 列宽/列顺序，存 localStorage ----
+     2026-10-28 拆成两个 key（红领巾要求「全局页 / 订单页的列排序、列宽独立设置」）：
+       · 文案替换 → 两页共用一份（同一套叫法，没理由分家）
+       · 列宽 / 列顺序 / 显隐 → **本脚本独用一份**：两页列本来就不一样
+         （1.2 多「申请开票单位代码」、申请单号那列还叫「申请单」），
+         共用一份必然互相踩（改一边，另一边顺序就乱）。
+     旧版把列配置也塞在 SETTINGS_STORAGE_KEY 里 ⇒ 首次运行从旧 key 迁移一份，旧数据不删。 */
   const SETTINGS_STORAGE_KEY = "tm-fapiao-settings";
+  const COLUMN_STORAGE_KEY = "tm-fapiao-columns-quanju";
   const COLUMN_MIN_WIDTH = 60;
   const COLUMN_MAX_WIDTH = 900;
 
   let TEXT_REPLACE = { ...DEFAULT_TEXT_REPLACE };
   const columnWidths = {}; // header → px（只在用户拖动过之后才有值）
 
-  function loadSettings() {
+  function readStoredJson(key) {
     try {
-      const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
-      if (!raw) return;
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) || null : null;
+    } catch (error) {
+      return null;
+    }
+  }
 
-      const data = JSON.parse(raw) || {};
+  const hasColumnConfig = (data) =>
+    !!data &&
+    (!!data.columnWidths ||
+      Array.isArray(data.columnOrder) ||
+      Array.isArray(data.hiddenColumns));
 
-      if (data.textReplace && typeof data.textReplace === "object") {
-        const entries = Object.entries(data.textReplace).filter(
-          ([source]) => typeof source === "string" && source.trim()
-        );
-        if (entries.length) TEXT_REPLACE = Object.fromEntries(entries);
-      }
+  function applyColumnConfig(data) {
+    if (!hasColumnConfig(data)) return;
 
-      if (data.columnWidths && typeof data.columnWidths === "object") {
-        Object.entries(data.columnWidths).forEach(([header, width]) => {
-          const value = Math.round(Number(width));
-          if (Number.isFinite(value) && value > 0) {
-            columnWidths[header] = Math.min(
-              COLUMN_MAX_WIDTH,
-              Math.max(COLUMN_MIN_WIDTH, value)
-            );
-          }
-        });
-      }
+    if (data.columnWidths && typeof data.columnWidths === "object") {
+      Object.entries(data.columnWidths).forEach(([header, width]) => {
+        const value = Math.round(Number(width));
+        if (Number.isFinite(value) && value > 0) {
+          columnWidths[header] = Math.min(
+            COLUMN_MAX_WIDTH,
+            Math.max(COLUMN_MIN_WIDTH, value)
+          );
+        }
+      });
+    }
 
-      if (Array.isArray(data.columnOrder)) {
-        const ids = data.columnOrder.filter((id) => typeof id === "string");
-        if (ids.length) columnOrder = ids;
-      }
+    if (Array.isArray(data.columnOrder)) {
+      const ids = data.columnOrder.filter((id) => typeof id === "string");
+      if (ids.length) columnOrder = ids;
+    }
 
-      if (Array.isArray(data.hiddenColumns)) {
-        hiddenColumnIds = new Set(
-          data.hiddenColumns.filter((id) => typeof id === "string")
-        );
-      }
-    } catch (error) {}
+    if (Array.isArray(data.hiddenColumns)) {
+      hiddenColumnIds = new Set(
+        data.hiddenColumns.filter((id) => typeof id === "string")
+      );
+    }
+  }
+
+  function loadSettings() {
+    const shared = readStoredJson(SETTINGS_STORAGE_KEY);
+
+    if (shared && shared.textReplace && typeof shared.textReplace === "object") {
+      const entries = Object.entries(shared.textReplace).filter(
+        ([source]) => typeof source === "string" && source.trim()
+      );
+      if (entries.length) TEXT_REPLACE = Object.fromEntries(entries);
+    }
+
+    // 列配置只认本页自己的 key；没有（第一次装这版）就从旧版共用 key 里搬一份过来
+    const own = readStoredJson(COLUMN_STORAGE_KEY);
+    applyColumnConfig(own || shared);
   }
 
   function persistSettings() {
     try {
+      // 共享 key 只负责文案替换；把原有字段读出来再写回，别把旧版留下的列配置抹掉
+      const shared = readStoredJson(SETTINGS_STORAGE_KEY) || {};
+      shared.textReplace = TEXT_REPLACE;
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(shared));
+
       localStorage.setItem(
-        SETTINGS_STORAGE_KEY,
+        COLUMN_STORAGE_KEY,
         JSON.stringify({
-          textReplace: TEXT_REPLACE,
           columnWidths,
           columnOrder,
           hiddenColumns: [...hiddenColumnIds],
@@ -165,6 +197,8 @@
 
   loadSettings();
   rebuildColumnLayout();
+  // 迁移 / 归一化过一次就落盘：本页从此只读自己的 key，另一页改什么都不影响这边
+  persistSettings();
 
 
   /* 「发票金额」列宽自适应。
@@ -1773,7 +1807,9 @@
     return row;
   }
 
-  // 设置面板里「列」那一行：勾选框 + 列名 + ↑↓
+  // 设置面板里「列」那一行：拖拽手柄 + 勾选框 + 列名
+  /* 2026-10-28 红领巾要求「排序模块可以手动拖拽调整位置，不要箭头」⇒
+     去掉了 ↑↓ 两个按钮，改成按住左侧手柄拖动整行（HTML5 拖放，colBox 上统一处理）。 */
   function createColumnSettingRow(id) {
     const def = COLUMN_DEF_BY_ID.get(id);
     if (!def) return null;
@@ -1781,6 +1817,21 @@
     const row = document.createElement("div");
     row.className = "tm-set-col";
     row.dataset.id = id;
+
+    const handle = document.createElement("span");
+    handle.className = "tm-set-drag";
+    handle.textContent = "⋮⋮";
+    handle.title = "按住拖动，调整这一列的位置";
+    handle.setAttribute("aria-hidden", "true");
+    // 拖动逻辑统一由 colBox 管（__tmStartColumnDrag）：只有按住手柄才开始，
+    // 在勾选框 / 列名上按住是正常点击，不会把行拖走。
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      const host = row.parentElement;
+      if (!host || typeof host.__tmStartColumnDrag !== "function") return;
+      event.preventDefault();
+      host.__tmStartColumnDrag(row, event);
+    });
 
     const label = document.createElement("label");
 
@@ -1802,25 +1853,11 @@
       label.appendChild(tag);
     }
 
-    const up = document.createElement("button");
-    up.type = "button";
-    up.className = "tm-set-move";
-    up.dataset.dir = "-1";
-    up.textContent = "↑";
-    up.title = "往前移一列";
-
-    const down = document.createElement("button");
-    down.type = "button";
-    down.className = "tm-set-move";
-    down.dataset.dir = "1";
-    down.textContent = "↓";
-    down.title = "往后移一列";
-
     const sync = () => row.classList.toggle("is-off", !box.checked);
     box.addEventListener("change", sync);
     sync();
 
-    row.append(label, up, down);
+    row.append(handle, label);
     return row;
   }
 
@@ -1898,7 +1935,7 @@
       }
       #${SETTINGS_PANEL_ID} .tm-set-btn.primary:hover { background: #1a6fe0; color: #fff; }
 
-      /* 列设置：一行 = 勾选框 + 列名 + 上下移 */
+      /* 列设置：一行 = 拖拽手柄 + 勾选框 + 列名 */
       #${SETTINGS_PANEL_ID} .tm-set-cols {
         display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px;
       }
@@ -1907,6 +1944,19 @@
         padding: 4px 6px; border: 1px solid #f0f0f0; border-radius: 6px; background: #fcfcfd;
       }
       #${SETTINGS_PANEL_ID} .tm-set-col.is-off { opacity: .45; }
+      /* 被按住拖起来的那一行：整行浮在指针下面（position:fixed 由 JS 现算） */
+      #${SETTINGS_PANEL_ID} .tm-set-col.is-dragging {
+        background: #fff; border-color: #237ffe; opacity: .97;
+        box-shadow: 0 10px 26px rgba(15,23,42,.20);
+        pointer-events: none;
+      }
+      /* 空槽：被拖行走开后原位留一个虚框，其余行就是平滑地往这个槽里退 */
+      #${SETTINGS_PANEL_ID} .tm-set-placeholder {
+        flex: 0 0 auto; border: 1px dashed #a9c6ff; border-radius: 6px;
+        background: #f4f8ff;
+      }
+      #${SETTINGS_PANEL_ID} .tm-set-cols.is-arranging { cursor: grabbing; }
+      #${SETTINGS_PANEL_ID} .tm-set-cols.is-arranging * { cursor: grabbing !important; }
       #${SETTINGS_PANEL_ID} .tm-set-col label {
         flex: 1 1 auto; display: flex; align-items: center; gap: 7px;
         cursor: pointer; min-width: 0;
@@ -1919,15 +1969,15 @@
         flex: 0 0 auto; padding: 0 5px; border-radius: 3px; font-size: 11px;
         color: #237ffe; background: #eef4ff;
       }
-      #${SETTINGS_PANEL_ID} .tm-set-move {
-        flex: 0 0 auto; width: 24px; height: 24px; padding: 0;
-        border: 1px solid #e5e7eb; border-radius: 5px; background: #fff;
-        color: #6b7280; font-size: 12px; line-height: 1; cursor: pointer;
+      #${SETTINGS_PANEL_ID} .tm-set-drag {
+        flex: 0 0 auto; width: 14px; text-align: center; cursor: grab;
+        color: #c8ccd4; font-size: 13px; line-height: 1; letter-spacing: -2px;
+        user-select: none;
+        /* 手柄上不要有浏览器自己的滚动/长按手势，否则手机上拖不动 */
+        touch-action: none;
       }
-      #${SETTINGS_PANEL_ID} .tm-set-move:hover:not(:disabled) {
-        border-color: #237ffe; color: #237ffe;
-      }
-      #${SETTINGS_PANEL_ID} .tm-set-move:disabled { opacity: .3; cursor: default; }
+      #${SETTINGS_PANEL_ID} .tm-set-col:hover .tm-set-drag { color: #8c9aad; }
+      #${SETTINGS_PANEL_ID} .tm-set-drag:active { cursor: grabbing; }
     `;
     document.head.appendChild(style);
 
@@ -2007,7 +2057,8 @@
     const widthTip = document.createElement("p");
     widthTip.className = "tm-set-tip";
     widthTip.textContent =
-      "直接在表头每一列的右边缘左右拖动就能改宽度；在边缘双击可把该列恢复成默认值。";
+      "直接在表头每一列的右边缘左右拖动就能改宽度；在边缘双击可把该列恢复成默认值。" +
+      "列宽只对「全局开票」这一页生效（订单页各存各的）。";
 
     const resetBtn = document.createElement("button");
     resetBtn.type = "button";
@@ -2032,20 +2083,11 @@
     const colTip = document.createElement("p");
     colTip.className = "tm-set-tip";
     colTip.textContent =
-      "↑ ↓ 调整左右顺序，取消勾选就隐藏（例如只留公司名、把税号列关掉）。改完点「保存并刷新」生效。";
+      "按住左侧 ⋮⋮ 拖动可调整左右顺序，取消勾选就隐藏（例如只留公司名、把税号列关掉）。" +
+      "这里的顺序 / 显隐 / 列宽只对「全局开票」这一页生效，不和订单页共用。改完点「保存并刷新」。";
 
     const colBox = document.createElement("div");
     colBox.className = "tm-set-cols";
-
-    const syncMoveButtons = () => {
-      const rows = [...colBox.children];
-      rows.forEach((row, index) => {
-        const up = row.querySelector('.tm-set-move[data-dir="-1"]');
-        const down = row.querySelector('.tm-set-move[data-dir="1"]');
-        if (up) up.disabled = index === 0;
-        if (down) down.disabled = index === rows.length - 1;
-      });
-    };
 
     const renderColumnRows = () => {
       rebuildColumnLayout();
@@ -2054,26 +2096,205 @@
         const row = createColumnSettingRow(id);
         if (row) colBox.appendChild(row);
       });
-      syncMoveButtons();
     };
 
-    colBox.addEventListener("click", (event) => {
-      const button = event.target.closest(".tm-set-move");
-      if (!button) return;
-      event.preventDefault();
+    /* ---- 列排序：指针拖拽（2026-10-28 重做，替掉 HTML5 drag&drop）----
+       旧版拖起来只有浏览器自带的半透明幽灵图，真行仍钉在原地，落位靠 dragover 里
+       insertBefore 硬插 —— 每挪一格 DOM 就重排一次，看着又抖又容易在拖快 / 拖出面板时
+       丢事件（松手不落位）。用户原话：「效果不好还容易失效」。
+       现在对标 sortable 那类库：
+         · 按住的整行改成 position:fixed 浮层，跟着指针走（不透明 + 投影 = 一眼看出是整行在动）；
+         · 原位留一个虚线空槽，其余行用 transform 平滑退到该去的位置（只走合成层，不重排）；
+         · 指针捕获在手柄上，拖到面板外 / 窗口边缘都不断；
+         · 松手才真正插回 DOM，取消（Esc / 指针取消）回原位。 */
+    let drag = null;
 
-      const row = button.closest(".tm-set-col");
-      if (!row) return;
+    const endDrag = (commit) => {
+      const s = drag;
+      if (!s) return;
+      drag = null;
 
-      if (button.dataset.dir === "-1" && row.previousElementSibling) {
-        colBox.insertBefore(row, row.previousElementSibling);
-      } else if (button.dataset.dir === "1" && row.nextElementSibling) {
-        colBox.insertBefore(row.nextElementSibling, row);
+      try {
+        s.handle.releasePointerCapture?.(s.pointerId);
+      } catch (error) {}
+
+      window.removeEventListener("pointermove", onDragMove, true);
+      window.removeEventListener("pointerup", onDragUp, true);
+      window.removeEventListener("pointercancel", onDragUp, true);
+      window.removeEventListener("blur", onDragUp, true);
+
+      if (s.raf) cancelAnimationFrame(s.raf);
+
+      if (!s.active) return; // 只是点了一下手柄，没真拖
+
+      colBox.classList.remove("is-arranging");
+      s.row.classList.remove("is-dragging");
+      [
+        "position", "zIndex", "width", "left", "top", "transition", "transform",
+      ].forEach((prop) => {
+        s.row.style[prop] = "";
+      });
+
+      if (commit) {
+        colBox.insertBefore(s.row, s.placeholder);
+      } else if (s.originNext && s.originNext.isConnected) {
+        colBox.insertBefore(s.row, s.originNext);
+      } else {
+        colBox.appendChild(s.row);
       }
-      syncMoveButtons();
+      s.placeholder.remove();
+
+      // 让位动画收个尾：下一帧清掉残留的 transition / transform
+      requestAnimationFrame(() => {
+        [...colBox.children].forEach((el) => {
+          el.style.transition = "";
+          el.style.transform = "";
+        });
+      });
+    };
+
+    const onDragMove = (event) => {
+      const s = drag;
+      if (!s || event.pointerId !== s.pointerId) return;
+
+      if (!s.active) {
+        // 起手 4px 内当点击：手柄上一点手抖不该把行拎起来
+        if (
+          Math.abs(event.clientX - s.startX) < 4 &&
+          Math.abs(event.clientY - s.startY) < 4
+        ) {
+          return;
+        }
+        s.active = true;
+        colBox.classList.add("is-arranging");
+        s.row.classList.add("is-dragging");
+        s.row.style.position = "fixed";
+        s.row.style.zIndex = "10";
+        s.row.style.width = `${s.rect.width}px`;
+        s.row.style.left = "0px";
+        s.row.style.top = "0px";
+        s.row.style.transition = "none";
+
+        /* ⚠️ 面板的 .tm-set-box 上带着 transform: translate(-50%,-50%)，
+           position:fixed 的包含块就被它接管了（不再以视口为准）——
+           直接把视口坐标写进 left/top 会整体偏出去一截（实测偏右下 ~200px）。
+           这里先把它摆到 0,0 量一次实际落点，把这段偏移记下来当补偿，后面全按视口坐标算。 */
+        const probe = s.row.getBoundingClientRect();
+        s.compX = s.rect.left - probe.left;
+        s.compY = s.rect.top - probe.top;
+
+        // fixed 会脱离文档流，靠 placeholder 撑住这一格的高度
+        colBox.insertBefore(s.placeholder, s.row);
+        colBox.appendChild(s.row);
+      }
+
+      s.pointerY = event.clientY;
+      if (!s.raf) s.raf = requestAnimationFrame(layoutFloat);
+    };
+
+    const onDragUp = (event) => {
+      const s = drag;
+      if (!s) return;
+      if (event && event.pointerId !== undefined && event.pointerId !== s.pointerId) return;
+      endDrag(event.type === "pointerup");
+    };
+
+    // 浮层跟随 + 空槽移动
+    const layoutFloat = () => {
+      const s = drag;
+      if (!s) return;
+      s.raf = 0;
+
+      s.row.style.top = `${s.compY + (s.pointerY - s.startY)}px`;
+      s.row.style.left = `${s.compX}px`;
+
+      // 指针压在某行的中线之上就挪到它前面，都不满足就落到最后
+      const siblings = [...colBox.children].filter(
+        (el) => el !== s.row && el !== s.placeholder
+      );
+      let next = null;
+      for (const el of siblings) {
+        const rect = el.getBoundingClientRect();
+        if (s.pointerY < rect.top + rect.height / 2) {
+          next = el;
+          break;
+        }
+      }
+      if (next === s.nextSlot) return;
+      s.nextSlot = next;
+
+      /* FLIP：先记下每行现在的位置，挪完空槽再把「位移差」反着贴回去，
+         下一帧清成 0 —— 行没真跳，是平滑地退开 / 归位。 */
+      const beforeTops = new Map(
+        [...colBox.children]
+          .filter((el) => el !== s.row)
+          .map((el) => [el, el.getBoundingClientRect().top])
+      );
+
+      colBox.insertBefore(s.placeholder, next);
+
+      beforeTops.forEach((top, el) => {
+        if (!el.isConnected) return;
+        const dy = top - el.getBoundingClientRect().top;
+        if (!dy) return;
+        el.style.transition = "none";
+        el.style.transform = `translateY(${dy}px)`;
+        void el.offsetHeight; // 先把上面的 transform 落地，再放开过渡
+        el.style.transition = "transform .18s cubic-bezier(.22,.61,.36,1)";
+        el.style.transform = "";
+      });
+    };
+
+    // 行里的手柄按住时调这里（见 createColumnSettingRow）
+    colBox.__tmStartColumnDrag = (row, event) => {
+      if (drag) return;
+
+      const rect = row.getBoundingClientRect();
+      const placeholder = document.createElement("div");
+      placeholder.className = "tm-set-placeholder";
+      placeholder.style.height = `${rect.height}px`;
+
+      drag = {
+        row,
+        handle: event.currentTarget || event.target,
+        placeholder,
+        rect,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        pointerY: event.clientY,
+        grabOffset: event.clientY - rect.top,
+        originNext: row.nextElementSibling,
+        nextSlot: row.nextElementSibling,
+        active: false,
+        raf: 0,
+      };
+
+      try {
+        drag.handle.setPointerCapture?.(event.pointerId);
+      } catch (error) {}
+
+      window.addEventListener("pointermove", onDragMove, true);
+      window.addEventListener("pointerup", onDragUp, true);
+      window.addEventListener("pointercancel", onDragUp, true);
+      window.addEventListener("blur", onDragUp, true);
+    };
+
+    // 默认顺序改过之后，本机存的旧顺序不会自动跟着变（那是用户自己的配置，不能悄悄覆盖），
+    // 所以给一个一键复位，省得手拖回去。
+    const resetOrderBtn = document.createElement("button");
+    resetOrderBtn.type = "button";
+    resetOrderBtn.className = "tm-set-reset";
+    resetOrderBtn.style.marginTop = "8px";
+    resetOrderBtn.textContent = "恢复默认顺序";
+    resetOrderBtn.addEventListener("click", () => {
+      columnOrder = COLUMN_DEFS.map((def) => def.id);
+      renderColumnRows();
+      panel.querySelector(".tm-set-msg").textContent =
+        "已按默认顺序重排，点「保存并刷新」才生效";
     });
 
-    colSection.append(colTitle, colTip, colBox);
+    colSection.append(colTitle, colTip, colBox, resetOrderBtn);
     // 每次打开面板时重画一遍（用户在别处拖过列宽、切过显示都不会丢）
     panel.__tmRenderColumns = renderColumnRows;
 
@@ -2165,12 +2386,26 @@
       if (event.target === panel) closeSettingsPanel();
     });
 
-    panel.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") {
+    /* ESC 关闭（2026-10-28）：旧版只挂在 panel 上，得先点进面板、焦点落在里面才生效；
+       现在挂 document 捕获阶段 —— 面板一露脸，按 ESC 直接关。
+       ⚠️ 正在拖列时按 ESC 只取消这一次拖动，不关面板（否则松手那一刻行会飞掉）。 */
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key !== "Escape" && event.key !== "Esc") return;
+        if (panel.style.display !== "block") return;
+
+        event.preventDefault();
         event.stopPropagation();
+
+        if (drag) {
+          endDrag(false);
+          return;
+        }
         closeSettingsPanel();
-      }
-    });
+      },
+      true
+    );
 
     document.body.appendChild(panel);
     return panel;
@@ -2194,46 +2429,146 @@
   }
 
   /******************** 8) UI：按钮 + 快捷键 ********************/
+  /* 设置入口（2026-10-28 改）：不再钉死在左下角，贴到查询条件栏「重置」的左边 ——
+     尺寸 / 圆角 / 字号照抄站点那个按钮（getComputedStyle 现读，站点换皮肤也跟着变），
+     只把底色换成浅蓝，一眼能分出「这是脚本加的」。文案「页面配置」。
+     ⚠️ 查询栏还没渲染出来（首屏加载中 / 换页重画的瞬间）时退回左下角悬浮，别让人找不到入口。 */
+  const UI_BTN_ID = "tm-btn-invoice-settings";
+  const UI_BTN_STYLE_ID = UI_BTN_ID + "-style";
+  const UI_BTN_LABEL = "页面配置";
+
+  const compactText = (value) => (value || "").replace(/\s+/g, "");
+
+  function isElementShown(node) {
+    if (!node || !node.isConnected) return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  /* 认「查询栏里的重置」而不是随便哪个重置：同一排按钮里必须还有「查询」。
+     ⚠️ antd 会在两个汉字中间插空格（显示成「重 置」），所以比较前先去掉空白。 */
+  function findQueryBarResetButton() {
+    const buttons = document.querySelectorAll("button");
+
+    for (const button of buttons) {
+      if (button.id === UI_BTN_ID) continue;
+      if (compactText(button.innerText) !== "重置") continue;
+      if (!isElementShown(button)) continue;
+
+      const bar = button.parentElement;
+      if (!bar) continue;
+
+      const hasQuery = [...bar.querySelectorAll("button")].some(
+        (node) =>
+          node !== button &&
+          node.id !== UI_BTN_ID &&
+          compactText(node.innerText) === "查询"
+      );
+      if (hasQuery) return button;
+    }
+
+    return null;
+  }
+
+  function ensureUiButtonStyle() {
+    if (document.getElementById(UI_BTN_STYLE_ID)) return;
+
+    const style = document.createElement("style");
+    style.id = UI_BTN_STYLE_ID;
+    style.textContent = `
+      #${UI_BTN_ID} {
+        box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center;
+        margin: 0; cursor: pointer; white-space: nowrap; user-select: none;
+        background: #eef4ff; border: 1px solid #adc6ff; color: #1d4ed8;
+        transition: background .15s, border-color .15s, color .15s;
+      }
+      #${UI_BTN_ID}:hover { background: #dfeaff; border-color: #7fa9ff; color: #1a6fe0; }
+      #${UI_BTN_ID}:active { background: #d2e2ff; }
+      /* 兜底：查询栏还没出来时钉在左下角（原来的位置） */
+      #${UI_BTN_ID}.is-floating {
+        position: fixed; left: 40px; top: 850px; z-index: 999999;
+        height: 32px; padding: 0 12px; border-radius: 8px; font-size: 12px;
+        box-shadow: 0 2px 10px rgba(0,0,0,.15);
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // 把站点按钮量出来的尺寸抄过来（只抄尺寸，颜色由上面那段 CSS 定）
+  function mirrorButtonMetrics(button, sample) {
+    button.removeAttribute("style");
+    if (!sample) return;
+
+    const style = getComputedStyle(sample);
+    [
+      "height",
+      "paddingTop",
+      "paddingBottom",
+      "paddingLeft",
+      "paddingRight",
+      "fontSize",
+      "fontFamily",
+      "fontWeight",
+      "lineHeight",
+      "borderRadius",
+      "borderWidth",
+    ].forEach((key) => {
+      const value = style[key];
+      if (value) button.style[key] = value;
+    });
+  }
+
   function ensureUiButton() {
-    if (uiBtn && document.body.contains(uiBtn)) return;
+    ensureUiButtonStyle();
 
-    uiBtn = document.createElement("button");
-    uiBtn.id = "tm-btn-invoice-settings";
-    uiBtn.type = "button";
-    uiBtn.title = withVersion("发票工具设置：文案替换、列宽");
+    if (!uiBtn || !uiBtn.isConnected) {
+      uiBtn = document.getElementById(UI_BTN_ID);
+    }
 
-    Object.assign(uiBtn.style, {
-      position: "fixed",
-      left: "40px",
-      top: "850px",
-      zIndex: "999999",
-      padding: "8px 10px",
-      border: "1px solid rgba(0,0,0,.2)",
-      borderRadius: "8px",
-      background: "#237ffe",
-      color: "#fff",
-      boxShadow: "0 2px 10px rgba(0,0,0,.15)",
-      cursor: "pointer",
-      userSelect: "none",
-      fontSize: "12px",
-    });
+    if (!uiBtn) {
+      uiBtn = document.createElement("button");
+      uiBtn.id = UI_BTN_ID;
+      uiBtn.type = "button";
+      uiBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        openSettingsPanel();
+      });
+      uiBtn.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        openSettingsPanel();
+      });
+    }
 
-    uiBtn.addEventListener("click", (event) => {
-      event.preventDefault();
-      openSettingsPanel();
-    });
+    const anchor = findQueryBarResetButton();
 
-    uiBtn.addEventListener("contextmenu", (event) => {
-      event.preventDefault();
-      openSettingsPanel();
-    });
+    if (anchor) {
+      const bar = anchor.parentElement;
+      const needsInsert =
+        uiBtn.parentElement !== bar || uiBtn.nextElementSibling !== anchor;
 
-    document.body.appendChild(uiBtn);
+      if (needsInsert) {
+        uiBtn.classList.remove("is-floating");
+        mirrorButtonMetrics(uiBtn, anchor);
+
+        // 站点按钮之间靠 flex gap 隔开；父容器不是 flex 就自己补一点右边距
+        const barStyle = getComputedStyle(bar);
+        const gap = parseFloat(barStyle.columnGap) || 0;
+        const isFlex = /flex/.test(barStyle.display);
+        uiBtn.style.marginRight = isFlex && gap > 0 ? "0px" : "8px";
+
+        bar.insertBefore(uiBtn, anchor);
+      }
+    } else if (!uiBtn.isConnected) {
+      uiBtn.classList.add("is-floating");
+      uiBtn.removeAttribute("style");
+      document.body.appendChild(uiBtn);
+    }
+
     updateUiLabel();
   }
 
   function removeUiButton() {
-    const node = document.getElementById("tm-btn-invoice-settings");
+    const node = document.getElementById(UI_BTN_ID);
     if (node) node.remove();
     uiBtn = null;
   }
@@ -2241,12 +2576,14 @@
   function updateUiLabel() {
     if (!uiBtn) return;
 
-    uiBtn.textContent = "⚙ 设置";
+    if (uiBtn.textContent !== UI_BTN_LABEL) uiBtn.textContent = UI_BTN_LABEL;
 
     const adjustable = getAdjustableColumn();
-    if (adjustable) {
-      uiBtn.title = withVersion(`发票工具设置：文案替换、列宽（Alt+= / Alt+- 也可调「${adjustable.header}」列宽）`);
-    }
+    const tip = adjustable
+      ? `发票工具设置：文案替换、列顺序、列宽（Alt+= / Alt+- 也可调「${adjustable.header}」列宽）`
+      : "发票工具设置：文案替换、列顺序、列宽";
+    const title = withVersion(tip);
+    if (uiBtn.title !== title) uiBtn.title = title;
   }
 
   window.addEventListener(
@@ -2506,6 +2843,17 @@
     return normText(clone.innerText);
   }
 
+  /* 批量清单里那行「数量 × 单价」小字（和列表金额格下面那行一模一样）。
+     明细缓存没命中就先空着 —— 面板开着的期间 refreshRowHint 会把补到的数据同步进来，
+     不在打开面板时主动发 44 个详情请求。 */
+  function getRowQtyText(applyCode) {
+    const items = getCachedDetail(applyCode);
+    if (!items) return "";
+
+    const text = buildDetailSummary(items);
+    return text === "无商品明细" ? "" : text;
+  }
+
   function collectInvoiceRows() {
     const table = document.querySelector(TABLE_SELECTOR);
     if (!table) return [];
@@ -2556,6 +2904,7 @@
           amountIdx !== undefined
             ? getAmountText(tr.children[amountIdx])
             : "",
+        qtyText: getRowQtyText(applyCode),
       });
     });
 
@@ -2734,20 +3083,36 @@
         display: grid; grid-template-columns: minmax(0, 1fr) 138px;
         align-items: center; column-gap: 10px;
       }
+      /* 名称行 = 名字 + 「×N」同名角标（和表格客户格右上角那个同色同口径） */
       #${panelId} .tm-batch-item-name {
+        min-width: 0; display: flex; align-items: center; gap: 6px;
+      }
+      #${panelId} .tm-batch-item-name-text {
         min-width: 0; font-weight: 600; color: #1f2937;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #${panelId} .tm-batch-item-dup {
+        flex: 0 0 auto; padding: 0 5px; border-radius: 7px;
+        font-size: 10px; line-height: 14px; font-style: normal; font-weight: 600;
+        color: #fff;
       }
       #${panelId} .tm-batch-item-code {
         min-width: 0; color: #a8b0bd; font-size: 12px;
         font-variant-numeric: tabular-nums;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
+      /* 右侧金额块：上行金额、下行「数量 × 单价」（和列表金额格下面那行小字同口径）。
+         宽度按最长的小字定：25 × 599 这种 9~11 个字符，84px 装不下，给 104。 */
       #${panelId} .tm-batch-item-amount {
-        flex: 0 0 auto; width: 84px; text-align: right;
-        color: #595959; font-style: normal;
-        font-variant-numeric: tabular-nums;
+        flex: 0 0 auto; width: 104px;
+        display: flex; flex-direction: column; align-items: flex-end; gap: 1px;
+        color: #595959; font-variant-numeric: tabular-nums;
       }
+      #${panelId} .tm-batch-item-money { font-style: normal; }
+      #${panelId} .tm-batch-item-qty {
+        font-size: 11px; line-height: 1.25; color: #a8b0bd; white-space: nowrap;
+      }
+      #${panelId} .tm-batch-item-qty:empty { display: none; }
       #${panelId} .tm-batch-foot {
         display: flex; justify-content: flex-end; gap: 8px;
         padding: 12px 16px; border-top: 1px solid #f0f0f0;
@@ -2940,6 +3305,8 @@
     items.forEach((item) => {
       const row = document.createElement("label");
       row.className = "tm-batch-item";
+      // 明细后到（refreshRowHint）时要按申请单号回填数量小字
+      row.dataset.applyCode = item.applyCode;
 
       // 显示的是替换后的客户名（和页面上看到的一致），但配色按「原名 + 税号」算，
       // 替换只是换个叫法，同一家还是同一家，得和列表里一个色
@@ -2958,9 +3325,25 @@
       const text = document.createElement("span");
       text.className = "tm-batch-item-text";
 
-      const name = document.createElement("b");
+      const name = document.createElement("span");
       name.className = "tm-batch-item-name";
-      name.textContent = shown;
+
+      const nameText = document.createElement("b");
+      nameText.className = "tm-batch-item-name-text";
+      nameText.textContent = shown;
+      name.appendChild(nameText);
+
+      /* 「×N」同名角标（2026-10-28 用户要求）：这张清单里有几张是同一家客户。
+         数据来源和表格客户格右上角那个 ×N 完全同一套（buildCustomerColorMarks
+         只收出现 ≥2 次的组，颜色也是同一个色号），所以在列表和清单里对得上。 */
+      if (mark) {
+        const dup = document.createElement("em");
+        dup.className = "tm-batch-item-dup";
+        dup.textContent = "×" + mark.count;
+        dup.style.background = mark.color;
+        dup.title = `这一批里有 ${mark.count} 张是同一家客户`;
+        name.appendChild(dup);
+      }
 
       const code = document.createElement("span");
       code.className = "tm-batch-item-code";
@@ -2973,13 +3356,24 @@
         item.seller,
         item.applyNo || item.applyCode,
         item.amount,
+        item.qtyText,
       ]
         .filter(Boolean)
         .join(" ｜ ");
 
-      const amount = document.createElement("em");
+      // 金额块：上行金额，下行「数量 × 单价」（与列表里金额格下面那行小字一致）
+      const amount = document.createElement("span");
       amount.className = "tm-batch-item-amount";
-      amount.textContent = item.amount;
+
+      const money = document.createElement("span");
+      money.className = "tm-batch-item-money";
+      money.textContent = item.amount;
+
+      const qty = document.createElement("span");
+      qty.className = "tm-batch-item-qty";
+      qty.textContent = item.qtyText || "";
+
+      amount.append(money, qty);
 
       row.append(box, text, amount);
       list.appendChild(row);
@@ -2988,6 +3382,30 @@
     panel.style.display = "block";
     list.scrollTop = 0;
     if (panel.tmSyncCount) panel.tmSyncCount();
+  }
+
+  /* 明细是异步补的：面板开着的时候，那行数据后到了就把「数量 × 单价」补上去。
+     用遍历而不是属性选择器 —— 申请单号里带特殊字符时选择器容易出岔子。 */
+  function syncBatchRowQty(applyCode) {
+    if (!applyCode) return;
+
+    const panel = document.getElementById(DOWNLOAD_MENU_ID + "-batch");
+    if (!panel || panel.style.display === "none") return;
+
+    let target = null;
+    for (const row of panel.querySelectorAll(".tm-batch-item")) {
+      if (row.dataset.applyCode === applyCode) {
+        target = row;
+        break;
+      }
+    }
+    if (!target) return;
+
+    const node = target.querySelector(".tm-batch-item-qty");
+    if (!node) return;
+
+    const text = getRowQtyText(applyCode);
+    if (node.textContent !== text) node.textContent = text;
   }
 
   /********** 悬浮提示：让人知道能点、也能右键 **********/
@@ -3554,6 +3972,9 @@
     if (amountIdx === undefined) return;
 
     renderDetailHint(row.children[amountIdx], items);
+
+    // 批量下载面板开着时，那一行的「数量 × 单价」也跟着补上
+    syncBatchRowQty(applyCode);
 
     // 浮层正开着这一行 → 内容跟着更新
     const pop = document.getElementById(DETAIL_POP_ID);
