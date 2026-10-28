@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.2套餐危害核对
 // @namespace    https://dime.health-100.cn/
-// @version      4.10.4
+// @version      4.11.0
 // @description  蝶美套餐危害核对：核对套餐名称里的危害因素、在岗状态同系统实际值是否一致，差异批量补齐，结束给出逐条报告。详细用法与更新记录见工具面板里的"使用说明"。
 
 // @match        https://dime.health-100.cn/*
@@ -3513,11 +3513,99 @@
       margin-top:5px;color:#7254a3;font-size:10px;line-height:1.5;
       white-space:pre-wrap;word-break:break-word
     }
-    #${TOOL_ID} .batch-notice{
-      margin-top:7px;padding:7px 8px;border:1px solid #c2e7b0;
-      border-radius:6px;background:#f0f9eb;color:#529b2e;
-      font-size:10px;line-height:1.5;white-space:pre-wrap;
-      max-height:220px;overflow-y:auto
+    /* v4.11 左侧那块 220px 高的纯文本报告框已废弃：批量结论统一出在右侧「核对结果」
+       顶部的结论卡片里（下面的 .batch-report 系列）。 */
+    #${TOOL_ID} .batch-report{
+      border:1px solid #c2e7b0;border-radius:8px;background:#fbfef9;
+      overflow:hidden;font-size:12px;line-height:1.55
+    }
+    #${TOOL_ID} .batch-report.is-stopped{
+      border-color:#f5dab1;background:#fffdf8
+    }
+    #${TOOL_ID} .batch-report.is-failed{
+      border-color:#fbc4c4;background:#fffafa
+    }
+    #${TOOL_ID} .batch-report-head{
+      display:flex;align-items:center;justify-content:space-between;gap:8px;
+      padding:9px 10px;background:#f0f9eb;border-bottom:1px solid #e1f3d8
+    }
+    #${TOOL_ID} .batch-report.is-stopped .batch-report-head{background:#fdf6ec;border-bottom-color:#f5dab1}
+    #${TOOL_ID} .batch-report.is-failed .batch-report-head{background:#fef0f0;border-bottom-color:#fbc4c4}
+    #${TOOL_ID} .batch-report-title{
+      min-width:0;font-size:13px;font-weight:900;color:#3f7a24
+    }
+    #${TOOL_ID} .batch-report.is-stopped .batch-report-title{color:#9a6b24}
+    #${TOOL_ID} .batch-report.is-failed .batch-report-title{color:#c45656}
+    #${TOOL_ID} .batch-report-copy{
+      flex:0 0 auto;padding:4px 9px;border:1px solid #c2e7b0;border-radius:5px;
+      background:#fff;color:#529b2e;font-size:11px;font-weight:800;cursor:pointer
+    }
+    #${TOOL_ID} .batch-report-copy:hover{background:#f0f9eb}
+    #${TOOL_ID} .batch-report-stats{
+      display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
+      gap:6px;padding:9px 10px 0
+    }
+    #${TOOL_ID} .batch-report-stat{
+      padding:6px 7px;border:1px solid #ebeef5;border-radius:6px;background:#fff
+    }
+    #${TOOL_ID} .batch-report-stat-label{
+      display:block;color:#909399;font-size:10px;font-weight:800;white-space:nowrap
+    }
+    #${TOOL_ID} .batch-report-stat-value{
+      display:block;margin-top:1px;color:#303133;font-size:17px;
+      font-weight:900;line-height:1.15;font-variant-numeric:tabular-nums
+    }
+    #${TOOL_ID} .batch-report-stat.saved .batch-report-stat-value{color:#529b2e}
+    #${TOOL_ID} .batch-report-stat.skipped .batch-report-stat-value{color:#b88230}
+    #${TOOL_ID} .batch-report-stat.failed .batch-report-stat-value{color:#c45656}
+    #${TOOL_ID} .batch-report-stat.cost .batch-report-stat-value{font-size:15px;color:#337ecc}
+    #${TOOL_ID} .batch-report-notes{
+      display:flex;flex-direction:column;gap:4px;padding:9px 10px 0
+    }
+    #${TOOL_ID} .batch-report-note{
+      padding:6px 8px;border-radius:5px;background:#fff;border:1px solid #ebeef5;
+      color:#606266;font-size:11.5px;line-height:1.5
+    }
+    #${TOOL_ID} .batch-report-note.warn{
+      border-color:#f5dab1;background:#fdf6ec;color:#9a6b24
+    }
+    #${TOOL_ID} .batch-report-note.danger{
+      border-color:#fbc4c4;background:#fef0f0;color:#c45656
+    }
+    #${TOOL_ID} .batch-report-list{
+      margin:9px 10px 10px;border:1px solid #ebeef5;border-radius:6px;overflow:hidden
+    }
+    #${TOOL_ID} .batch-report-list > summary{
+      display:flex;align-items:center;justify-content:space-between;gap:8px;
+      padding:7px 9px;background:#f7f8fa;color:#606266;font-size:11.5px;
+      font-weight:800;cursor:pointer;list-style:none;user-select:none
+    }
+    #${TOOL_ID} .batch-report-list > summary::-webkit-details-marker{display:none}
+    #${TOOL_ID} .batch-report-list > summary::before{
+      content:"▶";margin-right:5px;font-size:9px;color:#909399;transition:transform .15s
+    }
+    #${TOOL_ID} .batch-report-list[open] > summary::before{transform:rotate(90deg)}
+    #${TOOL_ID} .batch-report-rows{background:#fff}
+    #${TOOL_ID} .batch-report-row{
+      display:flex;align-items:baseline;gap:7px;padding:5px 9px;
+      font-size:11.5px;color:#606266;line-height:1.5
+    }
+    #${TOOL_ID} .batch-report-row + .batch-report-row{border-top:1px solid #f2f4f7}
+    #${TOOL_ID} .batch-report-row .tag{
+      flex:0 0 auto;padding:0 6px;border-radius:9px;font-size:10px;font-weight:900;color:#fff
+    }
+    #${TOOL_ID} .batch-report-row.is-saved .tag{background:#67c23a}
+    #${TOOL_ID} .batch-report-row.is-skipped .tag{background:#e6a23c}
+    #${TOOL_ID} .batch-report-row.is-failed .tag{background:#f56c6c}
+    #${TOOL_ID} .batch-report-row .who{
+      flex:0 1 auto;min-width:0;color:#303133;font-weight:700;
+      font-variant-numeric:tabular-nums;word-break:break-all
+    }
+    #${TOOL_ID} .batch-report-row .why{
+      flex:1 1 auto;min-width:0;color:#909399;font-size:11px;word-break:break-word
+    }
+    #${TOOL_ID} .batch-report-row .ms{
+      flex:0 0 auto;color:#c0c4cc;font-size:10px;font-variant-numeric:tabular-nums
     }
     #${TOOL_ID} [data-result-section]{
       scroll-margin-top:230px
@@ -3897,6 +3985,11 @@
     /* ================= v4.7 布局：左侧操作/概览，右侧结果 ================= */
     #${TOOL_ID} .tool-body{
       flex:1;min-height:0;display:grid;grid-template-columns:296px minmax(0,1fr);
+      /* v4.11 关键：行高必须 minmax(0,1fr)。原来只有 auto 行，内容一多这一行会被
+         撑到 max-content 高度（超出父容器、被 overflow:hidden 剪掉），
+         .tool-results 拿到的就是"跟内容一样高"，于是永远出不了滚动条 —— 这就是
+         「核对结果无法滚动」的根因。 */
+      grid-template-rows:minmax(0,1fr);
       gap:0;padding:0;overflow:hidden
     }
     /* v4.10.4 上下占比拖动条：单栏（窄）时上方操作区与下方结果区不再硬切 44vh，
@@ -3937,7 +4030,8 @@
       font-size:12px;line-height:1.8;text-align:center
     }
     #${TOOL_ID} .tool-results{
-      flex:1;min-height:0;overflow:auto;padding:10px 12px 18px
+      flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+      padding:10px 12px 18px
     }
     #${TOOL_ID} .tool-sticky-zone{
       position:static;margin:0;padding:0;border:0;background:transparent;box-shadow:none
@@ -4049,7 +4143,7 @@
   tool.innerHTML = `
     <div class="tool-header">
       <div class="tool-header-left">
-        <strong>套餐危害因素核对工具 v4.10.4</strong>
+        <strong>套餐危害因素核对工具 v4.11</strong>
         <span class="tool-mini-status">等待核对</span>
       </div>
       <button class="tool-mini-run" type="button" title="直接开始核对">开始核对</button>
@@ -4083,8 +4177,9 @@
           <b>三种结论：</b>已补齐 = 脚本改过来了；无需动 = 本来就一致；失败 = 没改成，报告里写原因（多是名称在危害库里定位不到，或保存接口回执不通过）。<br>
           <b>套餐名称格式：</b>「XX-危害1+危害2+危害3+岗中+性别」；岗位简称会自动识别。分隔符默认只认「+」，可在「⚙ 配置 → 分隔符」里改（也能加 、 ，等）。<b>只有配置的分隔符才拆危害</b>，没配的符号一律当名称的一部分；拆出来又对不上标准名的整段，按「名称异常」提示，可用「配置 → 匹配规则」人工指定。<br>
           <b>处理方式：</b>默认「静默直写」——编辑弹窗整批只在后台打开一次并全程隐身，屏幕上看不到弹窗、遮罩和逐条换内容的闪烁，也没有开窗动画；脚本把目标值直接写进页面表单模型、调页面自带的保存逻辑，成败以保存接口的回执为准，最快。若首轮提交被页面的"保存中"状态挡下（请求根本没发出），会自动降级成逐条提交，并在报告里说明。想改用「界面模拟」（逐项点选，慢但完全走人手路径，可肉眼对照）时，按住 <code>Alt</code> 点「批量核对补齐本页」即可来回切换，状态会记住。<br>
-          <b>进度背景怎么读：</b>百分比按"已结案 + 在途/待补试各计半格"算，所以提交中也在往前走。「在途 N」= 已发出请求、等回执；「待补试 M」= 首轮没成、排队等批末重试；「正在处理」是当前这一条，「最近完成」是最后 4 条的去向。整批跑到 100% 会原地停 2 秒显示处理结果，再交回右下角小卡片。中途想停点「停止」，已发出的那几条仍会落地。<br>
-          <b>报告怎么读：</b>逐条列出每条的结论与改动内容（新增了几项危害、在岗状态改成了什么）；开头若出现「首轮有 N 条…」，说明那 N 条是被自动降级后补成的，数据没问题、只是慢一点。请对照清单自行抽查。<br>
+          <b>进度背景怎么读：</b>百分比按"已结案 + 在途/待补试各计半格"算，所以提交中也在往前走。「在途 N」= 已发出请求、等回执；「待补试 M」= 首轮没成、排队等批末重试；「正在处理」是当前这一条和它此刻在做什么；顶部还有一颗实时用时。<b>下面那张明细表是全量的</b>：每完成一条就追加一行（✓ 已补齐 / – 无需动 / ✗ 失败），带序号、套餐编码、队列类型（只缺岗位 / 只缺危害 / 两者都缺）、本条结论和本条耗时，列表自己往下滚，往上翻能看到前面每一条。<br>
+          <b>v4.11 起这层只盖页面、不盖工具面板</b>：跑的时候面板照常可见、可滚、可点，页面被盖住即可。整批跑完不会自己消失——标题换成结果、进度环停住、明细原样留着，看完点右上角「确认并关闭」才收起。中途想停点「停止」，已发出的那几条仍会落地。<br>
+          <b>报告怎么读：</b>跑完后右侧「核对结果」最上面出结论卡片：<b>已补齐 / 无需动 / 失败 / 总耗时</b> 四个数 + 需要你知道的几句话（为什么停、有多少条第一次没提交上去被自动重提、失败几个），下面可展开「逐条结果」。卡片上的「复制报告」会把同一份结论复制成纯文本。只写结论，工程内部计数不再混在报告里。<br>
           <b>人工兜底：</b>匹配不上的名称用「匹配规则」建立标准危害映射；确认与危害无关的用「排除项 / 无关内容 / 无关关键词」，保存后长期复用。系统岗位为空且套餐状态明确时可辅助补齐；已有岗位与套餐不一致时只提示、不自动覆盖。<br>
           <b>边界：</b>只处理可明确判断的项，判断不了的一律留给人；批量改动前建议先小范围试一批。
       </details>
@@ -4092,6 +4187,12 @@
       <details class="tool-help">
         <summary>更新记录（点击展开）</summary>
         <div class="tool-tip">
+          <b>v4.11</b> 运行界面让位 + 结论说人话 + 修结果区不能滚：<br>
+          ・<b>修「核对结果」滚不动</b>：两栏布局的网格只有一条 <code>auto</code> 行，结果一多这一行就被内容撑到超出面板、被 <code>overflow:hidden</code> 剪掉，右边那块拿到的永远是"跟内容一样高"，所以出不了滚动条。行高改成 <code>minmax(0,1fr)</code> 后结果区恢复独立滚动。<br>
+          ・<b>运行界面只盖页面、不再盖面板</b>：那层毛玻璃以前 z-index 2147483640，把工具面板一起压在下面（跑批量时面板被糊掉、也点不了）。现在降到面板之下，并且靠右停靠时右边收进一个面板宽度 —— 页面照旧被盖住，面板照常可见可滚可点。<br>
+          ・<b>跑的时候看到的东西变多</b>：明细从"最近 4 条"改成全量追加、自己往下滚，每行带序号 / 套餐编码 / 队列类型 / 本条结论 / 本条耗时；顶部加实时用时，卡片按"除面板外"的宽度重新居中并放大。<br>
+          ・<b>结束不再自己消失</b>：原来跑到 100% 停 2 秒就淡出。现在标题换成结果、进度环停住、明细原样留着，「停止」换成「确认并关闭」，你看完手动点掉。<br>
+          ・<b>报告挪到右侧并只说结论</b>：左侧那块 220px 高的纯文本框删掉；改为右侧「核对结果」顶部的结论卡片（四个数 + 几句人话 + 可展开的逐条结果 + 复制报告）。"整批共用一个弹窗省下 N 次重建""单项快速通过 N 个""队列按…处理"这类看不懂的内部口径全部不再进报告。<br>
           <b>v4.10.4</b> 尺寸可调 + 把手不再占版面：<br>
           ・<b>收起把手不再吃正文宽度</b>：原先为了让开那条竖把手，整块正文都缩进 35px，从上到下留出一条白柱。现在把手半嵌在面板边缘，常态只露出十几像素、贴在边框上，正文宽度全部还给内容。<br>
           ・<b>上下比例能拖了</b>：操作区和「核对结果」之间加了一条横向拖动条（中间那道短杠），想多看结果就把上面压小、想多看摘要就把上面拉大；双击横条回到默认的 44%。<br>
@@ -4277,7 +4378,6 @@
   let batchCombinedAcceptedCount = 0;
   let batchRunning = false;
   let batchCancelRequested = false;
-  let lastBatchNotice = "";
   let hasRunCheck = false;
   let dialogObserver = null;
   let enhanceTimer = null;
@@ -4497,12 +4597,7 @@
           `
           : ""
       }
-
-      ${lastBatchNotice ? '<div class="batch-notice"></div>' : ""}
     `;
-
-    const notice = summaryBox.querySelector(".batch-notice");
-    if (notice) notice.textContent = lastBatchNotice;
 
     bindSummaryNavigation();
     bindBatchAction();
@@ -9457,8 +9552,28 @@
     skipped: 0,
     failed: 0,
     inFlight: 0,
-    pending: 0
+    pending: 0,
+    startedAt: 0,
+    timer: 0
   };
+
+  /* v4.11 运行界面的实时用时：每 200ms 刷一次（只是个文本，开销可以忽略） */
+  function stopBatchVeilTimer() {
+    if (batchHud.timer) {
+      clearInterval(batchHud.timer);
+      batchHud.timer = 0;
+    }
+  }
+
+  function startBatchVeilTimer() {
+    stopBatchVeilTimer();
+    batchHud.startedAt = Date.now();
+
+    batchHud.timer = window.setInterval(() => {
+      const seconds = (Date.now() - batchHud.startedAt) / 1000;
+      batchHudText("timer", `用时 ${seconds.toFixed(1)} 秒`);
+    }, 200);
+  }
 
   function ensureBatchHudStyle() {
     let style = document.getElementById(BATCH_HUD_ID + "-style");
@@ -9524,24 +9639,24 @@
   }
 
   /* ------------------------------------------------------------------
-   * 批量进度背景（全屏"极光玻璃"层）
+   * 批量进度背景（运行界面）
    *
    * 批量期间页面自己会铺一层白（列表重渲染 + 页面加载层），盯着一片白屏
    * 既没有信息也没有反馈。这一层把它接手过来：毛玻璃底 + 两团缓慢漂移的
    * 光晕 + 一道扫描光带 + 顶部流光进度条 + 中央进度环（百分比 / 已完成
-   * 条数 / 当前套餐 / 在途与待补试 / 成败统计 / 停止按钮）。
+   * 条数 / 当前套餐 / 在途与待补试 / 成败统计 / 实时用时 / 逐条明细）。
    *
-   * 三个必须守住的点：
-   *   1) pointer-events:none —— 只有"停止"按钮单独开启点击。界面模拟模式
-   *      要点真实元素、用户也可能想同时操作页面，绝不能被这层挡住。
-   *   2) z-index 低于工具面板与 HUD 卡片 —— 面板要一直看得见。
+   * 四个必须守住的点：
+   *   1) pointer-events:none —— 只有"停止 / 确认并关闭"按钮单独开启点击。
+   *      界面模拟模式要点真实元素、用户也可能想同时操作页面，绝不能被这层挡住。
+   *   2) 只盖页面、不盖面板 —— z-index(2147482990) 低于工具面板(2147483000)，
+   *      并且靠右停靠时右边收进一个面板宽度（v4.11 修：以前 2147483640 把面板也盖了）。
    *   3) 只在"静默直写"模式出现 —— 界面模拟模式要看得见弹窗，不能被盖住。
+   *   4) 结束不自动消失 —— 换成"确认并关闭"，等人看完再收起（v4.11）。
    * ------------------------------------------------------------------ */
   const BATCH_VEIL_ID = "dime-batch-veil";
   const BATCH_VEIL_STYLE_ID = "dime-batch-veil-style";
   const BATCH_VEIL_RING_CIRCUMFERENCE = 2 * Math.PI * 52;
-  // 跑完之后进度背景原地停留多久（看清结果再收场）。
-  const BATCH_VEIL_FINISH_HOLD_MS = 2000;
 
   function ensureBatchVeilStyle() {
     let style = document.getElementById(BATCH_VEIL_STYLE_ID);
@@ -9553,8 +9668,14 @@
     }
 
     style.textContent = [
-      `#${BATCH_VEIL_ID}{position:fixed;inset:0;z-index:2147483640;`,
+      /* v4.11 这层只盖"页面"，不盖工具面板：
+         · z-index 落到面板之下（面板 2147483000、竖条 2147483001）；
+         · 靠右停靠时右边收进一个面板宽度（--dime-hazard-reserve），靠左则左边收进。
+         于是批量跑起来时面板照常可看、可滚、可点，页面依旧被盖住。 */
+      `#${BATCH_VEIL_ID}{position:fixed;inset:0;z-index:2147482990;`,
       "overflow:hidden;pointer-events:none;",
+      `html.dime-hazard-push-right #${BATCH_VEIL_ID}{right:var(--dime-hazard-reserve,0px)}`,
+      `html.dime-hazard-push-left #${BATCH_VEIL_ID}{left:var(--dime-hazard-reserve,0px)}`,
       "background:linear-gradient(155deg,rgba(246,244,255,.94),",
       "rgba(238,244,255,.94) 42%,rgba(238,250,247,.94));",
       "backdrop-filter:blur(10px) saturate(1.2);",
@@ -9595,7 +9716,8 @@
       "box-shadow:0 0 14px rgba(99,102,241,.55);",
       "transition:transform .35s cubic-bezier(.22,1,.36,1)}",
       ".dime-veil-card{position:absolute;left:50%;top:50%;",
-      "width:min(640px,88vw);max-height:84vh;",
+      // 宽度按"这一层自己的可用宽度"算（面板已经把右边让出去了），不再用 88vw
+      "width:min(760px,calc(100% - 56px));max-height:calc(100% - 40px);",
       "display:flex;flex-direction:column;",
       "padding:20px 30px 22px;border-radius:22px;",
       "transform:translate(-50%,-50%);text-align:center;color:#303133;",
@@ -9620,6 +9742,11 @@
       "flex:none}",
       ".dime-veil-compose{font-size:12px;color:#909399;min-width:0;",
       "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      // v4.11 顶部实时计时：批量到底跑了多久，跑的时候就要能看见，不用等结束
+      ".dime-veil-timer{margin-left:auto;flex:none;",
+      "font-size:11px;font-weight:700;color:#7c5cd6;",
+      "padding:3px 9px;border-radius:9px;background:rgba(139,92,246,.1);",
+      "font-variant-numeric:tabular-nums}",
       ".dime-veil-body{flex:1;min-height:0;display:flex;",
       "flex-direction:column}",
       ".dime-veil-ring-wrap{position:relative;width:134px;height:134px;",
@@ -9657,8 +9784,10 @@
       ".dime-veil-now-v.is-idle{color:#909399;font-size:12px}",
       ".dime-veil-listhead{display:flex;justify-content:space-between;",
       "margin:14px 3px 6px;font-size:11px;color:#909399}",
-      ".dime-veil-log{text-align:left;padding:2px 0}",
-      ".dime-veil-row{display:flex;align-items:center;gap:9px;",
+      // v4.11 明细列表：从"最近 4 条"改成"一路追加 + 自己滚"，跑的过程中能看到全貌
+      ".dime-veil-log{text-align:left;padding:2px 0;",
+      "max-height:34vh;overflow-y:auto;overscroll-behavior:contain}",
+      ".dime-veil-row{display:flex;align-items:center;gap:8px;",
       "padding:6px 3px;font-size:12px;color:#606266;",
       "animation:dimeVeilRowIn .3s ease both}",
       "@keyframes dimeVeilRowIn{from{opacity:0;transform:translateY(-4px)}",
@@ -9667,17 +9796,23 @@
       "border-top:1px solid rgba(31,45,61,.05)}",
       ".dime-veil-row .mark{flex:none;width:15px;text-align:center;",
       "font-weight:700}",
-      ".dime-veil-row .code{color:#1f2d3d;font-weight:500;",
-      "font-variant-numeric:tabular-nums;white-space:nowrap;",
+      ".dime-veil-row .idx{flex:none;width:24px;text-align:right;",
+      "color:#c0c4cc;font-size:11px;font-variant-numeric:tabular-nums}",
+      ".dime-veil-row .code{flex:0 1 auto;min-width:0;color:#1f2d3d;",
+      "font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;",
       "overflow:hidden;text-overflow:ellipsis}",
-      ".dime-veil-row .info{margin-left:auto;flex:none;max-width:54%;",
+      ".dime-veil-row .kind{flex:none;padding:1px 6px;border-radius:8px;",
+      "background:rgba(31,45,61,.05);color:#8b8f96;font-size:10px;font-weight:700}",
+      ".dime-veil-row .info{flex:1 1 auto;min-width:0;margin-left:2px;",
       "color:#909399;font-size:11px;white-space:nowrap;",
-      "overflow:hidden;text-overflow:ellipsis}",
+      "overflow:hidden;text-overflow:ellipsis;text-align:right}",
+      ".dime-veil-row .ms{flex:none;width:52px;text-align:right;",
+      "color:#c0c4cc;font-size:10px;font-variant-numeric:tabular-nums}",
       ".dime-veil-row.is-saved .mark{color:#67c23a}",
       ".dime-veil-row.is-skipped .mark{color:#e6a23c}",
       ".dime-veil-row.is-failed .mark{color:#f56c6c}",
       ".dime-veil-empty{padding:10px 3px;font-size:12px;color:#c0c4cc}",
-      ".dime-veil-stop{pointer-events:auto;margin-left:auto;flex:none;",
+      ".dime-veil-stop{pointer-events:auto;margin-left:8px;flex:none;",
       "padding:8px 18px;border:none;border-radius:10px;cursor:pointer;",
       "font-size:13px;font-weight:600;color:#fff;",
       "background:linear-gradient(135deg,#8b5cf6,#3b82f6);",
@@ -9685,7 +9820,17 @@
       "transition:transform .18s ease,box-shadow .18s ease}",
       ".dime-veil-stop:hover{transform:translateY(-1px);",
       "box-shadow:0 12px 28px rgba(99,102,241,.42)}",
-      ".dime-veil-stop:active{transform:translateY(0)}"
+      ".dime-veil-stop:active{transform:translateY(0)}",
+      // v4.11 结束态不再自动消失：换成这颗按钮，等人看完点掉
+      ".dime-veil-confirm{pointer-events:auto;margin-left:8px;flex:none;",
+      "padding:8px 20px;border:none;border-radius:10px;cursor:pointer;",
+      "font-size:13px;font-weight:700;color:#fff;",
+      "background:linear-gradient(135deg,#22c55e,#0ea5e9);",
+      "box-shadow:0 8px 22px rgba(34,197,94,.32);",
+      "transition:transform .18s ease,box-shadow .18s ease}",
+      ".dime-veil-confirm:hover{transform:translateY(-1px);",
+      "box-shadow:0 12px 28px rgba(34,197,94,.42)}",
+      ".dime-veil-confirm:active{transform:translateY(0)}"
     ].join("");
   }
 
@@ -9708,6 +9853,7 @@
       '<span class="dime-veil-dot"></span>',
       '<span class="dime-veil-title" data-hud="title">正在静默核对补齐</span>',
       `<span class="dime-veil-compose" data-hud="compose">${composeText || ""}</span>`,
+      '<span class="dime-veil-timer" data-hud="timer">用时 0.0 秒</span>',
       '<button class="dime-veil-stop" type="button" data-hud="stop">',
       "停止批量处理",
       "</button>",
@@ -9764,15 +9910,23 @@
 
     document.body.appendChild(el);
     batchHud.veil = el;
+    startBatchVeilTimer();
   }
 
   /*
-   * 往"最近完成"里追加一条（只挂全屏进度背景，角落小卡片吃不下列表）。
+   * 往运行界面的明细里追加一条。
    *
-   * 只留最近 4 条：这层是"进度背景"，不是日志窗口 —— 屏幕上有少量正在
-   * 发生的事就有高级感，堆一屏反而吵。完整逐条清单仍在工具面板的报告里。
+   * v4.11 起这里就是"运行界面"的主体：不再只留最近 4 条，而是一路追加、列表自己
+   * 滚到底（滚动条在卡片内部，不会把整屏撑开）。每条带序号 / 套餐编码 / 队列类型 /
+   * 本条结论 / 本条耗时 —— 跑的时候就能看清它在干什么、慢在哪一条。
    */
-  const BATCH_VEIL_LOG_ROWS = 4;
+  const BATCH_VEIL_LOG_ROWS = 60;
+
+  /* 一条从开始到结案不到 0.1 秒的，就别显示"0.0s"了，直接留空更干净 */
+  function formatItemSeconds(ms) {
+    const value = Number(ms) || 0;
+    return value >= 100 ? (value / 1000).toFixed(1) : "";
+  }
 
   function pushBatchHudItem(candidate, result) {
     const list = batchHud.veil?.querySelector('[data-hud="log"]');
@@ -9794,6 +9948,11 @@
           ? result.note || "无需修改"
           : result.reason || "未知原因";
 
+    const elapsedMs =
+      candidate && candidate.__t0
+        ? Math.max(0, Date.now() - candidate.__t0)
+        : 0;
+
     list.querySelector(".dime-veil-empty")?.remove();
 
     const row = document.createElement("div");
@@ -9803,26 +9962,48 @@
     markEl.className = "mark";
     markEl.textContent = mark;
 
+    const idxEl = document.createElement("span");
+    idxEl.className = "idx";
+    idxEl.textContent = `#${batchHud.doneCount}`;
+
     const codeEl = document.createElement("span");
     codeEl.className = "code";
     codeEl.textContent = `${candidate.sequence || "-"} · ${candidate.code}`;
+
+    const kindEl = document.createElement("span");
+    kindEl.className = "kind";
+    kindEl.textContent = getBatchCandidateTypeLabel(candidate.batchType);
 
     const infoEl = document.createElement("span");
     infoEl.className = "info";
     infoEl.textContent = info;
     infoEl.title = info;
 
-    row.append(markEl, codeEl, infoEl);
+    const msEl = document.createElement("span");
+    msEl.className = "ms";
+    const msText = formatItemSeconds(elapsedMs);
+    msEl.textContent = msText ? `${msText}s` : "";
+
+    row.append(markEl, idxEl, codeEl, kindEl, infoEl, msEl);
     list.appendChild(row);
 
     while (list.children.length > BATCH_VEIL_LOG_ROWS) {
       list.removeChild(list.firstChild);
     }
 
-    batchHudText("logcount", `共 ${batchHud.doneCount} 条`);
+    // 跟着滚到底：看到的是最新几条，往上翻仍是完整明细
+    list.scrollTop = list.scrollHeight;
+
+    batchHudText(
+      "logcount",
+      `共 ${batchHud.doneCount} 条 · 已补齐 ${batchHud.saved}` +
+        ` · 无需动 ${batchHud.skipped} · 失败 ${batchHud.failed}`
+    );
   }
 
   function finishBatchVeil() {
+    stopBatchVeilTimer();
+
     const el = batchHud.veil;
 
     if (!el) return;
@@ -9930,6 +10111,14 @@
   }
 
   function updateBatchHudCurrent(candidate, index, phase) {
+    /* 记下这一条是什么时候开始动的、当前处在哪一步：
+       运行界面明细行里的"本条耗时"和阶段就靠这两个字段（重试不会再改第一次的时间，
+       所以看到的是这一条从头到尾花了多久）。 */
+    if (candidate) {
+      if (!candidate.__t0) candidate.__t0 = Date.now();
+      if (phase) candidate.__phase = phase;
+    }
+
     if (!batchHudRoots().length) return;
 
     // index 可能是序号，也可能是"重试"这种文字标签。
@@ -10029,10 +10218,33 @@
       const dot = veil.querySelector(".dime-veil-dot");
       const nowKey = veil.querySelector(".dime-veil-now-k");
 
+      // 用时定格在结束这一刻，之后不再往上跳
+      stopBatchVeilTimer();
+      if (batchHud.startedAt) {
+        batchHudText(
+          "timer",
+          `用时 ${((Date.now() - batchHud.startedAt) / 1000).toFixed(1)} 秒`
+        );
+      }
+
       batchHudText("title", title);
       if (summary) batchHudText("current", summary);
 
+      /* v4.11 结束态不再自己消失：把「停止」换成「确认并关闭」，
+         屏幕上的明细原样留着，等你看完手动点掉。 */
       veil.querySelector('[data-hud="stop"]')?.remove();
+
+      const head = veil.querySelector(".dime-veil-head");
+
+      if (head && !head.querySelector(".dime-veil-confirm")) {
+        const confirm = document.createElement("button");
+        confirm.type = "button";
+        confirm.className = "dime-veil-confirm";
+        confirm.textContent = "确认并关闭";
+        confirm.title = "看完结论后点这里收起运行界面";
+        confirm.addEventListener("click", () => finishBatchVeil());
+        head.appendChild(confirm);
+      }
 
       if (dot) {
         dot.classList.add(
@@ -10055,12 +10267,6 @@
           ? `本批 ${total} 个已全部过完`
           : `已处理 ${batchHud.doneCount}/${total} 个，其余未动`
       );
-
-      setTimeout(() => {
-        finishBatchVeil();
-        showBatchHudCard(title, summary);
-        scheduleBatchHudCardDismiss();
-      }, BATCH_VEIL_FINISH_HOLD_MS);
 
       return;
     }
@@ -11051,7 +11257,6 @@
     batchVerifiedCodes.clear();
     batchStrictCombinedVerification = false;
     batchCombinedAcceptedCount = 0;
-    lastBatchNotice = "";
     runButton.disabled = true;
     clearButton.disabled = true;
 
@@ -11086,29 +11291,40 @@
     let completedHazardOnly = 0;
     let completedCombined = 0;
     let failedMessage = "";
-    const batchLog = [];
+    // v4.11 逐条结论改存结构化对象（状态 / 序号 / 编码 / 队列类型 / 结论 / 本条耗时），
+    // 右侧结论卡片和纯文本复制都从这一份数据出，避免两边各写一套格式。
+    const batchLogItems = [];
 
     let doneCount = 0;
     let fastPathDeferredCount = 0;
     let fastPathSerialFallback = false;
 
     // 两条处理路径（流水线 / 界面模拟）共用的结果归账（纯同步）：
-    // 计数、HUD、按钮进度、逐条报告都在这里。
+    // 计数、HUD、按钮进度、逐条结论都在这里。
     const applyBatchResult = (candidate, result) => {
       doneCount++;
-      updateBatchProgress(
-        `停止批量处理（${doneCount}/${queue.length}）`
-      );
 
-      if (result.status === "saved") {
+      const status = result.status;
+      const itemElapsedMs =
+        candidate && candidate.__t0
+          ? Math.max(0, Date.now() - candidate.__t0)
+          : 0;
+
+      const pushItem = noteText => {
+        batchLogItems.push({
+          status,
+          sequence: candidate.sequence || "-",
+          code: candidate.code || "未识别编码",
+          typeLabel: getBatchCandidateTypeLabel(candidate.batchType),
+          note: noteText || "",
+          ms: itemElapsedMs
+        });
+      };
+
+      if (status === "saved") {
         savedCount++;
         bumpBatchHudProgress("saved");
-        batchLog.push(
-          [
-            `已补齐｜${candidate.sequence || "-"} · ${candidate.code}`,
-            result.detail ? `（${result.detail}）` : ""
-          ].filter(Boolean).join("")
-        );
+        pushItem(result.detail || "内容已更新");
 
         if (candidate.batchType === "stage-only") {
           completedStageOnly++;
@@ -11150,27 +11366,24 @@
             combinedAuditCount++;
           }
         }
-      } else if (result.status === "skipped") {
+      } else if (status === "skipped") {
         skippedCount++;
         bumpBatchHudProgress("skipped");
-        batchLog.push(
-          [
-            `无需动｜${candidate.sequence || "-"} · ${candidate.code}`,
-            result.note ? `（${result.note}）` : ""
-          ].filter(Boolean).join("")
-        );
+        pushItem(result.note || "无需改动");
       } else {
         failedCount++;
         bumpBatchHudProgress("failed");
-        batchLog.push(
-          [
-            `失败｜${candidate.sequence || "-"} · ${candidate.code}`,
-            result.reason ? `（${result.reason}）` : ""
-          ].filter(Boolean).join("")
-        );
+        pushItem(result.reason || "未知原因");
       }
 
-      // 全屏进度背景的"最近完成"跟着走；角落小卡片没有这张清单，函数里自会跳过。
+      // 左侧操作区那一行状态：跑到第几条、各类各多少，一眼能看
+      updateBatchProgress(
+        `停止批量处理（${doneCount}/${queue.length}）`,
+        `已处理 ${doneCount}/${queue.length} 个 ｜ 已补齐 ${savedCount}` +
+          ` ｜ 无需动 ${skippedCount} ｜ 失败 ${failedCount}`
+      );
+
+      // 运行界面的逐条明细跟着走；角落小卡片没有这张清单，函数里自会跳过。
       pushBatchHudItem(candidate, result);
     };
 
@@ -11224,8 +11437,6 @@
       }
     } finally {
       const batchElapsedMs = Date.now() - batchStartedAt;
-      // 整批共用的那一个弹窗，替页面省下了多少次"关窗→整棵重建"。
-      const heldDialogCount = fastPathHold.blockedCloses;
       const processedCount = savedCount + skippedCount;
       const elapsedText =
         `总耗时 ${(batchElapsedMs / 1000).toFixed(1)} 秒` +
@@ -11244,74 +11455,87 @@
       const stoppedByUser =
         batchCancelRequested && !failedMessage;
 
-      lastBatchNotice = [
-        failedMessage
-          ? "批量处理已因错误停止"
-          : stoppedByUser
-            ? "批量处理已按你的要求停止"
-            : "批量核对补齐结束",
-        `已核对补齐 ${savedCount} 个套餐`,
-        completedStageOnly
-          ? `只缺岗位：完成 ${completedStageOnly} 个`
-          : "",
-        completedHazardOnly
-          ? `只缺危害：完成 ${completedHazardOnly} 个`
-          : "",
-        completedCombined
-          ? `岗位和危害都缺：完成 ${completedCombined} 个`
-          : "",
-        networkCount
-          ? `数据层直写保存并经接口回执确认 ${networkCount} 个套餐`
-          : "",
-        networkCount && heldDialogCount
-          ? `整批共用一个编辑弹窗，省下 ${heldDialogCount} 次弹窗关闭与重建`
-          : "",
-        fastCount
-          ? `单项修改快速通过 ${fastCount} 个套餐`
-          : "",
-        combinedFastCount
-          ? `危害+岗位延时后快速通过 ${combinedFastCount} 个套餐`
-          : "",
-        reopenedCount
-          ? `重新打开复核 ${reopenedCount} 个套餐`
-          : "",
-        combinedAuditCount
-          ? `其中组合操作抽检 ${combinedAuditCount} 个套餐`
-          : "",
-        batchStrictCombinedVerification
-          ? "组合操作抽检曾发现异常，后续仅组合操作切换严格复核"
-          : "",
-        retryCount
-          ? `保存不完整时自动重试 ${retryCount} 次`
-          : "",
-        fastPathDeferredCount
-          ? `首轮有 ${fastPathDeferredCount} 条被页面弹窗的"保存中"状态挡下、` +
+      const outcomeKind = failedMessage
+        ? "failed"
+        : stoppedByUser
+          ? "stopped"
+          : "done";
+
+      const outcomeTitle =
+        outcomeKind === "failed"
+          ? "批量核对补齐已停止"
+          : outcomeKind === "stopped"
+            ? "批量核对补齐已按你的要求停止"
+            : "批量核对补齐完成";
+
+      /* ----------------------------------------------------------------
+       * 结论只写"使用者需要知道的事"：
+       *   改了几个 / 没改几个 / 失败几个 / 花了多久 / 为什么停 / 要不要复查。
+       *
+       * v4.11 重写：原来那一大段里混着"整批共用一个编辑弹窗，省下 N 次关闭重建"
+       * "单项修改快速通过 N 个""组合操作抽检 N 个""队列按……处理"这类工程内部口径，
+       * 看不懂也没用，真正的结论被淹在中间。这些一律不进结论（计数仍在代码里维护），
+       * 这里只留人能直接读懂的句子。运行界面里的逐条明细才是"全量"，这里只标结论。
+       * ---------------------------------------------------------------- */
+      const reportNotes = [];
+
+      if (outcomeKind === "stopped") {
+        reportNotes.push({
+          type: "warn",
+          text:
+            `你中途点了停止：本批 ${queue.length} 个套餐里，` +
+            `${doneCount} 个已经处理完，剩下 ${Math.max(
+              0,
+              queue.length - doneCount
+            )} 个没有动。`
+        });
+      }
+
+      if (failedMessage) {
+        reportNotes.push({
+          type: "danger",
+          text: `出错停下：${failedMessage.replace(/\n+/g, "；")}`
+        });
+      }
+
+      if (fastPathDeferredCount) {
+        reportNotes.push({
+          type: "warn",
+          text:
+            `有 ${fastPathDeferredCount} 个套餐第一次没提交上去` +
+            `（页面还停在"保存中"，请求其实没有发出去）。` +
             (fastPathSerialFallback
-              ? "脚本已自动改为逐条提交收尾"
-              : "已转入批末补试")
-          : "",
-        failedCount
-          ? `自动补试后仍失败 ${failedCount} 个套餐（见逐条结果）`
-          : "",
-        skippedCount
-          ? `本就一致、无需改动 ${skippedCount} 个套餐`
-          : "",
-        failedMessage,
-        batchLog.length
-          ? [
-              "逐条核对（按完成顺序）：",
-              ...batchLog,
-              failedMessage
-                ? "（停止后未处理项不在列表中）"
-                : ""
-            ].filter(Boolean).join("\n")
-          : "",
-        elapsedText,
-        "队列按“只缺岗位 → 只缺危害 → 两者都缺”处理。",
-        networkCount
-          ? `本次为静默直写＋流水线并发（最多 ${FAST_PATH.maxInFlight} 条请求同时在途）：编辑弹窗整批只在后台开一次（全程不可见），每条套餐一次保存请求、成败以接口回执为准；失败项批末自动补试；首轮若被页面弹窗的保存状态挡下，自动降级为逐条提交。请对照逐条结果自行抽查核对。`
-          : "组合套餐岗位选中后只留短缓冲，再补危害并在提交前双向复核。"
-      ].filter(Boolean).join("\n");
+              ? "脚本自动改成一条条重新提交，最后都处理完了。"
+              : "脚本已在批末自动补试。")
+        });
+      }
+
+      if (failedCount) {
+        reportNotes.push({
+          type: "danger",
+          text:
+            `有 ${failedCount} 个套餐没有改成功，` +
+            `原因见下面逐条结果里标「失败」的那几行。`
+        });
+      }
+
+      const batchReport = {
+        kind: outcomeKind,
+        title: outcomeTitle,
+        stats: [
+          { key: "saved", label: "已补齐", value: String(savedCount) },
+          { key: "skipped", label: "无需动", value: String(skippedCount) },
+          { key: "failed", label: "失败", value: String(failedCount) },
+          {
+            key: "cost",
+            label: "总耗时",
+            value: `${(batchElapsedMs / 1000).toFixed(1)} 秒`
+          }
+        ],
+        summaryLine: elapsedText,
+        notes: reportNotes,
+        items: batchLogItems
+      };
 
       batchCancelRequested = false;
 
@@ -11338,11 +11562,168 @@
         await waitForNoVisibleEditDialog(2500);
       } catch (_) {}
 
-      runCheck({
-        preserveBatchNotice: true,
-        preserveBatchVerified: true
-      });
+      runCheck({ preserveBatchVerified: true });
+
+      /* 重新核对会清空右侧结果区，所以结论卡片放在这之后补进去：
+         位置在结果区最上面 —— 先看结论，再看还剩下哪些差异要处理。 */
+      renderBatchReportCard(batchReport);
     }
+  }
+
+  /*
+   * v4.11 批量结论卡片（右侧「核对结果」顶部）。
+   *
+   * 取代了左侧那块 220px 高的纯文本框：宽度够、能滚、能折叠逐条清单，
+   * 而且不会像原来那样一跑完就把结论挤在角落里看不清。
+   * 「复制报告」给的是同一份结论的纯文本，方便贴到群里或填记录。
+   */
+  function buildBatchReportText(report) {
+    if (!report) return "";
+
+    const statusText = {
+      saved: "已补齐",
+      skipped: "无需动",
+      failed: "失败"
+    };
+
+    return [
+      report.title,
+      report.stats
+        .map(stat => `${stat.label} ${stat.value}`)
+        .join(" ｜ "),
+      ...report.notes.map(note => note.text),
+      report.items.length ? "逐条结果（按完成顺序）：" : "",
+      ...report.items.map(item =>
+        [
+          `${statusText[item.status] || "失败"}｜${item.sequence} · ${item.code}`,
+          item.note ? `（${item.note}）` : "",
+          formatItemSeconds(item.ms)
+            ? ` ${formatItemSeconds(item.ms)} 秒`
+            : ""
+        ].join("")
+      ),
+      report.summaryLine
+    ].filter(Boolean).join("\n");
+  }
+
+  function renderBatchReportCard(report) {
+    if (!report) return;
+    if (!resultsBox) return;
+
+    const card = document.createElement("section");
+    card.className = `batch-report is-${report.kind}`;
+    card.dataset.resultSection = "batch-report";
+
+    const head = document.createElement("div");
+    head.className = "batch-report-head";
+
+    const title = document.createElement("span");
+    title.className = "batch-report-title";
+    title.textContent = report.title;
+
+    const copyButton = document.createElement("button");
+    copyButton.type = "button";
+    copyButton.className = "batch-report-copy";
+    copyButton.textContent = "复制报告";
+    copyButton.addEventListener("click", () => {
+      copyText(buildBatchReportText(report));
+      showToast("报告已复制");
+    });
+
+    head.append(title, copyButton);
+
+    const stats = document.createElement("div");
+    stats.className = "batch-report-stats";
+
+    report.stats.forEach(stat => {
+      const box = document.createElement("div");
+      box.className = `batch-report-stat ${stat.key}`;
+
+      const label = document.createElement("span");
+      label.className = "batch-report-stat-label";
+      label.textContent = stat.label;
+
+      const value = document.createElement("strong");
+      value.className = "batch-report-stat-value";
+      value.textContent = stat.value;
+
+      box.append(label, value);
+      stats.appendChild(box);
+    });
+
+    card.append(head, stats);
+
+    if (report.notes.length) {
+      const notes = document.createElement("div");
+      notes.className = "batch-report-notes";
+
+      report.notes.forEach(note => {
+        const line = document.createElement("div");
+        line.className = `batch-report-note ${note.type || ""}`.trim();
+        line.textContent = note.text;
+        notes.appendChild(line);
+      });
+
+      card.appendChild(notes);
+    }
+
+    if (report.items.length) {
+      const list = document.createElement("details");
+      list.className = "batch-report-list";
+      list.open = true;
+
+      const listHead = document.createElement("summary");
+      listHead.innerHTML = `
+        <span>逐条结果（按完成顺序）</span>
+        <span class="result-group-count">${report.items.length} 个套餐</span>
+      `;
+      list.appendChild(listHead);
+
+      const rows = document.createElement("div");
+      rows.className = "batch-report-rows";
+
+      report.items.forEach(item => {
+        const row = document.createElement("div");
+        row.className = `batch-report-row is-${item.status}`;
+
+        const tag = document.createElement("span");
+        tag.className = "tag";
+        tag.textContent =
+          item.status === "saved"
+            ? "已补齐"
+            : item.status === "skipped"
+              ? "无需动"
+              : "失败";
+
+        const who = document.createElement("span");
+        who.className = "who";
+        who.textContent = `${item.sequence} · ${item.code}`;
+        who.title = `${item.typeLabel}｜${item.sequence} · ${item.code}`;
+
+        const why = document.createElement("span");
+        why.className = "why";
+        why.textContent = item.note;
+
+        const ms = document.createElement("span");
+        ms.className = "ms";
+        const msText = formatItemSeconds(item.ms);
+        ms.textContent = msText ? `${msText}s` : "";
+
+        row.append(tag, who, why, ms);
+        rows.appendChild(row);
+      });
+
+      list.appendChild(rows);
+      card.appendChild(list);
+    }
+
+    const foot = document.createElement("div");
+    foot.className = "summary-quiet-note";
+    foot.style.margin = "0 10px 10px";
+    foot.textContent = report.summaryLine;
+    card.appendChild(foot);
+
+    resultsBox.insertBefore(card, resultsBox.firstChild);
   }
 
   function renderResults(
@@ -11536,14 +11917,8 @@
   }
 
   function runCheck(options = {}) {
-    const preserveBatchNotice =
-      options?.preserveBatchNotice === true;
     const preserveBatchVerified =
       options?.preserveBatchVerified === true;
-
-    if (!preserveBatchNotice) {
-      lastBatchNotice = "";
-    }
 
     if (!preserveBatchVerified) {
       batchVerifiedCodes.clear();
@@ -12172,7 +12547,6 @@
     batchVerifiedCodes.clear();
     batchStrictCombinedVerification = false;
     batchCombinedAcceptedCount = 0;
-    lastBatchNotice = "";
     hasRunCheck = false;
     copyAllButton.style.display = "none";
     setSummary("高亮已清除，等待核对", "normal");
@@ -12276,5 +12650,5 @@
   hideToolPanel();
   renderRuleManager();
   requestAnimationFrame(() => enhanceVisibleEditDialogs());
-  console.log("套餐危害因素核对工具 v4.10.4 已加载。");
+  console.log("套餐危害因素核对工具 v4.11 运行界面让位版 已加载。");
 })();
