@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝶美-1.2套餐危害核对
 // @namespace    https://dime.health-100.cn/
-// @version      4.11.0
+// @version      4.17.0
 // @description  蝶美套餐危害核对：核对套餐名称里的危害因素、在岗状态同系统实际值是否一致，差异批量补齐，结束给出逐条报告。详细用法与更新记录见工具面板里的"使用说明"。
 
 // @match        https://dime.health-100.cn/*
@@ -160,11 +160,14 @@
    *
    * 做法：把目标值直接写进页面自己的 packageForm，同步刷新只读显示字段，
    *       再调用页面自己的 submitPackageForm()。表单校验、mnsign 鉴权头、
-   *       PUT 请求、列表就地回写、关闭弹窗全部由页面原有逻辑完成，
+   *       列表就地回写、关闭弹窗全部由页面原有逻辑完成，
    *       脚本不自己拼请求（这条路实测会被 "mnclientId或mnappid不能为空" 挡住）。
    *
-   * 是否真的写进后台：直接读页面那一次 PUT 的响应判定，
-   * 因此不再需要"保存后重新打开弹窗复核"这种高成本兜底。
+   * ⚠ v4.15 重要订正：在「导入体检单位」弹窗里改套餐时，submitPackageForm()
+   *       只把改动合并进弹窗内的表格（前端 basepackageList），**不发请求**；
+   *       真正落库要人点弹窗底部的「确定」。所以"改好了"与"提交了"必须分开：
+   *       脚本只负责前者（记 staged），后者交给人点那一下。
+   *       以前"读列表数据对账"判成功是自证循环，v4.15 已按此订正。
    */
   const FAST_PATH = {
     // 批量与单个"一键补齐"是否走数据层直写。可在工具面板上即时切换并记忆。
@@ -193,7 +196,10 @@
     // 回执落地后，页面收加载态还需要一点时间，动同一个弹窗前留的缓冲。
     serializeSettleMs: 100,
     // 重试前的间隔。
-    retryDelayMs: 600
+    retryDelayMs: 600,
+    /* v4.14：首轮没抓到保存请求时，等这么久再读一次列表数据对账。
+       回执落地后列表要重新渲染，读太早会读到旧行。 */
+    landingSettleMs: 280
   };
 
   const FAST_PATH_ENABLED_STORAGE_KEY =
@@ -3551,6 +3557,10 @@
     #${TOOL_ID} .batch-report-stat-label{
       display:block;color:#909399;font-size:10px;font-weight:800;white-space:nowrap
     }
+    /* v4.15 「已改好·待提交」比原来的两字标签长，四格里容易顶出去 */
+    #${TOOL_ID} .batch-report-stat.saved .batch-report-stat-label{
+      font-size:9px;letter-spacing:-.2px
+    }
     #${TOOL_ID} .batch-report-stat-value{
       display:block;margin-top:1px;color:#303133;font-size:17px;
       font-weight:900;line-height:1.15;font-variant-numeric:tabular-nums
@@ -4033,6 +4043,13 @@
       flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;
       padding:10px 12px 18px
     }
+    /* v4.12 真正的原因：3677 行把 .tool-results 设成了 flex column 容器，
+       它的子项（结果卡片）默认 flex-shrink:1 —— 内容一多，卡片不是把容器撑高，
+       而是自己被压回容器高度里，于是 scrollHeight == clientHeight，
+       滚动条永远不出现，卡片内部文字却挤在一起/溢到框外。
+       跟 v4.10.3 左栏踩的是同一个坑（.tool-side > *{flex:0 0 auto}），
+       这里必须一起补上，否则 minmax(0,1fr) 只是让容器有高度，内容仍被压平。 */
+    #${TOOL_ID} .tool-results > *{flex:0 0 auto}
     #${TOOL_ID} .tool-sticky-zone{
       position:static;margin:0;padding:0;border:0;background:transparent;box-shadow:none
     }
@@ -4143,7 +4160,7 @@
   tool.innerHTML = `
     <div class="tool-header">
       <div class="tool-header-left">
-        <strong>套餐危害因素核对工具 v4.11</strong>
+        <strong>套餐危害因素核对工具 v4.17</strong>
         <span class="tool-mini-status">等待核对</span>
       </div>
       <button class="tool-mini-run" type="button" title="直接开始核对">开始核对</button>
@@ -4174,12 +4191,13 @@
         <div class="tool-tip">
           <b>它做什么：</b>把"套餐名称里写的危害因素与在岗状态"跟系统里实际存的值对一遍，不一致的批量补齐。<br>
           <b>怎么用：</b>打开体检套餐列表页 → 点「开始核对」→ 等进度走完 → 看结果。核对完成后按钮会变成「批量核对补齐本页（N）」，点它才会真正改数据；只想看不想改，停在核对这步就行。<br>
-          <b>三种结论：</b>已补齐 = 脚本改过来了；无需动 = 本来就一致；失败 = 没改成，报告里写原因（多是名称在危害库里定位不到，或保存接口回执不通过）。<br>
+          <b>三种结论：</b><b>已改好</b> = 脚本把值改过来了；无需动 = 本来就一致；失败 = 没改成，报告里写原因（多是名称在危害库里定位不到）。<br>
+          <b>⚠ 这个页面要人点「确定」才真正提交：</b>在「导入体检单位」弹窗里改套餐时，页面自己只把改动合并进弹窗内那张表，<b>不往后端发请求</b>；必须点弹窗底部的<b>「确定」</b>才算保存，点「取消」会把这一批全部作废。所以脚本跑完给的是「已改好·待提交」，它<b>不会替你点「确定」</b>：你点完确定，这一批才算真落库。上一批没提交就再跑下一批，脚本会先问你一句要不要覆盖。<br>
           <b>套餐名称格式：</b>「XX-危害1+危害2+危害3+岗中+性别」；岗位简称会自动识别。分隔符默认只认「+」，可在「⚙ 配置 → 分隔符」里改（也能加 、 ，等）。<b>只有配置的分隔符才拆危害</b>，没配的符号一律当名称的一部分；拆出来又对不上标准名的整段，按「名称异常」提示，可用「配置 → 匹配规则」人工指定。<br>
-          <b>处理方式：</b>默认「静默直写」——编辑弹窗整批只在后台打开一次并全程隐身，屏幕上看不到弹窗、遮罩和逐条换内容的闪烁，也没有开窗动画；脚本把目标值直接写进页面表单模型、调页面自带的保存逻辑，成败以保存接口的回执为准，最快。若首轮提交被页面的"保存中"状态挡下（请求根本没发出），会自动降级成逐条提交，并在报告里说明。想改用「界面模拟」（逐项点选，慢但完全走人手路径，可肉眼对照）时，按住 <code>Alt</code> 点「批量核对补齐本页」即可来回切换，状态会记住。<br>
-          <b>进度背景怎么读：</b>百分比按"已结案 + 在途/待补试各计半格"算，所以提交中也在往前走。「在途 N」= 已发出请求、等回执；「待补试 M」= 首轮没成、排队等批末重试；「正在处理」是当前这一条和它此刻在做什么；顶部还有一颗实时用时。<b>下面那张明细表是全量的</b>：每完成一条就追加一行（✓ 已补齐 / – 无需动 / ✗ 失败），带序号、套餐编码、队列类型（只缺岗位 / 只缺危害 / 两者都缺）、本条结论和本条耗时，列表自己往下滚，往上翻能看到前面每一条。<br>
-          <b>v4.11 起这层只盖页面、不盖工具面板</b>：跑的时候面板照常可见、可滚、可点，页面被盖住即可。整批跑完不会自己消失——标题换成结果、进度环停住、明细原样留着，看完点右上角「确认并关闭」才收起。中途想停点「停止」，已发出的那几条仍会落地。<br>
-          <b>报告怎么读：</b>跑完后右侧「核对结果」最上面出结论卡片：<b>已补齐 / 无需动 / 失败 / 总耗时</b> 四个数 + 需要你知道的几句话（为什么停、有多少条第一次没提交上去被自动重提、失败几个），下面可展开「逐条结果」。卡片上的「复制报告」会把同一份结论复制成纯文本。只写结论，工程内部计数不再混在报告里。<br>
+          <b>处理方式：</b>默认「静默直写」——编辑弹窗整批只在后台打开一次并全程隐身，屏幕上看不到弹窗、遮罩和逐条换内容的闪烁，也没有开窗动画；脚本把目标值直接写进页面表单模型，再调页面自带的保存逻辑把它同步进弹窗里的那张表格。<b>这一步在单位的编辑弹窗里不会发出网络请求</b>，所以脚本改完会当场读一遍页面数据确认"值确实进去了"，然后记成「已改好·待提交」——剩下的一步就是你去点弹窗底部的「确定」。想改用「界面模拟」（逐项点选，慢但完全走人手路径，可肉眼对照）时，按住 <code>Alt</code> 点「批量核对补齐本页」即可来回切换，状态会记住。<br>
+          <b>进度背景怎么读：</b>环和百分比按"已结案算满格、已提交等回执的算大半格、排队等重试的只占一点点"来算，并且显示值只往前爬、不会往回退，每变一次都平滑过渡，不会突然跳满。<b>「正在处理」这一块</b>分五行：第一行是「第几条 / 总共几条 + 这条属于哪一类（只缺岗位 / 只缺危害 / 两者都缺）+ 这条已经处理了多久」，第二行是套餐编码，第三行是完整套餐名，<b>第四行是"这一条正在补什么"——把要补的危害名做成小标签列出来，需要改在岗状态的再挂一个岗位标签</b>，最后一行是它此刻在做的事（读行 → 打开编辑 → 写岗位 → 写危害 → 提交 → 等回执）。<b>下面「最近完成」是全量的</b>：每一完成一条追加一块，第一行是 ✓ / – / ✗ + 序号 + 套餐编码 + <b>这条做了什么</b>（补岗位 / 补危害 / 补岗位·补危害）+ 本条耗时，第二行写具体结果（"在岗：未选 → 是"、"补危害 3 项：锰及其无机化合物、噪声、紫外辐射"），统一的那句"改动还在弹窗里、记得点确定"只写在上面橙条里，不在每条后面重复，<b>卡片高度是固定的，日志再多也不会把整块顶高、位置也不会移动</b>，多出来的在列表内部往下滚（<b>列表可直接滚轮 / 拖滚动条，卡片本身能收鼠标事件</b>），往上翻能看到前面每一条。<br>
+          <b>v4.11 起这层只盖页面、不盖工具面板</b>：跑的时候面板照常可见、可滚、可点，页面被盖住即可。整批跑完不会自己消失——标题换成结果、进度环停住、明细原样留着，看完手动收起（待提交时那个按钮是「知道了」，只收运行界面，不碰页面上的数据）。中途想停点「停止」，已改好的那几条仍留在弹窗表格里。<br>
+          <b>报告怎么读：</b>跑完后右侧「核对结果」最上面出结论卡片：<b>已改好·待提交 / 无需动 / 失败 / 总耗时</b> 四个数 + 需要你知道的几句话（有多少条改好了还没提交、为什么停、失败几个），下面可展开「逐条结果」。卡片上的「复制报告」会把同一份结论复制成纯文本。只写结论，工程内部计数不再混在报告里。<br>
           <b>人工兜底：</b>匹配不上的名称用「匹配规则」建立标准危害映射；确认与危害无关的用「排除项 / 无关内容 / 无关关键词」，保存后长期复用。系统岗位为空且套餐状态明确时可辅助补齐；已有岗位与套餐不一致时只提示、不自动覆盖。<br>
           <b>边界：</b>只处理可明确判断的项，判断不了的一律留给人；批量改动前建议先小范围试一批。
       </details>
@@ -4187,6 +4205,44 @@
       <details class="tool-help">
         <summary>更新记录（点击展开）</summary>
         <div class="tool-tip">
+          <b>v4.17</b> 明细区这回真能滚了（前两版改错了地方）+ 日志改说"做了什么"：<br>
+          ・<b>他看到的</b>：红框那块还是滚不动，滚动条在那儿、滚轮没反应。<br>
+          ・<b>真相</b>：这层遮罩是 <code>pointer-events:none</code>（v4.6 定的"只做展示、不挡你操作页面"，只给「停止 / 知道了」两个按钮单独开 <code>auto</code>）。于是滚轮直接穿透到下面的页面上去了 —— 列表画得出滚动条、却收不到 wheel 事件。<b>v4.16 改的 flex 只解决了"内容被裁"，没人解决"事件收不到"</b>，连报两次是我一直盯着 CSS 布局找原因。<br>
+          ・<b>改法</b>：<code>.dime-veil-card{pointer-events:auto}</code> —— 卡片自己接管指针事件，卡片之外照旧穿透（面板照常可点、页面照常被盖住）。<br>
+          ・<b>日志改说"做了什么"</b>：明细行原来那个「只缺岗位」标签说的是<b>它原本缺什么</b>，不是脚本干了什么。现在标签改成动作（补岗位 / 补危害 / 补岗位·补危害），第二行写具体结果，例如「在岗：未选 → 是」「补危害 2 项：锰及其无机化合物、噪声」。「正在处理」那一块仍写「只缺…」，因为那里说的是接下来要做什么。<br>
+          <b>v4.16</b> 明细区能滚 + 去掉每条下面重复的备注：<br>
+          ・<b>他看到的</b>：「最近完成」明明还有条目没露出来，滚轮却滚不动，最下面几条被卡片底边切掉；而且每一条下面都跟着同一句"已改入弹窗表格（待点「确定」提交）"。<br>
+          ・<b>真相</b>：v4.15 为了不让上面几块（环 / 计数 / 正在处理）被挤扁，写了 <code>.dime-veil-body&gt;*{flex:0 0 auto}</code>。这条选择器比 <code>.dime-veil-log</code> 更"具体"，顺手把明细列表自己的 <code>flex:1 1 0</code> 也覆盖成"按内容高度" ⇒ 列表高度永远等于内容高度，<code>scrollHeight == clientHeight</code>，滚动条一辈子不出现，超出的部分直接被卡片裁掉。又一个"特异性压过意图"的坑。<br>
+          ・<b>改法</b>：选择器加 <code>:not(.dime-veil-log)</code>，列表恢复弹性高度，明细在内部滚并自动跟到最新一条。实测 6 条时可视高 172 / 内容高 312，可滚；40 条时内容高 2063，同样只滚列表。<br>
+          ・<b>备注不再刷屏</b>：那句统一说明只留在卡片顶部橙条和结论卡上；明细第二行只写这一条具体改了什么，右侧「逐条结果」和复制报告同口径。<br>
+          <b>v4.15</b> 订正「报告全绿、实际一条都没提交」：<br>
+          ・<b>他看到的</b>：脚本报 6 条全部改好，可页面上的「导入体检单位」弹窗还开着，不点底部的「确定」就什么都没推过去；点「取消」这一批全没了。<br>
+          ・<b>真相</b>：<code>submitPackageForm()</code> 在这个单位弹窗里只把改动合并进<b>弹窗内的表格</b>（前端数据），不向后端发请求；脚本随后"读列表对账"，读到的正是刚被合并进去的那份前端数据 ⇒ 自己证明自己，6/6 全判成功。<b>v4.13 那句"首轮其实已经存进去了"是错的</b>，向你说声抱歉。<br>
+          ・<b>改法</b>：对账通过只记「已改好·待提交」（新状态 <code>staged</code>），不再冒充"已保存"；结论卡、运行界面、复制报告统一这么写，并在最显眼的位置提示"请在页面底部点一次「确定」，点「取消」会全部作废"。<br>
+          ・<b>收尾更安全</b>：以前整批结束会走页面的"取消"关窗，等于替你把当前这条丢掉；待提交时改成直接置 <code>openPackage=false</code> 收窗，表格数据原样留着，等你点「确定」。<br>
+          ・<b>防覆盖</b>：上一批没提交就开始跑下一批时，先弹一句确认——继续会把上一批盖掉。<br>
+          ・<b>不替你提交</b>：按你的要求，脚本只改不点「确定」，保持"最后一步由人确认"。<br>
+          ・<b>运行界面不再往上飘</b>：那张卡片原来是 <code>top:50% + translateY(-50%)</code> 垂直居中、高度又跟着日志长 ⇒ 每多一条明细，整块就往上挪一点。现在高度写死（<code>min(620px, 100vh-48px)</code>），环、计数、正在处理、统计都不许被挤，明细只在自己的列表里滚。<br>
+          <b>v4.14</b> 进度不再"卡着不动然后突然跑满" + 写着在补什么 + 结论瘦身：<br>
+          ・<b>他看到的</b>：环走得很慢、一直停在 42%，最后一秒直接跳到 100%，"已完成"从 0/6 直接变 6/6，中间没有过渡。<br>
+          ・<b>真相</b>：抓保存请求那段只认「XHR + PUT + 地址正好以 /basepackage 结尾」。你这台机器上那几次保存根本没被认出来 ⇒ 每条都白等满 3 秒超时、判成"没提交上去"，六条串行白等 18 秒，这期间一条都没结案；进度只是被"待补试算半格"虚撑着，所以既慢又假。等到批末重跑，六条又都秒过 ⇒ 一帧之内从 0 跳到 6。<br>
+          ・<b>改法一（根治）</b>：请求识别放宽到"PUT + 地址里含 basepackage"（含 <code>/basepackage/123</code> 这种带 id 的形式），并且给 <code>fetch</code> 也挂上钩子。请求能认出来，第一条几秒内就有回执，进度自然一格一格走。<br>
+          ・<b>改法一之二（兜底）</b>：万一还是没认出来，不再直接判失败进重试队列，而是当场读一次列表数据对账 —— 目标危害都在、在岗状态也对，就直接记「已补齐」。六条一起卡 18 秒空转的情况不会再出现。<br>
+          ・<b>改法二（显示）</b>：权重改成"已结案 1 格、在途 0.6 格、待补试 0.1 格"，并且显示值只进不退、每帧补间约 0.6 秒；百分比和"已完成 n/6"一起滚，即使某一段集中结案，看到的也是小跑冲上去而不是跳字。<br>
+          ・<b>「正在处理」多一行标签</b>：把这一条要补的危害名直接列出来（最多 5 个，多的收成"+N 项"），需要改在岗状态的再挂一个绿色岗位标签。<br>
+          ・<b>结论写具体</b>：明细从"新增危害 2 项"改成"补危害 2 项：锰及其无机化合物、噪声"，一眼知道补了什么。<br>
+          ・<b>说明瘦身</b>：那条"第一次没拿到保存结果…"的三句话压成一句（全部已确认存上时直接说"其实第一次就存上了"）；明细里那句"首次提交已生效（没收到回执，按页面数据核对确认）；首轮未果原因：…"缩成"首轮保存已生效（未收到回执）"，原因挪到鼠标悬停里。<br>
+          <b>v4.13</b> 修「数据改好了却报成无需改动」：<br>
+          ・<b>他看到的</b>：6 个套餐全判「无需动」，报告说「第一次没提交上去、请求其实没有发出」，但实际数据已经改好了，脚本等于白跑两遍。<br>
+          ・<b>真相</b>：首轮那几次保存其实都成功了，只是脚本在 3 秒内没等到那一次 PUT（页面当时还停在"保存中"，请求发得慢），于是判"没成功"并降级重跑；重跑时读到页面已经是目标值 ⇒ 按"无需修改"记成 <code>skipped</code>。<br>
+          ・<b>改法</b>：重试路径里出现"无需修改"时不再直接记「无需动」，而是认定**首轮提交已生效**（弹窗数据来自列表行，行里已经是目标值 + 弹窗表单也已同步，只能是那次保存落地了）⇒ 记「已补齐」，并计入报告统计。<br>
+          ・<b>文案不再说谎</b>：不再写"请求其实没有发出"（脚本当时并不知道），改成"没及时拿到保存结果，不等于没存上"，并注明其中几个经核对确认是已存进去的。<br>
+          <b>v4.12</b> 修「核对结果」真滚不动 + 运行界面写详细：<br>
+          ・<b>结果区终于能滚了</b>：v4.11 只给外层网格补了行高，没发现 <code>.tool-results</code> 自己是个 flex 纵向容器 —— 里面的结果卡片默认可收缩，内容一多不是把容器撑高，而是被压回容器高度里，于是 <code>scrollHeight</code> 永远等于 <code>clientHeight</code>，滚动条一辈子不出现，卡片里的字却被挤成一团。给子项加 <code>flex:0 0 auto</code> 后内容才真正累计高度。跟 v4.10.3 左栏踩的是同一个坑。<br>
+          ・<b>「正在处理」从一行挤成四行</b>：原来整条挤成一行（序号 · 编码 · 名称 ｜阶段），名称必被省略号吃掉。现在拆成「第几条/共几条 + 类型徽章 + 本条第 N 秒」→「套餐编码」→「完整套餐名（最多两行）」→「当前阶段（紫色呼吸点）」，并且"本条第 N 秒"每 200ms 跟着走，哪条慢一眼看得出。<br>
+          ・<b>「最近完成」每条两行</b>：第一行 结论标记 + 序号 + 编码 + 类型 + 耗时，第二行写具体改了什么（新增哪几项危害、在岗状态改成什么）。原来结论挤在单行末尾，一律被省略号截掉，等于白显示。<br>
+          ・<b>明细列表改吃剩余高度</b>：原先死限 <code>34vh</code>，笔记本屏幕上会把上面几行挤出去；现在 <code>flex:1</code> 撑满卡片剩余空间，矮屏（≤800px 高）把进度环自动缩到 104px 让位。<br>
+          ・收尾后「正在处理」换成「处理结果 + 一句定论」，编码/套餐名那两行收起，不会再被误读成"还有一条在跑"。<br>
           <b>v4.11</b> 运行界面让位 + 结论说人话 + 修结果区不能滚：<br>
           ・<b>修「核对结果」滚不动</b>：两栏布局的网格只有一条 <code>auto</code> 行，结果一多这一行就被内容撑到超出面板、被 <code>overflow:hidden</code> 剪掉，右边那块拿到的永远是"跟内容一样高"，所以出不了滚动条。行高改成 <code>minmax(0,1fr)</code> 后结果区恢复独立滚动。<br>
           ・<b>运行界面只盖页面、不再盖面板</b>：那层毛玻璃以前 z-index 2147483640，把工具面板一起压在下面（跑批量时面板被糊掉、也点不了）。现在降到面板之下，并且靠右停靠时右边收进一个面板宽度 —— 页面照旧被盖住，面板照常可见可滚可点。<br>
@@ -4378,6 +4434,9 @@
   let batchCombinedAcceptedCount = 0;
   let batchRunning = false;
   let batchCancelRequested = false;
+  /* v4.15 上一批"改好了但没提交"的条数：这个页面不点弹窗底部的「确定」
+     就不会推给后端，再跑一批会把它们覆盖掉，所以开始前要提醒一次。 */
+  let unsubmittedChangeCount = 0;
   let hasRunCheck = false;
   let dialogObserver = null;
   let enhanceTimer = null;
@@ -9250,55 +9309,121 @@
       return originalOpen.apply(this, arguments);
     };
 
+    /*
+     * v4.14 放宽匹配（他 2026-10-29 报「进度一开始特别慢、最后一秒跑满」的根因之一）：
+     * 老规则只认「XHR + PUT + URL 正好以 /basepackage 结尾」。一旦页面的保存地址变成
+     * /basepackage/123 这种带 id 的形式，或者改用 fetch，第 1 步 waitFastPathCondition
+     * 就永远等不到 ⇒ 每条都白等 3 秒超时、判 blocked，六条串行就是 18 秒空转，
+     * 而这段时间一条都没结案，进度只能靠"待补试半格"虚撑。
+     * 现在：PUT + 路径里出现 /basepackage 段就算，XHR 与 fetch 都挂上。
+     */
+    const isBasePackageSave = (method, url) => {
+      if (String(method || "").toUpperCase() !== "PUT") return false;
+
+      const cleanUrl = String(url || "").split("#")[0].split("?")[0];
+
+      // 只要求"含 basepackage"：/basepackage、/basepackage/123、
+      // /xxx/basepackageUpdate 都算。是否真是这一条的保存，由后面的
+      // 回执 code 校验兜底，宁松勿漏。
+      return /basepackage/i.test(cleanUrl);
+    };
+
+    /* 请求发出的那一刻就分配 id 并叫醒等待方，不等响应。 */
+    const markSent = () => {
+      const id = ++fastPathTap.seq;
+
+      fastPathTap.lastSentId = id;
+      notifyFastPathTap();
+
+      return id;
+    };
+
+    const recordResult = (id, startedAt, status, text) => {
+      let payload = null;
+
+      try {
+        payload = JSON.parse(text || "null");
+      } catch (_) {
+        payload = text || "";
+      }
+
+      const result = {
+        id,
+        status,
+        payload,
+        elapsedMs: Date.now() - startedAt
+      };
+
+      fastPathTap.lastResult = result;
+      fastPathTap.results.set(id, result);
+
+      // 只留最近若干条，避免长时间挂着页面时无限增长。
+      if (fastPathTap.results.size > 20) {
+        const oldest = [...fastPathTap.results.keys()].sort(
+          (a, b) => a - b
+        )[0];
+        fastPathTap.results.delete(oldest);
+      }
+
+      notifyFastPathTap();
+    };
+
     proto.send = function (body) {
       const info = this.__dimeFastPathRequest;
 
-      if (info && info.method === "PUT") {
-        const cleanUrl = info.url.split("#")[0].split("?")[0];
+      if (info && isBasePackageSave(info.method, info.url)) {
+        const xhr = this;
+        const startedAt = Date.now();
+        const id = markSent();
 
-        if (cleanUrl.endsWith("/basepackage")) {
-          const xhr = this;
-          const startedAt = Date.now();
-          const id = ++fastPathTap.seq;
-
-          fastPathTap.lastSentId = id;
-
-          xhr.addEventListener("loadend", () => {
-            let payload = null;
-
-            try {
-              payload = JSON.parse(xhr.responseText || "null");
-            } catch (_) {
-              payload = xhr.responseText || "";
-            }
-
-            const result = {
-              id,
-              status: xhr.status,
-              payload,
-              elapsedMs: Date.now() - startedAt
-            };
-
-            fastPathTap.lastResult = result;
-            fastPathTap.results.set(id, result);
-
-            // 只留最近若干条，避免长时间挂着页面时无限增长。
-            if (fastPathTap.results.size > 20) {
-              const oldest = [...fastPathTap.results.keys()].sort(
-                (a, b) => a - b
-              )[0];
-              fastPathTap.results.delete(oldest);
-            }
-
-            notifyFastPathTap();
-          });
-
-          notifyFastPathTap();
-        }
+        xhr.addEventListener("loadend", () => {
+          recordResult(id, startedAt, xhr.status, xhr.responseText);
+        });
       }
 
       return originalSend.apply(this, arguments);
     };
+
+    /* fetch 兜底：页面若用 fetch 提交，XHR 钩子一个都抓不到（同上，全程白等）。 */
+    const originalFetch = window.fetch;
+
+    if (typeof originalFetch === "function") {
+      window.fetch = function (input, init) {
+        const url =
+          typeof input === "string" ? input : input?.url || "";
+        const method = String(init?.method || input?.method || "GET");
+
+        if (!isBasePackageSave(method, url)) {
+          return originalFetch.apply(this, arguments);
+        }
+
+        const startedAt = Date.now();
+        const id = markSent();
+        const promise = originalFetch.apply(this, arguments);
+
+        promise
+          .then(
+            response => {
+              response
+                .clone()
+                .text()
+                .then(text => recordResult(id, startedAt, response.status, text))
+                .catch(() =>
+                  recordResult(id, startedAt, response.status, "")
+                );
+
+              return response;
+            },
+            error => {
+              recordResult(id, startedAt, 0, String(error?.message || error));
+              throw error;
+            }
+          )
+          .catch(() => {});
+
+        return promise;
+      };
+    }
   }
 
   function getFastPathPageMessage() {
@@ -9413,6 +9538,10 @@
 
     return {
       additions: additions.length,
+      /* v4.14 实际新增的那几项叫什么（用于结论里写明细） */
+      addedNames: additions
+        .map(id => plan.harmNameById?.get(String(id)))
+        .filter(Boolean),
       totalHazards: Array.isArray(form.dimeBaseharmList)
         ? form.dimeBaseharmList.length
         : 0,
@@ -9538,7 +9667,7 @@
    *
    * 弹窗隐身后，屏幕上没有任何动静，"看着空白屏幕等"体验很差。
    * 这张毛玻璃小卡片就是批量期间唯一的动态元素：
-   *   渐变进度条 + 已处理计数 + 当前套餐 + 已补齐/无需动/失败 实时计数，
+   *   渐变进度条 + 已处理计数 + 当前套餐 + 已改好/无需动/失败 实时计数，
    *   卡片上的"停止"按钮与批量按钮等效（置 batchCancelRequested）。
    * 批量结束（完成/停止/报错都算）后变正负零状态展示几秒，自动淡出。
    * ------------------------------------------------------------------ */
@@ -9554,7 +9683,16 @@
     inFlight: 0,
     pending: 0,
     startedAt: 0,
-    timer: 0
+    timer: 0,
+    /* v4.12 当前正在处理的那一条：给「正在处理」卡片里的"本条第 N 秒"用 */
+    current: null,
+    /* v4.14 显示值（补间在途）与目标值：两者分开，进度才不会"啪"一下跳满 */
+    shownRatio: 0,
+    ratioTarget: 0,
+    shownDone: 0,
+    ratioRaf: 0,
+    /* 当前标签行画的是哪一条，避免同一条多次刷新时重复重建 */
+    detailOwner: null
   };
 
   /* v4.11 运行界面的实时用时：每 200ms 刷一次（只是个文本，开销可以忽略） */
@@ -9572,6 +9710,8 @@
     batchHud.timer = window.setInterval(() => {
       const seconds = (Date.now() - batchHud.startedAt) / 1000;
       batchHudText("timer", `用时 ${seconds.toFixed(1)} 秒`);
+      // 当前那条已经磨了多久，跟总用时一起跳 —— 一眼能看出是哪条慢
+      refreshBatchNowElapsed();
     }, 200);
   }
 
@@ -9718,6 +9858,20 @@
       ".dime-veil-card{position:absolute;left:50%;top:50%;",
       // 宽度按"这一层自己的可用宽度"算（面板已经把右边让出去了），不再用 88vw
       "width:min(760px,calc(100% - 56px));max-height:calc(100% - 40px);",
+      /* v4.15 卡片高度写死：原来只给 max-height，明细一多卡片就长高，
+         而它是 top:50% + translateY(-50%) 垂直居中的 ⇒ 每多一条日志，
+         整块就往上挪一点，看着像"页面在往上飘"。高度固定后位置钉住，
+         多出来的明细只在内部列表里滚。 */
+      "height:min(620px,calc(100% - 48px));",
+      "overflow:hidden;",
+      /* v4.17 卡片自己接管指针事件。
+         整层 `.dime-veil` 是 pointer-events:none（只给"停止 / 知道了"两个按钮
+         单独开 auto）—— 本意是"这层只做展示、不挡你操作页面"，但副作用是
+         明细列表根本收不到 wheel：滚轮直接穿透到下面的页面去了，所以列表
+         有滚动条也滚不动（他 2026-10-29 连报两次"滚不动"，前两版一直在改
+         flex，方向错了；flex 那条只是"内容被裁"，这个是"事件收不到"）。
+         卡片区域接管即可：卡片之外照旧穿透，面板照常可点。 */
+      "pointer-events:auto;",
       "display:flex;flex-direction:column;",
       "padding:20px 30px 22px;border-radius:22px;",
       "transform:translate(-50%,-50%);text-align:center;color:#303133;",
@@ -9748,7 +9902,13 @@
       "padding:3px 9px;border-radius:9px;background:rgba(139,92,246,.1);",
       "font-variant-numeric:tabular-nums}",
       ".dime-veil-body{flex:1;min-height:0;display:flex;",
-      "flex-direction:column}",
+      "flex-direction:column;overflow:hidden}",
+      /* v4.15 卡片高度固定后，上面几块（环 / 计数 / 统计 / 正在处理）不许被
+         明细列表挤扁：默认 flex-shrink:1 会把它们压到 0，只剩列表还在。
+         v4.16：这里必须排除明细列表本身 —— `>*` 的特异性高于 `.dime-veil-log`，
+         会把它的 flex:1 1 0 一并覆盖成"按内容高度"，列表于是既不弹性也不溢出，
+         滚动条永远不出现、底部几条还被卡片裁掉（他 2026-10-29 报"这部分无法滚动"）。 */
+      ".dime-veil-body>*:not(.dime-veil-log){flex:0 0 auto}",
       ".dime-veil-ring-wrap{position:relative;width:134px;height:134px;",
       "margin:0 auto}",
       ".dime-veil-ring{width:134px;height:134px;transform:rotate(-90deg)}",
@@ -9767,47 +9927,105 @@
       ".dime-veil-count small{font-size:12px;color:#909399;font-weight:500}",
       ".dime-veil-pipeline{margin-top:4px;font-size:11px;color:#909399;",
       "font-variant-numeric:tabular-nums}",
+      // v4.15 收尾时如果改动还没提交，这一行要点名说清楚，不能混在灰字里
+      ".dime-veil-pipeline.is-warn{margin-top:8px;padding:6px 10px;",
+      "border-radius:8px;background:rgba(230,162,60,.14);",
+      "color:#b06d00;font-size:12px;font-weight:600;line-height:1.5}",
       ".dime-veil-stats{display:flex;gap:16px;justify-content:center;",
       "margin-top:9px;font-size:12px;color:#909399}",
       ".dime-veil-stats b{font-weight:600}",
       ".dime-veil-stats .s-ok b{color:#67c23a}",
       ".dime-veil-stats .s-skip b{color:#e6a23c}",
       ".dime-veil-stats .s-fail b{color:#f56c6c}",
-      ".dime-veil-now{margin-top:16px;padding:9px 13px;border-radius:12px;",
+      // v4.12 「正在处理」从一行挤成多行：这条到底是谁、什么类型、在做什么、花多久
+      ".dime-veil-now{margin-top:14px;padding:11px 14px 12px;border-radius:12px;",
       "background:rgba(139,92,246,.06);",
       "border:1px solid rgba(139,92,246,.14);text-align:left}",
-      ".dime-veil-now-k{display:block;font-size:11px;color:#8b5cf6;",
-      "font-weight:600;letter-spacing:.04em}",
-      ".dime-veil-now-v{display:block;margin-top:4px;font-size:13px;",
-      "color:#1f2d3d;white-space:nowrap;overflow:hidden;",
+      ".dime-veil-now-head{display:flex;align-items:center;gap:7px;min-width:0}",
+      ".dime-veil-now-k{flex:none;font-size:11px;color:#8b5cf6;",
+      "font-weight:700;letter-spacing:.04em}",
+      ".dime-veil-now-pos{flex:none;font-size:11px;color:#8b8f96;",
+      "font-weight:700;font-variant-numeric:tabular-nums}",
+      ".dime-veil-now-kind{flex:none;padding:1px 7px;border-radius:9px;",
+      "background:rgba(139,92,246,.12);color:#7c5cd6;",
+      "font-size:10px;font-weight:700}",
+      ".dime-veil-now-elapsed{margin-left:auto;flex:none;font-size:11px;",
+      "color:#909399;font-variant-numeric:tabular-nums}",
+      ".dime-veil-now-code{margin-top:7px;font-size:13px;font-weight:700;",
+      "color:#1f2d3d;font-variant-numeric:tabular-nums;",
+      "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dime-veil-now-name{margin-top:3px;font-size:12px;color:#5b616b;",
+      "line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;",
+      "-webkit-box-orient:vertical;overflow:hidden}",
+      /* v4.14「这一条到底在补什么」：危害名做成小标签，一眼看清是哪几项 */
+      ".dime-veil-now-detail{margin-top:7px;display:flex;flex-wrap:wrap;",
+      "align-items:center;gap:5px;font-size:11px;line-height:1.5;color:#6b7280}",
+      ".dime-veil-now-detail.is-empty{display:none}",
+      ".dime-veil-now-detail .k{flex:none;color:#909399}",
+      ".dime-veil-now-detail .tag{flex:none;padding:1px 7px;border-radius:7px;",
+      "background:rgba(59,130,246,.1);color:#3b6fd4;font-weight:600;",
+      "white-space:nowrap}",
+      ".dime-veil-now-detail .tag.is-stage{background:rgba(34,197,94,.12);",
+      "color:#199e59}",
+      ".dime-veil-now-detail .more{color:#a0a4ab}",
+      ".dime-veil-now-phase{margin-top:8px;padding-top:8px;",
+      "border-top:1px dashed rgba(139,92,246,.2);display:flex;",
+      "align-items:center;gap:6px;font-size:12px;color:#4b5563;min-width:0}",
+      ".dime-veil-now-phase::before{content:\"\";flex:none;width:6px;height:6px;",
+      "border-radius:50%;background:#8b5cf6;",
+      "animation:dimeHudPulse 1.2s ease-in-out infinite}",
+      ".dime-veil-now-phase.is-idle{color:#909399}",
+      ".dime-veil-now-phase.is-idle::before{background:#c0c4cc;animation:none}",
+      ".dime-veil-now-v{min-width:0;white-space:nowrap;overflow:hidden;",
       "text-overflow:ellipsis}",
-      ".dime-veil-now-v.is-idle{color:#909399;font-size:12px}",
+      ".dime-veil-now.is-done .dime-veil-now-code,",
+      ".dime-veil-now.is-done .dime-veil-now-name,",
+      ".dime-veil-now.is-done .dime-veil-now-detail{display:none}",
+      // 矮屏（笔记本 768/900 高）缩一圈：环小一点，把高度留给明细列表
+      "@media (max-height:800px){",
+      ".dime-veil-ring-wrap,.dime-veil-ring{width:104px;height:104px}",
+      ".dime-veil-pct{font-size:24px}",
+      ".dime-veil-now{margin-top:10px}",
+      ".dime-veil-now-name{-webkit-line-clamp:1}",
+      "}",
       ".dime-veil-listhead{display:flex;justify-content:space-between;",
       "margin:14px 3px 6px;font-size:11px;color:#909399}",
-      // v4.11 明细列表：从"最近 4 条"改成"一路追加 + 自己滚"，跑的过程中能看到全貌
-      ".dime-veil-log{text-align:left;padding:2px 0;",
-      "max-height:34vh;overflow-y:auto;overscroll-behavior:contain}",
-      ".dime-veil-row{display:flex;align-items:center;gap:8px;",
-      "padding:6px 3px;font-size:12px;color:#606266;",
+      // v4.12 明细列表吃掉卡片剩余高度（原来死限 34vh，小屏时把上面几行挤出去）
+      ".dime-veil-log{flex:1 1 0;min-height:88px;text-align:left;",
+      "padding:2px 8px 2px 0;overflow-y:auto;overscroll-behavior:contain;",
+      /* v4.16 有得滚就要看得出能滚：给一条细滚动条，别让人以为到底了 */
+      "scrollbar-width:thin;scrollbar-color:rgba(139,92,246,.32) transparent}",
+      ".dime-veil-log::-webkit-scrollbar{width:6px}",
+      ".dime-veil-log::-webkit-scrollbar-track{background:transparent}",
+      ".dime-veil-log::-webkit-scrollbar-thumb{",
+      "background:rgba(139,92,246,.28);border-radius:3px}",
+      ".dime-veil-log::-webkit-scrollbar-thumb:hover{",
+      "background:rgba(139,92,246,.5)}",
+      ".dime-veil-row{display:flex;align-items:flex-start;gap:9px;",
+      "padding:7px 3px;font-size:12px;color:#606266;",
       "animation:dimeVeilRowIn .3s ease both}",
       "@keyframes dimeVeilRowIn{from{opacity:0;transform:translateY(-4px)}",
       "to{opacity:1;transform:none}}",
       ".dime-veil-row+.dime-veil-row{",
       "border-top:1px solid rgba(31,45,61,.05)}",
-      ".dime-veil-row .mark{flex:none;width:15px;text-align:center;",
-      "font-weight:700}",
-      ".dime-veil-row .idx{flex:none;width:24px;text-align:right;",
-      "color:#c0c4cc;font-size:11px;font-variant-numeric:tabular-nums}",
+      ".dime-veil-row .mark{flex:none;width:15px;line-height:1.35;",
+      "text-align:center;font-weight:700}",
+      ".dime-veil-row-main{flex:1 1 auto;min-width:0}",
+      ".dime-veil-row-top{display:flex;align-items:center;gap:7px;min-width:0}",
+      ".dime-veil-row .idx{flex:none;color:#c0c4cc;font-size:11px;",
+      "font-variant-numeric:tabular-nums}",
       ".dime-veil-row .code{flex:0 1 auto;min-width:0;color:#1f2d3d;",
       "font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;",
       "overflow:hidden;text-overflow:ellipsis}",
       ".dime-veil-row .kind{flex:none;padding:1px 6px;border-radius:8px;",
       "background:rgba(31,45,61,.05);color:#8b8f96;font-size:10px;font-weight:700}",
-      ".dime-veil-row .info{flex:1 1 auto;min-width:0;margin-left:2px;",
-      "color:#909399;font-size:11px;white-space:nowrap;",
-      "overflow:hidden;text-overflow:ellipsis;text-align:right}",
-      ".dime-veil-row .ms{flex:none;width:52px;text-align:right;",
-      "color:#c0c4cc;font-size:10px;font-variant-numeric:tabular-nums}",
+      // 结论单独占第二行：改了什么（新增哪几项危害、在岗状态改成什么）才看得清
+      ".dime-veil-row .info{margin-top:2px;color:#8b8f96;font-size:11px;",
+      "line-height:1.5;word-break:break-word;",
+      "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;",
+      "overflow:hidden}",
+      ".dime-veil-row .ms{flex:none;margin-left:auto;color:#b0b4ba;",
+      "font-size:10px;font-variant-numeric:tabular-nums}",
       ".dime-veil-row.is-saved .mark{color:#67c23a}",
       ".dime-veil-row.is-skipped .mark{color:#e6a23c}",
       ".dime-veil-row.is-failed .mark{color:#f56c6c}",
@@ -9880,13 +10098,23 @@
       `<small> / ${total} 已完成</small></div>`,
       '<div class="dime-veil-pipeline" data-hud="pipeline">在途 0 ｜ 待补试 0</div>',
       '<div class="dime-veil-stats">',
-      '<span class="s-ok">已补齐 <b data-hud="saved">0</b></span>',
+      '<span class="s-ok">已改好 <b data-hud="saved">0</b></span>',
       '<span class="s-skip">无需动 <b data-hud="skipped">0</b></span>',
       '<span class="s-fail">失败 <b data-hud="failed">0</b></span>',
       "</div>",
       '<div class="dime-veil-now">',
+      '<div class="dime-veil-now-head">',
       '<span class="dime-veil-now-k">正在处理</span>',
-      '<span class="dime-veil-now-v" data-hud="current">正在准备……</span>',
+      '<span class="dime-veil-now-pos" data-hud="nowpos">#-</span>',
+      '<span class="dime-veil-now-kind" data-hud="nowkind">-</span>',
+      '<span class="dime-veil-now-elapsed" data-hud="nowelapsed"></span>',
+      "</div>",
+      '<div class="dime-veil-now-code" data-hud="nowcode">正在准备……</div>',
+      '<div class="dime-veil-now-name" data-hud="nowname"></div>',
+      '<div class="dime-veil-now-detail is-empty" data-hud="nowdetail"></div>',
+      '<div class="dime-veil-now-phase is-idle">',
+      '<span class="dime-veil-now-v" data-hud="current">等待第一条开始</span>',
+      "</div>",
       "</div>",
       '<div class="dime-veil-listhead">',
       "<span>最近完成</span>",
@@ -9934,19 +10162,22 @@
     if (!list) return;
 
     const status = result?.status || "failed";
-    const className =
-      status === "saved"
-        ? "is-saved"
-        : status === "skipped"
-          ? "is-skipped"
-          : "is-failed";
-    const mark = status === "saved" ? "✓" : status === "skipped" ? "–" : "✗";
-    const info =
-      status === "saved"
-        ? result.detail || "内容已更新"
-        : status === "skipped"
-          ? result.note || "无需修改"
-          : result.reason || "未知原因";
+    /* v4.15：staged（已改好、待提交）在明细里与 saved 同色同勾，
+       区别只写在结论那一行文字里，避免多出一种颜色让人以为出了问题。 */
+    const isDone = status === "saved" || status === "staged";
+    const className = isDone
+      ? "is-saved"
+      : status === "skipped"
+        ? "is-skipped"
+        : "is-failed";
+    const mark = isDone ? "✓" : status === "skipped" ? "–" : "✗";
+    /* v4.16 staged 允许第二行为空（没有具体改动可写时不写），
+       空字符串就整行不渲染 —— 不再为了"占位"塞一句每条都一样的备注。 */
+    const info = isDone
+      ? result.detail || (status === "staged" ? "" : "内容已更新")
+      : status === "skipped"
+        ? result.note || "无需修改"
+        : result.reason || "未知原因";
 
     const elapsedMs =
       candidate && candidate.__t0
@@ -9972,19 +10203,34 @@
 
     const kindEl = document.createElement("span");
     kindEl.className = "kind";
-    kindEl.textContent = getBatchCandidateTypeLabel(candidate.batchType);
+    // v4.17 标签写"做了什么"（补岗位 / 补危害），不是"原本缺什么"
+    kindEl.textContent = getBatchActionLabel(candidate.batchType);
 
     const infoEl = document.createElement("span");
     infoEl.className = "info";
     infoEl.textContent = info;
-    infoEl.title = info;
 
     const msEl = document.createElement("span");
     msEl.className = "ms";
     const msText = formatItemSeconds(elapsedMs);
     msEl.textContent = msText ? `${msText}s` : "";
 
-    row.append(markEl, idxEl, codeEl, kindEl, infoEl, msEl);
+    // v4.12 两行式：第一行"哪个套餐 / 什么类型 / 花多久"，第二行"具体改了什么"。
+    // 挤在一行时结论会被省略号吃掉，等于白显示。
+    const rowTop = document.createElement("div");
+    rowTop.className = "dime-veil-row-top";
+    rowTop.append(idxEl, codeEl, kindEl, msEl);
+
+    const rowMain = document.createElement("div");
+    rowMain.className = "dime-veil-row-main";
+    rowMain.append(rowTop);
+
+    if (info) rowMain.append(infoEl);
+
+    // 排障原因（页面为什么没发请求）只放在悬停提示里，不占版面
+    if (result?.detailTitle) rowMain.title = result.detailTitle;
+
+    row.append(markEl, rowMain);
     list.appendChild(row);
 
     while (list.children.length > BATCH_VEIL_LOG_ROWS) {
@@ -9996,7 +10242,7 @@
 
     batchHudText(
       "logcount",
-      `共 ${batchHud.doneCount} 条 · 已补齐 ${batchHud.saved}` +
+      `共 ${batchHud.doneCount} 条 · 已改好 ${batchHud.saved}` +
         ` · 无需动 ${batchHud.skipped} · 失败 ${batchHud.failed}`
     );
   }
@@ -10035,6 +10281,7 @@
 
     batchHud.el = null;
     batchHud.veil = null;
+    batchHud.current = null;
     batchHud.total = total;
     batchHud.doneCount = 0;
     batchHud.saved = 0;
@@ -10042,6 +10289,13 @@
     batchHud.failed = 0;
     batchHud.inFlight = 0;
     batchHud.pending = 0;
+    // v4.14 进度显示值也要归零，否则上一批的 100% 会被当成新一批的起点
+    if (batchHud.ratioRaf) cancelAnimationFrame(batchHud.ratioRaf);
+    batchHud.ratioRaf = 0;
+    batchHud.shownRatio = 0;
+    batchHud.ratioTarget = 0;
+    batchHud.shownDone = 0;
+    batchHud.detailOwner = null;
 
     if (fastPathEnabled) {
       // 静默直写：页面全程不可见地干活，全屏进度背景就是唯一的信息来源。
@@ -10074,7 +10328,7 @@
       `<div class="dime-hud-current" data-hud="current">${summary || "正在准备……"}</div>`,
       '<div class="dime-hud-pipeline" data-hud="pipeline">在途 0 ｜ 待补试 0</div>',
       '<div class="dime-hud-stats">',
-      `<span class="s-ok">已补齐 <b data-hud="saved">${batchHud.saved}</b></span>`,
+      `<span class="s-ok">已改好 <b data-hud="saved">${batchHud.saved}</b></span>`,
       `<span class="s-skip">无需动 <b data-hud="skipped">${batchHud.skipped}</b></span>`,
       `<span class="s-fail">失败 <b data-hud="failed">${batchHud.failed}</b></span>`,
       "</div>"
@@ -10110,6 +10364,77 @@
     refreshBatchHudBar();
   }
 
+  /*
+   * v4.14「这一条在补什么」：把核对时算出的缺口（危害名 + 在岗状态）做成小标签。
+   *
+   * 只显示前 5 个危害，多出来的收成"+N 项"（悬停看全量）——这一行是"当前进度"，
+   * 不是清单；清单在下面的明细里。名称直接用核对阶段的 canonical，
+   * 也就是你之前看到红标的那些名字，口径一致。
+   */
+  const BATCH_NOW_TAG_LIMIT = 5;
+
+  function renderBatchNowTargets(candidate) {
+    const node = batchHud.veil?.querySelector('[data-hud="nowdetail"]');
+
+    if (!node) return;
+
+    // 同一条会分几次刷新阶段（写入表单 → 已提交），标签内容不变就别重建，
+    // 免得那排小标签闪。
+    if (batchHud.detailOwner === candidate) return;
+
+    batchHud.detailOwner = candidate;
+    node.textContent = "";
+
+    const hazards = (candidate?.missing || [])
+      .map(item => item?.canonical || item?.raw)
+      .filter(Boolean);
+    const stage = candidate?.expectedStage || "";
+
+    if (!hazards.length && !stage) {
+      node.classList.add("is-empty");
+      return;
+    }
+
+    node.classList.remove("is-empty");
+
+    const addKey = text => {
+      const key = document.createElement("span");
+      key.className = "k";
+      key.textContent = text;
+      node.appendChild(key);
+    };
+
+    if (hazards.length) {
+      addKey("正在补齐");
+
+      hazards.slice(0, BATCH_NOW_TAG_LIMIT).forEach(name => {
+        const tag = document.createElement("span");
+        tag.className = "tag";
+        tag.textContent = name;
+        tag.title = name;
+        node.appendChild(tag);
+      });
+
+      if (hazards.length > BATCH_NOW_TAG_LIMIT) {
+        const more = document.createElement("span");
+        more.className = "more";
+        more.textContent = `+${hazards.length - BATCH_NOW_TAG_LIMIT} 项`;
+        more.title = hazards.slice(BATCH_NOW_TAG_LIMIT).join("、");
+        node.appendChild(more);
+      }
+    }
+
+    if (stage) {
+      addKey(hazards.length ? "｜在岗" : "在岗状态");
+
+      const tag = document.createElement("span");
+      tag.className = "tag is-stage";
+      tag.textContent = stage;
+      tag.title = `在岗状态将设为「${stage}」`;
+      node.appendChild(tag);
+    }
+  }
+
   function updateBatchHudCurrent(candidate, index, phase) {
     /* 记下这一条是什么时候开始动的、当前处在哪一步：
        运行界面明细行里的"本条耗时"和阶段就靠这两个字段（重试不会再改第一次的时间，
@@ -10119,6 +10444,9 @@
       if (phase) candidate.__phase = phase;
     }
 
+    // v4.12 「正在处理」要能实时报"这一条已经磨了多久"，计时器每 200ms 来取一次。
+    batchHud.current = candidate || null;
+
     if (!batchHudRoots().length) return;
 
     // index 可能是序号，也可能是"重试"这种文字标签。
@@ -10127,30 +10455,61 @@
         ? `#${index}/${batchHud.total}`
         : `#${index}`;
 
+    batchHudText("nowpos", position);
     batchHudText(
-      "current",
-      [
-        `${position} ${candidate.sequence || "-"} · ${candidate.code}`,
-        candidate.packageName ? ` · ${candidate.packageName}` : "",
-        phase ? `｜${phase}` : ""
-      ].join("")
+      "nowkind",
+      candidate?.batchType
+        ? getBatchCandidateTypeLabel(candidate.batchType)
+        : "-"
     );
+    batchHudText(
+      "nowcode",
+      candidate
+        ? `${candidate.sequence || "-"} · ${candidate.code || "-"}`
+        : "正在准备……"
+    );
+    batchHudText("nowname", candidate?.packageName || "");
+    // 换条就换标签：这一条要补哪几个危害、在岗改成什么
+    renderBatchNowTargets(candidate);
+    batchHudText("current", phase || candidate?.__phase || "处理中……");
+
+    // 阶段行从灰色 idle 切成紫色呼吸点：说明确实有一条在跑。
+    const phaseRow = batchHud.veil?.querySelector(".dime-veil-now-phase");
+    if (phaseRow) phaseRow.classList.toggle("is-idle", !candidate);
+
+    refreshBatchNowElapsed();
+  }
+
+  /* 「正在处理」右上角的"本条第 N 秒"：由 200ms 计时器驱动，结案即清零。 */
+  function refreshBatchNowElapsed() {
+    const candidate = batchHud.current;
+
+    if (!candidate || !candidate.__t0) {
+      batchHudText("nowelapsed", "");
+      return;
+    }
+
+    const seconds = (Date.now() - candidate.__t0) / 1000;
+    batchHudText("nowelapsed", `本条第 ${seconds.toFixed(1)} 秒`);
   }
 
   /*
-   * 进度几何：已结案的算满格，还在途/待补试的算半格。
+   * 进度几何（v4.14 重做）。
    *
-   * 只按"已结案"画条会出现这种情况：扫掠阶段请求全部在途、一条结果都没回来，
-   * 条就一直钉在 0，等到最后一批回执同时落地才一次性跳满（正是用户报的现象）。
-   * 把"处理中"按半格计入，条和进度环才会随着提交持续推进。
+   * 老公式有两个毛病，他 2026-10-29 直接看出来了：「一开始走得非常慢，最后突然跑满」。
+   *   1) 待补试按半格算 —— 首轮被判 blocked 的条目全堆进重试队列，一条没结案，
+   *      进度却靠"半格"飘到 42%，用户看到的是一段没有任何真实进展的假进度；
+   *   2) 已结案只在重试阶段集中上涨，一次跳满。
+   *
+   * 现在的规则：
+   *   - 每格权重：已结案 1.0、在途 0.6（确实在等回执）、待补试 0.1（只是排队，几乎不算）；
+   *   - 显示值只会往前爬，不会因为队列变化往回退；
+   *   - 目标值变化后由 rAF 补间过去（约 0.6 秒），百分比与"已完成 n"一起滚，
+   *     这样即使某一段集中结案，看到的也是"一路小跑冲上去"，而不是跳字。
    */
-  function refreshBatchHudBar() {
-    const total = Math.max(1, batchHud.total || batchHud.doneCount || 1);
-    const ongoing = (batchHud.inFlight || 0) + (batchHud.pending || 0);
-    const ratio = Math.min(
-      1,
-      (batchHud.doneCount + ongoing * 0.5) / total
-    );
+  function paintBatchHudRatio() {
+    const ratio = batchHud.shownRatio;
+    const doneText = String(Math.round(batchHud.shownDone));
 
     for (const root of batchHudRoots()) {
       const bar = root.querySelector('[data-hud="bar"]');
@@ -10163,9 +10522,63 @@
           (BATCH_VEIL_RING_CIRCUMFERENCE * (1 - ratio)).toFixed(2)
         );
       }
+
+      const done = root.querySelector('[data-hud="done"]');
+      if (done) done.textContent = doneText;
     }
 
     batchHudText("pct", `${Math.round(ratio * 100)}%`);
+  }
+
+  function animateBatchHudRatio() {
+    if (batchHud.ratioRaf) return;
+
+    const step = () => {
+      const rest = batchHud.ratioTarget - batchHud.shownRatio;
+      const doneRest = batchHud.doneCount - batchHud.shownDone;
+
+      // 0.09/帧：差距大的时候约 0.5~0.7 秒追上，差距小时自然停住。
+      batchHud.shownRatio += rest * 0.09;
+      batchHud.shownDone += doneRest * 0.09;
+
+      if (Math.abs(rest) < 0.004 && Math.abs(doneRest) < 0.4) {
+        batchHud.shownRatio = batchHud.ratioTarget;
+        batchHud.shownDone = batchHud.doneCount;
+        batchHud.ratioRaf = 0;
+        paintBatchHudRatio();
+        return;
+      }
+
+      paintBatchHudRatio();
+      batchHud.ratioRaf = requestAnimationFrame(step);
+    };
+
+    batchHud.ratioRaf = requestAnimationFrame(step);
+  }
+
+  function refreshBatchHudBar({ snap = false } = {}) {
+    const total = Math.max(1, batchHud.total || batchHud.doneCount || 1);
+    const ongoing =
+      (batchHud.inFlight || 0) * 0.6 + (batchHud.pending || 0) * 0.1;
+    const computed = Math.min(
+      1,
+      (batchHud.doneCount + ongoing) / total
+    );
+    // 只进不退：待补试进队列/出队列会让 computed 抖动，显示值不能被拽回去。
+    const target = Math.max(batchHud.shownRatio || 0, computed);
+
+    batchHud.ratioTarget = target;
+
+    if (snap) {
+      if (batchHud.ratioRaf) cancelAnimationFrame(batchHud.ratioRaf);
+      batchHud.ratioRaf = 0;
+      batchHud.shownRatio = target;
+      batchHud.shownDone = batchHud.doneCount;
+      paintBatchHudRatio();
+      return;
+    }
+
+    animateBatchHudRatio();
   }
 
   /*
@@ -10196,7 +10609,8 @@
 
     if (!batchHudRoots().length) return;
 
-    batchHudText("done", String(batchHud.doneCount));
+    /* "已完成 n" 交给补间（v4.14）：直接写数字会让 0 → 6 是一次跳字，
+       跟进度环一起滚才有过渡感。 */
     batchHudText("saved", String(batchHud.saved));
     batchHudText("skipped", String(batchHud.skipped));
     batchHudText("failed", String(batchHud.failed));
@@ -10210,7 +10624,7 @@
    * 那一行换成本次汇总、圆点由呼吸变定格），原地停 2 秒让人看清结果，
    * 再淡出并把汇总交回右下角小卡片。
    */
-  function finishBatchHud(title, summary) {
+  function finishBatchHud(title, summary, hint) {
     const veil = batchHud.veil;
 
     if (veil) {
@@ -10240,19 +10654,32 @@
         const confirm = document.createElement("button");
         confirm.type = "button";
         confirm.className = "dime-veil-confirm";
-        confirm.textContent = "确认并关闭";
-        confirm.title = "看完结论后点这里收起运行界面";
+        /* v4.15 待提交时这个按钮只收自己的运行界面 —— 页面那份改动还要人在
+           弹窗底部点「确定」，别让人以为关掉这个就等于完事了。 */
+        confirm.textContent = hint ? "知道了" : "确认并关闭";
+        confirm.title = hint
+          ? "收起运行界面（页面上的改动还没有提交）"
+          : "看完结论后点这里收起运行界面";
         confirm.addEventListener("click", () => finishBatchVeil());
         head.appendChild(confirm);
       }
 
       if (dot) {
         dot.classList.add(
-          title.includes("完成") ? "is-done" : isFailed ? "is-failed" : "is-stopped"
+          /(完成|改好)/.test(title) ? "is-done" : isFailed ? "is-failed" : "is-stopped"
         );
       }
 
       if (nowKey) nowKey.textContent = "处理结果";
+
+      /* 「正在处理」收成结果态：编码/套餐名那两行已无意义（最后一条容易
+         被当成"还有一条在跑"），藏掉；"本条第 N 秒"清零；阶段点停止呼吸。 */
+      batchHud.current = null;
+      batchHudText("nowpos", "");
+      batchHudText("nowkind", "");
+      batchHudText("nowelapsed", "");
+      veil.querySelector(".dime-veil-now")?.classList.add("is-done");
+      veil.querySelector(".dime-veil-now-phase")?.classList.add("is-idle");
 
       // 收尾了，"在途/待补试"已经没有意义：正常收场就是两个 0，
       // 中途叫停则更糟——会挂着上一批的残数。这里统一换成一句定论。
@@ -10261,12 +10688,23 @@
 
       const total = batchHud.total || batchHud.doneCount;
 
+      // 待提交时这一行改成醒目提示条（橙色底），不能和"在途 0 ｜ 待补试 0"
+      // 那种灰字混在一起 —— 那是工程计数，这是"你接下来要做什么"。
+      veil
+        .querySelector(".dime-veil-pipeline")
+        ?.classList.toggle("is-warn", Boolean(hint));
+
       batchHudText(
         "pipeline",
-        title.includes("完成")
-          ? `本批 ${total} 个已全部过完`
-          : `已处理 ${batchHud.doneCount}/${total} 个，其余未动`
+        hint ||
+          (title.includes("完成")
+            ? `本批 ${total} 个已全部过完`
+            : `已处理 ${batchHud.doneCount}/${total} 个，其余未动`)
       );
+
+      /* 在途/待补试清零后要让环自己爬到终点（不是 snap）：
+         收尾这一刻如果"啪"跳到 100%，前面那 0.5 秒的补间就白做了。 */
+      refreshBatchHudBar();
 
       return;
     }
@@ -10361,19 +10799,26 @@
     document.addEventListener("click", fastPathHold.handler, true);
   }
 
-  async function endFastPathHold(vm) {
+  /*
+   * v4.15：keepDataForSubmit = 这批改动只写进了弹窗表格、还没提交。
+   * 这时候绝不能走页面的"取消"（cancelPackage）——那是把当前这条丢掉的
+   * 语义；改成直接置 openPackage=false 收窗，页面内的表格数据原样留着，
+   * 等用户在外层弹窗点「确定」。
+   */
+  async function endFastPathHold(vm, { keepDataForSubmit = false } = {}) {
     if (!fastPathHold.active) return;
 
     const heldVm = fastPathHold.vm || vm;
+    const descriptor = fastPathHold.descriptor;
 
     fastPathHold.active = false;
 
     try {
-      if (heldVm && fastPathHold.descriptor) {
+      if (heldVm && descriptor) {
         Object.defineProperty(
           heldVm,
           "openPackage",
-          fastPathHold.descriptor
+          descriptor
         );
       }
     } catch (_) {}
@@ -10385,6 +10830,19 @@
 
     fastPathHold.vm = null;
     fastPathHold.descriptor = null;
+
+    if (keepDataForSubmit) {
+      /* 描述符已经还原，这里直接置 false：走的是页面"保存成功关窗"那条路，
+         不经过 cancelPackage，弹窗内那份数据不会被清掉。 */
+      try {
+        if (heldVm && descriptor?.set) {
+          descriptor.set.call(heldVm, false);
+        }
+      } catch (_) {}
+
+      await waitFastPathRender(heldVm);
+      return;
+    }
 
     // 整批结束才真正关窗，整批过程中一次都不关。
     await closeFastPathDialog(heldVm);
@@ -10495,7 +10953,18 @@
     const plan = {
       harmIds: resolution.ids,
       stageCode,
-      duplicateNames: resolution.duplicates
+      duplicateNames: resolution.duplicates,
+      /* v4.14 id → 危害名：保存成功后要能说出"补了哪几项"，而不是只说"2 项"。
+         resolution.matched 与 resolution.ids 同序（每解析出一条就各 push 一次）。 */
+      harmNameById:
+        resolution.ids.length === resolution.matched.length
+          ? new Map(
+              resolution.ids.map((id, index) => [
+                String(id),
+                resolution.matched[index] || ""
+              ])
+            )
+          : new Map()
     };
 
     if (!plan.harmIds.length && !plan.stageCode) return null;
@@ -10647,7 +11116,8 @@
         stopMessage:
           "找不到页面的套餐管理组件，数据层直写不可用；请改用界面模拟模式",
         deferredCount: 0,
-        serialFallback: false
+        serialFallback: false,
+        stagedCount: 0
       };
     }
 
@@ -10664,6 +11134,10 @@
     // 首轮没拿到结果的条数，以及是否已降级为逐条提交（详见 FAST_PATH.maxInFlight 注释）。
     let deferredCount = 0;
     let serialFallback = false;
+    /* v4.15 改动只进了弹窗表格、还没提交的条数。
+       （v4.13 那一版把它当成"首轮其实已经存进去了"，是错的：这个页面在
+       单位弹窗里改套餐根本不发请求，详见 lateVerifyFastPathLanding 注释。） */
+    let stagedCount = 0;
 
     const syncPipelineHud = () =>
       updateBatchHudPipeline(inFlight, retryQueue.length);
@@ -10689,19 +11163,80 @@
     const describeItem = candidate =>
       `${candidate.sequence || "-"} · ${candidate.code}`;
 
-    const describeApplied = applied => {
+    /* v4.14 结论写具体内容：不再只说"新增危害 2 项"，而是把补了哪几项列出来。 */
+    const describeApplied = (applied, candidate) => {
       if (!applied) return "内容已更新";
 
       const stageLabel = FAST_PATH_STAGE_CODES.find(
         ([, code]) => code === applied.stageCode
       )?.[0];
+      /* 优先用"这一次真正新增的名字"（applyFastPathFill 回传）；
+         拿不到时退回核对阶段的缺口名称。 */
+      const names =
+        applied.addedNames?.length
+          ? applied.addedNames
+          : (candidate?.missing || [])
+              .map(item => item?.canonical || item?.raw)
+              .filter(Boolean);
+      const parts = [];
 
-      return [
-        applied.additions ? `新增危害 ${applied.additions} 项` : "",
-        applied.stageChanged && stageLabel
-          ? `在岗状态 → ${stageLabel}`
-          : ""
-      ].filter(Boolean).join("，") || "内容已更新";
+      if (applied.additions) {
+        const shown = names.slice(0, 4);
+
+        parts.push(
+          shown.length
+            ? `补危害 ${applied.additions} 项：${shown.join("、")}` +
+              (names.length > shown.length
+                ? ` 等 ${names.length} 项`
+                : "")
+            : `补危害 ${applied.additions} 项`
+        );
+      }
+
+      if (applied.stageChanged && stageLabel) {
+        // v4.17 与 staged 那条同口径：写"未选 → 目标值"，一眼看出做了什么
+        parts.push(`在岗：未选 → ${stageLabel}`);
+      }
+
+      return parts.join(" ｜ ") || "内容已更新";
+    };
+
+    /* v4.17：第二行统一写"这一条到底做了什么"，措辞与真回执那条一致。
+       只缺岗位的条目也要有第二行 —— 原来省掉了，结果整行只剩「只缺岗位」
+       一个词，说的是"它原本缺什么"，他要的是"你处理了什么"（他 2026-10-29）。 */
+    const describeStaged = (candidate, applied) => {
+      const names =
+        applied?.addedNames?.length
+          ? applied.addedNames
+          : (candidate?.missing || [])
+              .map(item => item?.canonical || item?.raw)
+              .filter(Boolean);
+      const additions = applied?.additions || names.length;
+      const parts = [];
+
+      if (additions) {
+        const shown = names.slice(0, 4);
+
+        parts.push(
+          shown.length
+            ? `补危害 ${additions} 项：${shown.join("、")}` +
+              (names.length > shown.length ? " 等" : "")
+            : `补危害 ${additions} 项`
+        );
+      }
+
+      /* 批量候选里 stageConflict 已被排除，进来的一定是"原来没选"，
+         所以固定写"未选 → 目标值"，不编造一个读不到的原值。 */
+      const stageChanged =
+        applied?.stageChanged ||
+        candidate?.stagePending ||
+        candidate?.batchType === "combined";
+
+      if (stageChanged && candidate?.expectedStage) {
+        parts.push(`在岗：未选 → ${candidate.expectedStage}`);
+      }
+
+      return parts.join(" ｜ ");
     };
 
     const finishOutcome = async (candidate, evaluation, applied, attempts) => {
@@ -10713,10 +11248,77 @@
         status: "saved",
         attempts,
         verificationMode: "network",
-        detail: describeApplied(applied)
+        detail: describeApplied(applied, candidate)
       });
 
       return true;
+    };
+
+    /*
+     * 首轮"没抓到保存请求"时的当场对账。
+     *
+     * 以前这种条目直接进重试队列：先白跑一整轮（六条约 18 秒），重试时
+     * applyFastPathFill 发现弹窗里已经是目标值 ⇒ 判"无需修改"，再由 v4.13
+     * 的规则转记成"已改好"。那 18 秒与"进度卡着不动"的观感全是白费，
+     * 所以就地读一次列表行：目标危害是不是都在这行的 dimeBaseharmList 里、
+     * 在岗状态是不是已经是目标值。只放行"名称全部解析成功、且一个都不缺"
+     * 的情况；读不到在岗字段、或有名称解析不了，一律返回 false 交回重试队列。
+     *
+     * ⚠ v4.15：这个判据只能证明"改动已经进了页面表格"，**不能证明后端收到了**。
+     * 在单位编辑弹窗里改套餐时，页面本来就不发请求，行数据是页面自己合并的。
+     * 因此通过时记 staged（已改好·待提交），绝不记成"已保存"。
+     */
+    async function lateVerifyFastPathLanding(vm, candidate) {
+      const names = (candidate.missing || [])
+        .map(item => item?.canonical || item?.raw)
+        .filter(Boolean);
+
+      if (!names.length && !candidate.expectedStage) return false;
+
+      await sleep(FAST_PATH.landingSettleMs);
+
+      const rowIndex = findFastPathPackageIndex(vm, candidate.code);
+
+      if (rowIndex < 0) return false;
+
+      const row = vm.basepackageList[rowIndex];
+
+      if (!row) return false;
+
+      const resolution = resolveFastPathHarmIds(vm, names, row.dimeBaseharmList);
+
+      if (resolution.unresolved.length || resolution.ambiguous.length) return false;
+      if (names.length && !resolution.ids.length) return false;
+
+      const current = new Set(
+        (Array.isArray(row.dimeBaseharmList) ? row.dimeBaseharmList : []).map(
+          id => String(id)
+        )
+      );
+
+      if (resolution.ids.some(id => !current.has(String(id)))) return false;
+
+      if (candidate.expectedStage) {
+        const want = getFastPathStageCode(candidate.expectedStage);
+        const actual = String(
+          row.worktype ?? row.workType ?? row.workStatus ?? ""
+        );
+
+        if (!want || !actual || actual !== String(want)) return false;
+      }
+
+      return true;
+    }
+
+    /* 首轮没拿到结果的统一去处：记一笔、切串行、进批末重试队列。 */
+    const markDeferred = (candidate, reason) => {
+      deferredCount++;
+      serialFallback = true;
+      retryQueue.push({
+        candidate,
+        lastReason: reason || "未知原因"
+      });
+      syncPipelineHud();
     };
 
     /* ---- 主扫掠：每条一次，最多 maxInFlight 个请求在途 ---- */
@@ -10773,15 +11375,33 @@
           }
 
           if (committed.kind === "blocked") {
-            // 请求压根没发出去（多数是复用弹窗还没从上一次保存里出来）：
-            // 记一笔首轮未过，并立刻切到"等回执再提交"。
-            deferredCount++;
-            serialFallback = true;
-            retryQueue.push({
-              candidate,
-              lastReason: committed.reason || "未知原因"
-            });
-            syncPipelineHud();
+            /* v4.14 先别急着判失败：请求可能已经发出、只是没被认出来
+               （带 id 的路径 / 走了 fetch / 回执晚于 3 秒）。就地读一次列表
+               数据对账，已经到位就不再重试。
+
+               v4.15 订正（他 2026-10-29 指出「不点确认就不会推送」）：
+               这个页面在「导入体检单位」弹窗里改套餐时，页面自己的保存只是把
+               改动合并进弹窗内那张表格（前端 basepackageList），**不向后端发
+               请求**；真正落库要人点弹窗底部的「确定」。所以对账通过只能说明
+               "改动已经写进页面表格"，绝不能记成"已保存 / 已生效"。这里记
+               staged（已改好、待提交），报告与收尾一律按"还没落库"处理。 */
+            if (await lateVerifyFastPathLanding(vm, candidate)) {
+              stagedCount++;
+              batchVerifiedCodes.add(strictKey(candidate.code));
+
+              await applyResult(candidate, {
+                status: "staged",
+                attempts: 1,
+                verificationMode: "staged",
+                detail: describeStaged(candidate, committed.applied),
+                detailTitle: committed.reason
+                  ? `页面没有发出保存请求：${committed.reason}`
+                  : ""
+              });
+              continue;
+            }
+
+            markDeferred(candidate, committed.reason);
             continue;
           }
 
@@ -10812,22 +11432,10 @@
             continue;
           }
 
-          deferredCount++;
-          serialFallback = true;
-          retryQueue.push({
-            candidate,
-            lastReason: evaluation.reason || "未知原因"
-          });
-          syncPipelineHud();
+          markDeferred(candidate, evaluation.reason);
         } catch (error) {
           // 提交环节的瞬时错误（弹窗未就绪、表单被占用等）：交给批末重试。
-          deferredCount++;
-          serialFallback = true;
-          retryQueue.push({
-            candidate,
-            lastReason: error?.message || String(error)
-          });
-          syncPipelineHud();
+          markDeferred(candidate, error?.message || String(error));
         }
       }
     };
@@ -10887,12 +11495,43 @@
             });
 
             if (committed.kind === "skip") {
-              await applyResult(candidate, {
-                status: "skipped",
-                attempts: attempt,
-                verificationMode: "none",
-                note: committed.note
-              });
+              /* v4.13 订正「处理了两遍、最后全判成无需处理」这个现象：
+                 这条之所以在这里，是因为首轮没拿到保存结果。重试时
+                 applyFastPathFill 报"无需修改"，说明弹窗表单里已经包含目标
+                 危害/岗位 —— 首轮的改动确实写进去了。
+
+                 v4.15 再订正一次语义：写进去 ≠ 提交了。这个页面在单位弹窗里
+                 改套餐本来就不发请求，所以这里只能记 staged（已改好·待提交），
+                 不能记"已保存"，否则又会出现"报告全绿、其实一条没提交"。 */
+              const landedByFirstSubmit = committed.note === "无需修改";
+
+              if (landedByFirstSubmit) {
+                stagedCount++;
+                // 与正常保存成功的条目同等对待：后续 runCheck 不再重复核对它。
+                batchVerifiedCodes.add(strictKey(candidate.code));
+              }
+
+              await applyResult(
+                candidate,
+                landedByFirstSubmit
+                  ? {
+                      status: "staged",
+                      attempts: attempt,
+                      verificationMode: "staged",
+                      /* v4.16：第二行只写这条具体改了什么；这里走的是重试路径，
+                         拿不到 applied（首轮就已写进去），按缺口信息回推。 */
+                      detail: describeStaged(candidate),
+                      detailTitle: lastReason
+                        ? `页面没有发出保存请求：${lastReason}`
+                        : ""
+                    }
+                  : {
+                      status: "skipped",
+                      attempts: attempt,
+                      verificationMode: "none",
+                      note: committed.note
+                    }
+              );
               resolved = true;
               break;
             }
@@ -10947,7 +11586,7 @@
       }
     }
 
-    return { stopMessage, deferredCount, serialFallback };
+    return { stopMessage, deferredCount, serialFallback, stagedCount };
   }
 
   async function processOneBatchCandidate(
@@ -11172,6 +11811,18 @@
     }[type] || "其他";
   }
 
+  /* v4.17 明细里的标签改成"这一条做了什么"。
+     "只缺岗位"说的是它原本缺什么（是他 2026-10-29 指出的问题：
+     日志该回答"你处理了什么"）；"正在处理"那一块仍然用上面那套
+     "只缺…"，因为那里说的是"接下来要做什么"，语义本来就不同。 */
+  function getBatchActionLabel(type) {
+    return {
+      "stage-only": "补岗位",
+      "hazard-only": "补危害",
+      combined: "补岗位·补危害"
+    }[type] || "补内容";
+  }
+
   function buildOrderedBatchQueue(candidates) {
     const typeOrder = {
       "stage-only": 0,
@@ -11223,6 +11874,95 @@
   }
 
 
+  /*
+   * v4.15：这个页面不点弹窗底部的「确定」就不会提交，改好的东西只停在弹窗表格里。
+   * 这里记住"还有多少条没提交"，用户一点确定/保存/提交就解除提醒
+   * （不判断成败——宁可少提醒，也不要反复弹窗打扰）。
+   */
+  function watchSubmitConfirmClick() {
+    if (watchSubmitConfirmClick.installed) return;
+
+    watchSubmitConfirmClick.installed = true;
+
+    document.addEventListener(
+      "click",
+      event => {
+        const button = event.target?.closest?.("button");
+
+        if (!button) return;
+
+        const text = cleanText(button.innerText || button.textContent);
+
+        if (/^(确定|保存|提交)$/.test(text)) {
+          setTimeout(() => {
+            unsubmittedChangeCount = 0;
+          }, 1200);
+          return;
+        }
+
+        /* 点了「取消」：页面会把这一批回滚掉，右侧不能还挂着"已核对通过"。
+           清掉已验证标记，下次核对就会老实报出还缺什么。 */
+        if (/^(取消|关闭)$/.test(text)) {
+          setTimeout(() => {
+            if (!unsubmittedChangeCount) return;
+
+            unsubmittedChangeCount = 0;
+            batchVerifiedCodes.clear();
+            showToast("这一批改动已随「取消」回滚");
+          }, 1200);
+        }
+      },
+      true
+    );
+  }
+
+  /*
+   * v4.15：改完不提交等于白改，光写字提示不够 —— 直接把页面底部那个
+   * 「确定」按钮圈出来（呼吸光圈 + 滚进视野），点过或 12 秒后自己消失。
+   * 只加一个类，不替用户点，也不改按钮的任何行为。
+   */
+  const SUBMIT_PULSE_STYLE_ID = "dime-submit-pulse-style";
+  const SUBMIT_PULSE_CLASS = "dime-submit-pulse-on";
+
+  function highlightPageSubmitButton() {
+    if (!document.getElementById(SUBMIT_PULSE_STYLE_ID)) {
+      const style = document.createElement("style");
+
+      style.id = SUBMIT_PULSE_STYLE_ID;
+      style.textContent =
+        "." + SUBMIT_PULSE_CLASS + "{animation:dime-submit-pulse 1.4s ease-out infinite!important;" +
+        "position:relative;z-index:1}" +
+        "@keyframes dime-submit-pulse{" +
+        "0%{box-shadow:0 0 0 0 rgba(64,158,255,.75)}" +
+        "70%{box-shadow:0 0 0 12px rgba(64,158,255,0)}" +
+        "100%{box-shadow:0 0 0 0 rgba(64,158,255,0)}}";
+
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    const button = [...document.querySelectorAll("button")].find(element => {
+      if (element.closest(`#${TOOL_ID}`)) return false;
+      if (!isVisibleElement(element)) return false;
+
+      return /^(确定|保存|提交)$/.test(
+        cleanText(element.innerText || element.textContent)
+      );
+    });
+
+    if (!button) return;
+
+    button.classList.add(SUBMIT_PULSE_CLASS);
+    button.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+
+    const clear = () => {
+      button.classList.remove(SUBMIT_PULSE_CLASS);
+      button.removeEventListener("click", clear, true);
+    };
+
+    button.addEventListener("click", clear, true);
+    setTimeout(clear, 12000);
+  }
+
   async function startBatchRepair() {
     if (batchRunning) return;
 
@@ -11239,6 +11979,23 @@
     if (findVisibleEditDialogs().length) {
       showToast("请先关闭当前编辑套餐弹窗");
       return;
+    }
+
+    /* v4.15：上一批只写进了弹窗表格、没点「确定」，再跑会把这批改动盖掉。
+       只在这一个点上问一句，平时不打扰。 */
+    if (unsubmittedChangeCount > 0) {
+      const proceed = window.confirm(
+        `上一批还有 ${unsubmittedChangeCount} 条的改动没提交` +
+        "（页面上还没点「确定」）。\n" +
+        "继续跑这一批会覆盖掉它们，确定要继续吗？"
+      );
+
+      if (!proceed) {
+        showToast(`已取消：上一批还有 ${unsubmittedChangeCount} 条没提交`);
+        return;
+      }
+
+      unsubmittedChangeCount = 0;
     }
 
     // 点击“批量核对补齐”后直接开始，不再弹出浏览器原生确认框。
@@ -11279,6 +12036,8 @@
     );
 
     let savedCount = 0;
+    /* v4.15 已改好、但只是写进了弹窗表格、还没提交的条数 */
+    let stagedCount = 0;
     let skippedCount = 0;
     let failedCount = 0;
     let retryCount = 0;
@@ -11310,21 +12069,33 @@
           ? Math.max(0, Date.now() - candidate.__t0)
           : 0;
 
-      const pushItem = noteText => {
+      const pushItem = (noteText, noteTitle) => {
         batchLogItems.push({
           status,
           sequence: candidate.sequence || "-",
           code: candidate.code || "未识别编码",
           typeLabel: getBatchCandidateTypeLabel(candidate.batchType),
+          // v4.17 结果行优先说"做了什么"，类型只在没有具体内容时兜底
+          actionLabel: getBatchActionLabel(candidate.batchType),
           note: noteText || "",
+          noteTitle: noteTitle || "",
           ms: itemElapsedMs
         });
       };
 
-      if (status === "saved") {
-        savedCount++;
+      /* v4.15：saved（真收到保存回执、确认落库）与 staged（只写进弹窗表格、
+         等人点「确定」）都算"改好了"，进度条口径一致；统计与文案分开算。 */
+      if (status === "saved" || status === "staged") {
+        if (status === "staged") stagedCount++;
+        else savedCount++;
+
         bumpBatchHudProgress("saved");
-        pushItem(result.detail || "内容已更新");
+        /* v4.16 staged 没有具体改动时允许留空，右侧逐条结果改显示类型标签，
+           不再每行重复同一句"已改入弹窗表格…"。 */
+        pushItem(
+          result.detail || (status === "staged" ? "" : "内容已更新"),
+          result.detailTitle
+        );
 
         if (candidate.batchType === "stage-only") {
           completedStageOnly++;
@@ -11347,6 +12118,10 @@
           result.verificationMode === "network"
         ) {
           networkCount++;
+        } else if (
+          result.verificationMode === "staged"
+        ) {
+          /* v4.15 只写进了页面表格：没有请求可等，也不属于"重开场核对" */
         } else if (
           result.verificationMode === "fast"
         ) {
@@ -11379,7 +12154,8 @@
       // 左侧操作区那一行状态：跑到第几条、各类各多少，一眼能看
       updateBatchProgress(
         `停止批量处理（${doneCount}/${queue.length}）`,
-        `已处理 ${doneCount}/${queue.length} 个 ｜ 已补齐 ${savedCount}` +
+        `已处理 ${doneCount}/${queue.length} 个 ｜ 已改好 ${savedCount + stagedCount}` +
+          (stagedCount ? `（待提交 ${stagedCount}）` : "") +
           ` ｜ 无需动 ${skippedCount} ｜ 失败 ${failedCount}`
       );
 
@@ -11466,7 +12242,9 @@
           ? "批量核对补齐已停止"
           : outcomeKind === "stopped"
             ? "批量核对补齐已按你的要求停止"
-            : "批量核对补齐完成";
+            : stagedCount
+              ? "批量改好了，等你点「确定」提交"
+              : "批量核对补齐完成";
 
       /* ----------------------------------------------------------------
        * 结论只写"使用者需要知道的事"：
@@ -11483,11 +12261,8 @@
         reportNotes.push({
           type: "warn",
           text:
-            `你中途点了停止：本批 ${queue.length} 个套餐里，` +
-            `${doneCount} 个已经处理完，剩下 ${Math.max(
-              0,
-              queue.length - doneCount
-            )} 个没有动。`
+            `你中途点了停止：${doneCount}/${queue.length} 个已处理完，` +
+            `其余 ${Math.max(0, queue.length - doneCount)} 个没动。`
         });
       }
 
@@ -11498,15 +12273,25 @@
         });
       }
 
-      if (fastPathDeferredCount) {
+      /* v4.15 最重要的一条，必须排在最前面：
+         这个页面在「导入体检单位」弹窗里改套餐时，页面自己的保存只把改动
+         合并进弹窗内那张表格，不往后端发请求 —— 真正的提交是人点弹窗底部
+         的「确定」。所以"改好了"和"提交了"是两件事，且不提交等于白改。 */
+      if (stagedCount) {
         reportNotes.push({
           type: "warn",
           text:
-            `有 ${fastPathDeferredCount} 个套餐第一次没提交上去` +
-            `（页面还停在"保存中"，请求其实没有发出去）。` +
-            (fastPathSerialFallback
-              ? "脚本自动改成一条条重新提交，最后都处理完了。"
-              : "脚本已在批末自动补试。")
+            `${stagedCount} 个的改动已经写进弹窗里那张表，但还没提交：` +
+            "请在页面底部点一次「确定」；点「取消」会把这一批全部作废。"
+        });
+      }
+
+      if (fastPathDeferredCount && !stagedCount) {
+        reportNotes.push({
+          type: "warn",
+          text:
+            `有 ${fastPathDeferredCount} 个第一次没等到保存回执，` +
+            "已自动重新提交并通过。"
         });
       }
 
@@ -11523,7 +12308,11 @@
         kind: outcomeKind,
         title: outcomeTitle,
         stats: [
-          { key: "saved", label: "已补齐", value: String(savedCount) },
+          {
+            key: "saved",
+            label: stagedCount ? "已改好·待提交" : "已改好",
+            value: String(savedCount + stagedCount)
+          },
           { key: "skipped", label: "无需动", value: String(skippedCount) },
           { key: "failed", label: "失败", value: String(failedCount) },
           {
@@ -11539,34 +12328,58 @@
 
       batchCancelRequested = false;
 
+      /* 记下"还没提交"的条数：开始下一批前会拿它提醒一次（点过「确定」就自动清零）。 */
+      unsubmittedChangeCount = stagedCount;
+
+      if (stagedCount) watchSubmitConfirmClick();
+
       // 整批结束（正常结束、停止或报错都走这里）：
       // 恢复弹窗的关闭能力，把整批共用着的那一次弹窗真正关掉，
       // 并解除弹窗隐身（先关窗再解除，关窗动画也不会被看见）。
-      await endFastPathHold(getFastPathVm());
+      //
+      // v4.15：如果这批改动还没提交，关窗方式要换掉 —— 不能走页面"取消"，
+      // 否则等于替用户把这一批点掉了。
+      await endFastPathHold(getFastPathVm(), {
+        keepDataForSubmit: stagedCount > 0
+      });
       endFastPathGhost();
+
+      const submitHint = stagedCount
+        ? `这 ${stagedCount} 条的改动还在弹窗里：请在页面底部点一次「确定」，` +
+          "点「取消」会全部作废"
+        : "";
 
       finishBatchHud(
         failedMessage
           ? "批量核对补齐已停止（出错）"
           : stoppedByUser
             ? "已按要求停止"
-            : "批量核对补齐完成",
+            : stagedCount
+              ? "改好了，待你点「确定」"
+              : "批量核对补齐完成",
         [
-          `已补齐 ${savedCount} · 无需动 ${skippedCount}`,
+          `已改好 ${savedCount + stagedCount} · 无需动 ${skippedCount}`,
           failedCount ? ` · 失败 ${failedCount}` : "",
           ` · 用时 ${(batchElapsedMs / 1000).toFixed(1)} 秒`
-        ].join("")
+        ].join(""),
+        submitHint
       );
 
-      try {
-        await waitForNoVisibleEditDialog(2500);
-      } catch (_) {}
+      /* 待提交时父弹窗本来就开着，这里不用再等弹窗消失（省 2.5 秒空等）。 */
+      if (!stagedCount) {
+        try {
+          await waitForNoVisibleEditDialog(2500);
+        } catch (_) {}
+      }
 
       runCheck({ preserveBatchVerified: true });
 
       /* 重新核对会清空右侧结果区，所以结论卡片放在这之后补进去：
          位置在结果区最上面 —— 先看结论，再看还剩下哪些差异要处理。 */
       renderBatchReportCard(batchReport);
+
+      /* 最后一件事：把页面底部那个「确定」圈出来。改完不点它，一切都是白改。 */
+      if (stagedCount) highlightPageSubmitButton();
     }
   }
 
@@ -11581,7 +12394,8 @@
     if (!report) return "";
 
     const statusText = {
-      saved: "已补齐",
+      saved: "已改好",
+      staged: "已改好",
       skipped: "无需动",
       failed: "失败"
     };
@@ -11596,7 +12410,11 @@
       ...report.items.map(item =>
         [
           `${statusText[item.status] || "失败"}｜${item.sequence} · ${item.code}`,
-          item.note ? `（${item.note}）` : "",
+          item.note
+            ? `（${item.note}）`
+            : item.actionLabel || item.typeLabel
+              ? `（${item.actionLabel || item.typeLabel}）`
+              : "",
           formatItemSeconds(item.ms)
             ? ` ${formatItemSeconds(item.ms)} 秒`
             : ""
@@ -11684,13 +12502,16 @@
 
       report.items.forEach(item => {
         const row = document.createElement("div");
-        row.className = `batch-report-row is-${item.status}`;
+        /* v4.15：staged（已改好、待提交）沿用 saved 的绿色标签，
+           差别写在结论文字里 —— 别多出一种颜色让人以为出了问题。 */
+        row.className =
+          `batch-report-row is-${item.status === "staged" ? "saved" : item.status}`;
 
         const tag = document.createElement("span");
         tag.className = "tag";
         tag.textContent =
-          item.status === "saved"
-            ? "已补齐"
+          item.status === "saved" || item.status === "staged"
+            ? "已改好"
             : item.status === "skipped"
               ? "无需动"
               : "失败";
@@ -11702,7 +12523,10 @@
 
         const why = document.createElement("span");
         why.className = "why";
-        why.textContent = item.note;
+        /* v4.16 没有具体改动时显示"这条做了什么"（补岗位 / 补危害），
+           而不是空白，也不再重复那句统一备注。 */
+        why.textContent = item.note || item.actionLabel || item.typeLabel || "";
+        why.title = item.noteTitle || why.textContent;
 
         const ms = document.createElement("span");
         ms.className = "ms";
@@ -12650,5 +13474,5 @@
   hideToolPanel();
   renderRuleManager();
   requestAnimationFrame(() => enhanceVisibleEditDialogs());
-  console.log("套餐危害因素核对工具 v4.11 运行界面让位版 已加载。");
+  console.log("套餐危害因素核对工具 v4.16 已加载。");
 })();
