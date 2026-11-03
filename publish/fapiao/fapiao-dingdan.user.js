@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.2订单页面
 // @namespace    https://tampermonkey.net/soa-order-invoice/
-// @version      1.30
+// @version      1.31
 // @description  发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -2872,6 +2872,29 @@
     return text === "无商品明细" ? "" : text;
   }
 
+  /* 批量清单里的「创建人 + 时间」。
+     脚本已经把这一格规范成两个 div（姓名 / 时间），并且把两段文本挂到了 td 的
+     data-tm-creator-name / -time 上（prepareCreatorCell）。优先读属性——那是最准的，
+     姓名留空时它还会给出「手工开票」这个显示口径；没有属性（这行还没跑过规范化）
+     才退回读两个 div。 */
+  function getCreatorOfRow(cell) {
+    if (!cell) return { creator: "", creatorTime: "" };
+
+    const name = cell.getAttribute("data-tm-creator-name");
+    const time = cell.getAttribute("data-tm-creator-time");
+    if (name || time) return { creator: name || "", creatorTime: time || "" };
+
+    const divs = cell.querySelectorAll(":scope > div");
+    if (divs.length >= 2) {
+      return {
+        creator: normText(divs[0].innerText),
+        creatorTime: normText(divs[1].innerText),
+      };
+    }
+
+    return { creator: normText(cell.innerText), creatorTime: "" };
+  }
+
   function collectInvoiceRows() {
     const table = document.querySelector(TABLE_SELECTOR);
     if (!table) return [];
@@ -2880,6 +2903,9 @@
     const sellerIdx = indexMap.get("销方公司");
     const customerIdx = indexMap.get("开票客户");
     const amountIdx = indexMap.get(AMOUNT_COLUMN_HEADER);
+    const statusIdx = indexMap.get("当前状态");
+    const creatorIdx = indexMap.get("创建人");
+    const sourceIdx = indexMap.get("来源");
     const applyNoIdx =
       indexMap.get("申请单号") !== undefined
         ? indexMap.get("申请单号")
@@ -2923,6 +2949,18 @@
             ? getAmountText(tr.children[amountIdx])
             : "",
         qtyText: getRowQtyText(applyCode),
+        // 下面几列是 2026-11-03 加的：同客户同金额的几张票，只能靠这几列分辨
+        status:
+          statusIdx !== undefined
+            ? normText(tr.children[statusIdx]?.innerText)
+            : "",
+        ...getCreatorOfRow(
+          creatorIdx !== undefined ? tr.children[creatorIdx] : null
+        ),
+        source:
+          sourceIdx !== undefined
+            ? normText(tr.children[sourceIdx]?.innerText)
+            : "",
       });
     });
 
@@ -3031,7 +3069,8 @@
     let panel = document.getElementById(panelId);
 
     // 新旧两版并存时，同名面板可能是旧版建的（结构、样式都对不上），校验后重建
-    if (panel && panel.dataset.tmBuild !== "2") {
+    // build 3 = 8 列网格 + 表头（2026-11-03），build 2 是原来三列的 flex 版
+    if (panel && panel.dataset.tmBuild !== "3") {
       panel.remove();
       const oldStyle = document.getElementById(panelId + "-style");
       if (oldStyle) oldStyle.remove();
@@ -3051,7 +3090,7 @@
       #${panelId} * { box-sizing: border-box; }
       #${panelId} .tm-batch-box {
         position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
-        width: 620px; max-width: 92vw; max-height: 84vh;
+        width: 980px; max-width: 94vw; max-height: 84vh;
         display: flex; flex-direction: column;
         background: #fff; border-radius: 10px; box-shadow: 0 20px 60px rgba(15,23,42,.28);
       }
@@ -3080,30 +3119,51 @@
         padding: 10px 16px 8px; font-size: 12px; color: #595959; cursor: pointer;
       }
       #${panelId} .tm-batch-count { margin-left: auto; color: #9ca3af; }
+      /* 清单改成「表头 + 8 列网格」（2026-11-03 用户要求）：
+         销方公司 / 开票客户 / 税号 / 金额 / 状态 / 创建人+时间 / 来源。
+         列宽写死的是「内容定长」的那几列（销方简称、税号、金额、状态、时间、来源），
+         只有「开票客户」是 1fr —— 它名字长短最难预料，让它吃剩余空间。
+         min-width 是为了屏幕窄的时候横向滚动，而不是把列挤成一坨。 */
       #${panelId} .tm-batch-list {
+        --tm-batch-grid: 20px 96px minmax(0, 1fr) 152px 96px 92px 128px 78px;
         margin: 0 16px 12px; border: 1px solid #f0f0f0; border-radius: 8px;
         overflow: auto; max-height: 44vh; min-height: 60px;
       }
+      #${panelId} .tm-batch-thead,
       #${panelId} .tm-batch-item {
-        display: flex; align-items: center; gap: 8px;
-        padding: 7px 10px 7px 8px; cursor: pointer; border-bottom: 1px solid #fafafa;
+        display: grid; grid-template-columns: var(--tm-batch-grid);
+        align-items: center; column-gap: 8px;
+        min-width: 900px; padding-left: 8px; padding-right: 10px;
+        /* 两边都要留这 4px，否则表头和行会错开一条竖线的宽度 */
+        border-left: 4px solid transparent;
+      }
+      #${panelId} .tm-batch-thead {
+        position: sticky; top: 0; z-index: 1;
+        height: 30px; background: #fafafa;
+        border-bottom: 1px solid #f0f0f0;
+        color: #8c8c8c; font-size: 12px;
+      }
+      #${panelId} .tm-batch-thead span {
+        min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #${panelId} .tm-batch-item {
+        padding-top: 7px; padding-bottom: 7px; cursor: pointer;
+        border-bottom: 1px solid #fafafa;
         /* 同一家客户只留左边一条 4px 同色竖线，与表格里的同名标记完全一致
            （2026-10-27 统一）：整行铺淡底会和勾选框的选中态混在一起，清单一长就显花。 */
-        border-left: 4px solid var(--tm-group-color, transparent);
+        border-left-color: var(--tm-group-color, transparent);
       }
       #${panelId} .tm-batch-item:last-child { border-bottom: none; }
       #${panelId} .tm-batch-item:hover { background: #fafafa; }
-      #${panelId} .tm-batch-item input { flex: 0 0 auto; margin: 0; }
-      /* 名称 / 税号 分成两列（原来税号紧跟名字后面，名字一长就被推走 ⇒ 整列参差不齐）。
-         两列都定宽 + ellipsis，右边金额再定宽右对齐，三列才能各就各位。 */
-      #${panelId} .tm-batch-item-text {
-        flex: 1 1 auto; min-width: 0;
-        display: grid; grid-template-columns: minmax(0, 1fr) 138px;
-        align-items: center; column-gap: 10px;
+      #${panelId} .tm-batch-item input { margin: 0; }
+      /* 通用单元格：一律单行省略，全量文本塞 title */
+      #${panelId} .tm-batch-c {
+        min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
+      #${panelId} .tm-batch-item-seller { color: #595959; font-size: 12.5px; }
       /* 名称行 = 名字 + 「×N」同名角标（和表格客户格右上角那个同色同口径） */
       #${panelId} .tm-batch-item-name {
-        min-width: 0; display: flex; align-items: center; gap: 6px;
+        display: flex; align-items: center; gap: 6px;
       }
       #${panelId} .tm-batch-item-name-text {
         min-width: 0; font-weight: 600; color: #1f2937;
@@ -3115,18 +3175,29 @@
         color: #fff;
       }
       #${panelId} .tm-batch-item-code {
-        min-width: 0; color: #a8b0bd; font-size: 12px;
-        font-variant-numeric: tabular-nums;
-        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        color: #a8b0bd; font-size: 12px; font-variant-numeric: tabular-nums;
       }
-      /* 右侧金额块：上行金额、下行「数量 × 单价」（和列表金额格下面那行小字同口径）。
-         宽度按最长的小字定：25 × 599 这种 9~11 个字符，84px 装不下，给 104。 */
+      /* 金额块：上行金额、下行「数量 × 单价」（和列表金额格下面那行小字同口径） */
       #${panelId} .tm-batch-item-amount {
-        flex: 0 0 auto; width: 104px;
         display: flex; flex-direction: column; align-items: flex-end; gap: 1px;
         color: #595959; font-variant-numeric: tabular-nums;
       }
       #${panelId} .tm-batch-item-money { font-style: normal; }
+      /* 创建人 + 时间：上行姓名、下行时间（原来格子里就是上下两行，照搬） */
+      #${panelId} .tm-batch-item-creator {
+        display: flex; flex-direction: column; gap: 1px; line-height: 1.3;
+      }
+      #${panelId} .tm-batch-item-creator > b {
+        min-width: 0; font-weight: 400; color: #1f2937; font-size: 12.5px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #${panelId} .tm-batch-item-creator > i {
+        min-width: 0; font-style: normal; color: #a8b0bd; font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #${panelId} .tm-batch-item-status { color: #595959; font-size: 12.5px; }
+      #${panelId} .tm-batch-item-source { color: #8c8c8c; font-size: 12px; }
       #${panelId} .tm-batch-item-qty {
         font-size: 11px; line-height: 1.25; color: #a8b0bd; white-space: nowrap;
       }
@@ -3149,7 +3220,7 @@
 
     panel = document.createElement("div");
     panel.id = panelId;
-    panel.dataset.tmBuild = "2";
+    panel.dataset.tmBuild = "3";
 
     const box = document.createElement("div");
     box.className = "tm-batch-box";
@@ -3284,6 +3355,34 @@
      原来按「首次出现顺序」取号的 BATCH_GROUP_COLORS 已删除：
      顺序取号会导致同一个客户在列表和清单里颜色不一致。 */
 
+  /* 清单表头（2026-11-03 用户指定列序）：销方公司 → 开票客户 → 税号 → 金额
+     → 状态 → 创建人+时间 → 来源。第一格是复选框列，留空（全选在上面那条 bar 里）。
+     列序写死不跟表格的拖拽顺序联动：清单只放这 7 列，位置固定才方便逐行扫。 */
+  const BATCH_HEAD_LABELS = [
+    { label: "销方公司", className: "tm-batch-item-seller" },
+    { label: "开票客户", className: "tm-batch-item-name" },
+    { label: "税号", className: "tm-batch-item-code" },
+    { label: "金额", className: "tm-batch-item-amount" },
+    { label: "状态", className: "tm-batch-item-status" },
+    { label: "创建人 / 时间", className: "tm-batch-item-creator" },
+    { label: "来源", className: "tm-batch-item-source" },
+  ];
+
+  function buildBatchHeadRow() {
+    const head = document.createElement("div");
+    head.className = "tm-batch-thead";
+
+    head.appendChild(document.createElement("span"));
+    BATCH_HEAD_LABELS.forEach((column) => {
+      const cell = document.createElement("span");
+      cell.className = column.className;
+      cell.textContent = column.label;
+      head.appendChild(cell);
+    });
+
+    return head;
+  }
+
   function openBatchPanel() {
     const items = collectInvoiceRows();
     if (!items.length) {
@@ -3297,6 +3396,7 @@
 
     title.textContent = "批量下载发票（共 " + items.length + " 张）";
     list.textContent = "";
+    list.appendChild(buildBatchHeadRow());
 
     // 同一家客户在清单里用同一个色条，而且要求和列表里「一模一样」。
     // 只靠哈希还差一步：撞色时要顺延一格，顺延结果取决于「这一屏有哪几个重复组」，
@@ -3338,17 +3438,23 @@
       const box = document.createElement("input");
       box.type = "checkbox";
       box.value = item.applyCode;
-      box.checked = true;
+      // 2026-11-03 用户要求：打开清单默认一张都不勾，要下哪张自己点
+      box.checked = false;
 
-      const text = document.createElement("span");
-      text.className = "tm-batch-item-text";
+      /* ① 销方公司 */
+      const seller = document.createElement("span");
+      seller.className = "tm-batch-c tm-batch-item-seller";
+      seller.textContent = safeReplaceText(item.seller || "");
+      seller.title = item.seller || "";
 
+      /* ② 开票客户（名字 + 「×N」同名角标） */
       const name = document.createElement("span");
-      name.className = "tm-batch-item-name";
+      name.className = "tm-batch-c tm-batch-item-name";
 
       const nameText = document.createElement("b");
       nameText.className = "tm-batch-item-name-text";
       nameText.textContent = shown;
+      nameText.title = customer || item.customer || "";
       name.appendChild(nameText);
 
       /* 「×N」同名角标（2026-10-28 用户要求）：这张清单里有几张是同一家客户。
@@ -3363,23 +3469,13 @@
         name.appendChild(dup);
       }
 
+      /* ③ 税号 */
       const code = document.createElement("span");
-      code.className = "tm-batch-item-code";
+      code.className = "tm-batch-c tm-batch-item-code";
       code.textContent = item.customerCode || "";
+      code.title = item.customerCode || "";
 
-      text.append(name, code);
-      text.title = [
-        customer || item.customer,
-        item.customerCode,
-        item.seller,
-        item.applyNo || item.applyCode,
-        item.amount,
-        item.qtyText,
-      ]
-        .filter(Boolean)
-        .join(" ｜ ");
-
-      // 金额块：上行金额，下行「数量 × 单价」（与列表里金额格下面那行小字一致）
+      /* ④ 金额块：上行金额，下行「数量 × 单价」（与列表里金额格下面那行小字一致） */
       const amount = document.createElement("span");
       amount.className = "tm-batch-item-amount";
 
@@ -3393,7 +3489,50 @@
 
       amount.append(money, qty);
 
-      row.append(box, text, amount);
+      /* ⑤ 状态（表格里那一格已经过文案替换，显示的就是这里读到的文本） */
+      const status = document.createElement("span");
+      status.className = "tm-batch-c tm-batch-item-status";
+      status.textContent = item.status || "";
+      status.title = item.status || "";
+
+      /* ⑥ 创建人 + 时间：上行姓名、下行时间 */
+      const creator = document.createElement("span");
+      creator.className = "tm-batch-c tm-batch-item-creator";
+
+      const creatorName = document.createElement("b");
+      creatorName.textContent = item.creator || "";
+
+      const creatorTime = document.createElement("i");
+      creatorTime.textContent = item.creatorTime || "";
+
+      creator.append(creatorName, creatorTime);
+      creator.title = [item.creator, item.creatorTime]
+        .filter(Boolean)
+        .join(" ");
+
+      /* ⑦ 来源 */
+      const source = document.createElement("span");
+      source.className = "tm-batch-c tm-batch-item-source";
+      source.textContent = item.source || "";
+      source.title = item.source || "";
+
+      /* 整行的悬停提示：列宽有限，长名字 / 长状态在格子里都会省略，
+         全量（含清单里没有单独占列的申请单号）放这儿，鼠标停一下就全能看全。 */
+      row.title = [
+        item.seller,
+        customer || item.customer,
+        item.customerCode,
+        item.amount,
+        item.qtyText,
+        item.status,
+        [item.creator, item.creatorTime].filter(Boolean).join(" "),
+        item.source,
+        item.applyNo || item.applyCode,
+      ]
+        .filter(Boolean)
+        .join(" ｜ ");
+
+      row.append(box, seller, name, code, amount, status, creator, source);
       list.appendChild(row);
     });
 
