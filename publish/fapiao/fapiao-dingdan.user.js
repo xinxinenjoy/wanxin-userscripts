@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.2订单页面
 // @namespace    https://tampermonkey.net/soa-order-invoice/
-// @version      1.32
+// @version      1.35
 // @description  发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -1305,10 +1305,11 @@
         user-select: none;
       }
 
-      /* 失败行：底色走过亮蓝（撞勾选行）、淡粉（跟白表格不搭）、淡灰（几乎看不出）。
-         现在用淡天蓝，和站点主色同调，能看出分区又不抢眼；失败本身仍靠状态列的红色文字识别。 */
+      /* 失败行：#3945c6 的 10% 淡靛蓝底 + 常规深色字，状态列保持站点红。
+         底色试过亮蓝、淡粉、淡灰、淡天蓝、深靛蓝整行——不是刺眼就是跟白表格不合，
+         最后取主色的极淡版：同色系冷调，和白底协调，又能看出分区。 */
       ${scope} tr.tm-row-fail > td {
-        background: #eaf2ff !important;
+        background: #e6eaf9 !important;
         color: rgba(0, 0, 0, 0.85) !important;
       }
       ${scope} tr.tm-row-fail > td * {
@@ -1317,6 +1318,14 @@
       ${scope} tr.tm-row-fail td[data-tm-status="1"],
       ${scope} tr.tm-row-fail td[data-tm-status="1"] * {
         color: #ff4d4f !important;
+      }
+      /* 操作列的链接别被正文色吞掉 */
+      ${scope} tr.tm-row-fail .optionslist a {
+        color: #1890ff !important;
+      }
+      ${scope} tr.tm-row-fail .optionslist a:hover {
+        color: #096dd9 !important;
+        text-decoration: underline;
       }
     `;
 
