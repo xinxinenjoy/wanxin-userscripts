@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.39
+// @version      6.46
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -238,6 +238,9 @@
   const SOA_CLIENT_ID = "MN_SOA3";
   const TRUTH_REFRESH_MAX_ROWS = 6;
   const TRUTH_REFRESH_GAP_MS = 800;
+  /* 「来源」格点击 → 打开对应订单：拿裸单号查站点自己的订单列表查询（订单中心那个接口） */
+  const ORDER_SEARCH_URL = "/soa/api/v2/order/page";
+  const ORDER_LINK_STYLE_ID = "tm-order-link-style";
 
   /******************** 2) 状态 ********************/
   let enabled = false;
@@ -265,6 +268,9 @@
 
   /* 商品明细：applyCode → { items, at }；items = [{ name, unit, qty, unitPrice, amount }] */
   const detailCache = new Map();
+  /* 发票 → 订单：applyCode → [{ code, name }]。详情接口 orderItemDTOS 给的是裸单号，
+     点「来源」跳转时再拿它去查最新快照版本（-数字 后缀）。 */
+  const orderCodesByApply = new Map();
   const detailFailed = new Set(); // 取不到的行，本次会话不再重试
   const detailRequested = new Set(); // 已入队 / 已请求
   let detailQueue = [];
@@ -1287,9 +1293,19 @@
         user-select: none;
       }
 
-      ${scope} tr.tm-row-fail > td { background: rgb(35,127,254) !important; }
-      ${scope} tr.tm-row-fail,
-      ${scope} tr.tm-row-fail * { color: #fff !important; }
+      /* 失败行：底色走过亮蓝（撞勾选行）、淡粉（跟白表格不搭）、淡灰（几乎看不出）。
+         现在用淡天蓝，和站点主色同调，能看出分区又不抢眼；失败本身仍靠状态列的红色文字识别。 */
+      ${scope} tr.tm-row-fail > td {
+        background: #eaf2ff !important;
+        color: rgba(0, 0, 0, 0.85) !important;
+      }
+      ${scope} tr.tm-row-fail > td * {
+        color: inherit !important;
+      }
+      ${scope} tr.tm-row-fail td[data-tm-status="1"],
+      ${scope} tr.tm-row-fail td[data-tm-status="1"] * {
+        color: #ff4d4f !important;
+      }
     `;
 
     // 同名客户的竖线只画在「视觉第一列」上，所以先找出排第一且没隐藏的那一列
@@ -1383,6 +1399,12 @@
         text-overflow: ellipsis !important;
         white-space: nowrap !important;
         vertical-align: middle;
+      }
+      /* 站点自带的错因气泡（img 旁的 .ant-tooltip，常显、absolute 定位、宽度随文案涨）
+         不再让它露脸：文案一长就横穿相邻列，短文案又会被左侧相邻格压住。
+         改由脚本按鼠标位置浮一个（见 6.10）。 */
+      ${scope} td[data-tm-status="1"] .ant-tooltip {
+        display: none !important;
       }
     `;
 
@@ -1596,6 +1618,12 @@
       if (replaced !== rawFull) setCellTextKeepStructure(cell, replaced);
     }
 
+    // 「来源」格：点一下直接打开这张发票对应的 SOA 订单（自动取最新快照版本）
+    const sourceIdx = columnIndexes.get("来源");
+    if (sourceIdx !== undefined && cells[sourceIdx]) {
+      ensureSourceOrderLink(cells[sourceIdx], tr);
+    }
+
     if (
       amountIdx !== undefined &&
       cells[amountIdx] &&
@@ -1609,6 +1637,8 @@
 
     // 给状态格打标记：上面那套「放开溢出、让站点气泡不被裁」的 CSS 靠它定位
     cells[statusIdx].setAttribute("data-tm-status", "1");
+    // 错因不再用站点那块常显气泡，改由 6.10 的浮层按鼠标位置显示
+    bindStatusTip(cells[statusIdx]);
 
     tr.classList.remove("tm-row-fail", "tm-row-refund");
     const statusText = normText(cells[statusIdx].innerText);
@@ -4199,6 +4229,19 @@
 
     setDetailCache(applyCode, normalizeDetailItems(data.taxableList));
 
+    // 详情响应里还带着这张发票对应的订单（orderItemDTOS）—— 裸单号，留给「来源」格点击用
+    const orderItems = Array.isArray(data.orderItemDTOS) ? data.orderItemDTOS : [];
+    if (orderItems.length) {
+      const codes = [];
+      orderItems.forEach((item) => {
+        const code = item && typeof item.orderCode === "string" ? item.orderCode.trim() : "";
+        if (code && !codes.some((entry) => entry.code === code)) {
+          codes.push({ code, name: typeof item.orderName === "string" ? item.orderName : "" });
+        }
+      });
+      if (codes.length) orderCodesByApply.set(applyCode, codes);
+    }
+
     const sellerName =
       typeof data.contractCompanyName === "string" ? data.contractCompanyName : "";
     if (sellerName && sellerTruth.get(applyCode) !== sellerName) {
@@ -4219,6 +4262,294 @@
     } catch (error) {
       return false;
     }
+  }
+
+  /******************** 6.9) 「来源」格 → 点击打开对应 SOA 订单 ********************/
+  /* 发票详情只给裸单号；订单改过会生成新记录，order_code = 裸单号 + "-" + N（每改一次 +1）。
+     所以点击时模拟订单中心的查询：query_words = 裸单号，从返回行里取 order_code 完整值
+     （就是最新版本），再打开 #/order/info?orderCode=完整值。
+     实测：发票 INVOICE37937608398280161 → 裸号 SOA37670624240390844
+     → 查询返回 SOA37670624240390844-1 → 打开的即最新版本。 */
+  /* 静止态只在文字下留一道很淡的点线（取当前文字色 45% 透明），
+     表格行被勾选成蓝底白字时也协调；hover 转实线下划线，按下微微变淡。 */
+  const ORDER_LINK_CSS = `
+      td[data-tm-order-link="1"] {
+        cursor: pointer;
+        text-decoration: underline dotted;
+        text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+        text-decoration-thickness: 1px;
+        text-underline-offset: 3px;
+        transition: text-decoration-color .12s ease;
+      }
+      td[data-tm-order-link="1"]:hover {
+        text-decoration: underline solid;
+        text-decoration-color: currentColor;
+      }
+      td[data-tm-order-link="1"]:hover * { text-decoration: underline; }
+      td[data-tm-order-link="1"]:active { opacity: .6; }
+      td[data-tm-order-link="1"][data-tm-order-busy="1"] { opacity: .45; cursor: progress; }
+    `;
+
+  function ensureOrderLinkStyle() {
+    const existing = document.getElementById(ORDER_LINK_STYLE_ID);
+    if (existing && existing.textContent === ORDER_LINK_CSS) return;
+
+    const style = existing || document.createElement("style");
+    style.id = ORDER_LINK_STYLE_ID;
+    style.textContent = ORDER_LINK_CSS;
+    if (!existing) document.head.appendChild(style);
+  }
+
+  function getRowOrderCode(tr) {
+    const applyCode = getRowApplyCode(tr);
+    const list = applyCode ? orderCodesByApply.get(applyCode) : null;
+    return list && list.length ? list[0].code : "";
+  }
+
+  /* 裸单号 → 最新完整 order_code。query_words 是模糊查，必须再按主单号精确挑一遍 */
+  async function resolveLatestOrderCode(code) {
+    const bare = String(code || "").split("-")[0];
+    if (!bare) return "";
+
+    try {
+      const response = await fetch(ORDER_SEARCH_URL, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          mnClientId: SOA_CLIENT_ID,
+        },
+        body: JSON.stringify({
+          page_index: 1,
+          page_size: 10,
+          statuses: [],
+          type: "LOCAL",
+          region_code: soaRegionCode || "XX",
+          standard_version: 2,
+          query_words: bare,
+          sort_type: { create_time: "down" },
+        }),
+      });
+      const json = await response.json();
+      const items =
+        (json && json.data && json.data.respPagination && json.data.respPagination.items) || [];
+
+      let best = "";
+      let bestVersion = -1;
+      items.forEach((item) => {
+        const full = item && typeof item.order_code === "string" ? item.order_code : "";
+        if (!full) return;
+        if (item.main_order_code !== bare && full !== bare && !full.startsWith(bare + "-")) {
+          return;
+        }
+        const version = full === bare ? 0 : Number(full.slice(bare.length + 1)) || 0;
+        if (version > bestVersion) {
+          bestVersion = version;
+          best = full;
+        }
+      });
+      return best;
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function openOrderPage(fullCode) {
+    const url = `${location.origin}/#/order/info?oper=check&orderCode=${encodeURIComponent(
+      fullCode
+    )}`;
+    // 新标签页打开：发票列表还在，核对完切回来继续开票
+    window.open(url, "_blank", "noopener");
+  }
+
+  async function openOrderForRow(cell, tr) {
+    if (cell.dataset.tmOrderBusy === "1") return;
+    cell.dataset.tmOrderBusy = "1";
+
+    try {
+      let bare = getRowOrderCode(tr);
+
+      // 详情还没拉到时现取一次（正常情况下明细队列早就拉过了）
+      if (!bare) {
+        const applyCode = getRowApplyCode(tr);
+        if (applyCode) {
+          const data = await fetchDetailData(applyCode);
+          if (data) absorbDetailData(data);
+          bare = getRowOrderCode(tr);
+        }
+      }
+
+      if (!bare) {
+        showDownloadTip("这张发票没找到对应的订单号", false, 2200);
+        return;
+      }
+
+      // 每次都现查：订单随时可能被改出新版本，缓存反而会跳到旧快照上
+      const full = (await resolveLatestOrderCode(bare)) || bare;
+      openOrderPage(full);
+    } finally {
+      cell.dataset.tmOrderBusy = "";
+    }
+  }
+
+  function ensureSourceOrderLink(cell, tr) {
+    if (!cell) return;
+
+    ensureOrderLinkStyle();
+    cell.setAttribute("title", "点击打开对应 SOA 订单（自动定位最新快照版本）");
+
+    if (cell.dataset.tmOrderLink === "1") return;
+    cell.dataset.tmOrderLink = "1";
+    cell.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openOrderForRow(cell, tr);
+    });
+  }
+
+  /******************** 6.10) 「当前状态」格的错因：改为贴在感叹号右侧的浮层 ********************/
+  /* 站点把错因做成 img.errtipstyle 旁边一块常显的 .ant-tooltip（placement-left、absolute）。
+     问题：宽度跟着文案涨，长文案（如「纳税人 xxx 未登录或登录已失效…」）会横穿好几列；
+     短文案又会因为 left: -43px 跑到格子左侧、被相邻列压住。
+     这里只留文案，自己画一层：平时不显示，鼠标进到该格才浮出来，固定贴在感叹号右侧，
+     宽度封顶 340px 自动换行；右边放不下就翻到图标左侧，下边放不下就往上顶。 */
+  const STATUS_TIP_ID = "tm-status-tip";
+
+  function ensureStatusTipEl() {
+    let tip = document.getElementById(STATUS_TIP_ID);
+    if (tip) return tip;
+
+    const style = document.createElement("style");
+    style.id = STATUS_TIP_ID + "-style";
+    style.textContent = `
+      #${STATUS_TIP_ID} {
+        position: fixed; z-index: 2147483402; display: none;
+        box-sizing: border-box;
+        min-width: 96px; max-width: 340px;
+        padding: 7px 10px;
+        background: rgba(28, 32, 38, .96);
+        color: #fff;
+        border-radius: 6px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, .26);
+        font: 12px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        pointer-events: none;
+      }
+    `;
+    document.head.appendChild(style);
+
+    tip = document.createElement("div");
+    tip.id = STATUS_TIP_ID;
+    document.body.appendChild(tip);
+
+    // 页面/表格一滚，fixed 浮层就悬在原地了，直接收掉
+    document.addEventListener("scroll", hideStatusTip, true);
+    window.addEventListener("blur", hideStatusTip);
+
+    return tip;
+  }
+
+  /* 固定贴在锚点（那个红色感叹号）右侧，垂直居中对齐图标；右边放不下就翻到图标左侧。
+     不跟鼠标走 —— 鼠标在格子内怎么动，气泡都待在同一处，看文案时更稳。 */
+  function showStatusTip(text, anchor) {
+    if (!text) return;
+
+    const tip = ensureStatusTipEl();
+    tip.textContent = text;
+    tip.style.display = "block";
+
+    const rect = tip.getBoundingClientRect();
+    const base = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+    const gap = 8;
+
+    let left = 8;
+    let top = 8;
+
+    if (base) {
+      left = base.right + gap;
+      top = base.top + base.height / 2 - rect.height / 2;
+      // 右侧放不下就贴到图标左边
+      if (left + rect.width > window.innerWidth - 8) left = base.left - rect.width - gap;
+    }
+
+    if (left < 8) left = 8;
+    if (top < 8) top = 8;
+    if (top + rect.height > window.innerHeight - 8) top = window.innerHeight - rect.height - 8;
+
+    tip.style.left = Math.round(left) + "px";
+    tip.style.top = Math.round(top) + "px";
+  }
+
+  function hideStatusTip() {
+    const tip = document.getElementById(STATUS_TIP_ID);
+    if (tip && tip.style.display !== "none") tip.style.display = "none";
+  }
+
+  /* 只有真的带错因的格子才绑：普通行的状态格既没有错误图标、也没有气泡节点，直接返回。
+     注意站点那个 .ant-tooltip 是 **鼠标移入时才挂 DOM** 的（antd Tooltip 默认 trigger=hover），
+     而且 React 的事件代理挂在 root 上、晚于挂在格子上的原生监听器执行 ——
+     所以 mouseenter 里立刻读文案必然是空的，得等它把节点挂上来（实测 2026-11-04）。 */
+  function readStatusTipText(cell) {
+    const inner = cell.querySelector(".ant-tooltip-inner");
+    const icon = cell.querySelector(".errtipstyle");
+    return String(
+      (inner && inner.textContent) || (icon && icon.getAttribute("title")) || ""
+    ).trim();
+  }
+
+  function bindStatusTip(cell) {
+    if (!cell || cell.dataset.tmStatusTip === "1") return;
+    if (!cell.querySelector(".errtipstyle, .ant-tooltip-inner")) return;
+
+    cell.dataset.tmStatusTip = "1";
+
+    // 每个格子一份：token 用来作废「鼠标已经走了」的补读，observer 盯站点气泡挂载
+    let token = 0;
+    let observer = null;
+
+    const drop = () => {
+      token++;
+      if (observer) {
+        observer.disconnect();
+        observer = null;
+      }
+      hideStatusTip();
+    };
+
+    cell.addEventListener("mouseenter", () => {
+      const mine = ++token;
+
+      const tryShow = () => {
+        if (mine !== token) return true; // 鼠标已离开，别再弹
+        const text = readStatusTipText(cell);
+        if (!text) return false;
+        const icon = cell.querySelector(".errtipstyle");
+        showStatusTip(text, icon || cell);
+        return true;
+      };
+
+      if (tryShow()) return;
+
+      if (observer) observer.disconnect();
+      observer = new MutationObserver(() => {
+        if (tryShow() && observer) {
+          observer.disconnect();
+          observer = null;
+        }
+      });
+      observer.observe(cell, { childList: true, subtree: true });
+
+      // 站点一直没挂气泡（这行其实没文案）就别再盯着了
+      setTimeout(() => {
+        if (observer && mine === token) {
+          observer.disconnect();
+          observer = null;
+        }
+      }, 1500);
+    });
+
+    cell.addEventListener("mouseleave", drop);
   }
 
   /********** 浮层：鼠标停在金额格上看完整明细 **********/
