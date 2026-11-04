@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.2订单页面
 // @namespace    https://tampermonkey.net/soa-order-invoice/
-// @version      1.31
+// @version      1.32
 // @description  发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -1305,9 +1305,19 @@
         user-select: none;
       }
 
-      ${scope} tr.tm-row-fail > td { background: rgb(35,127,254) !important; }
-      ${scope} tr.tm-row-fail,
-      ${scope} tr.tm-row-fail * { color: #fff !important; }
+      /* 失败行：底色走过亮蓝（撞勾选行）、淡粉（跟白表格不搭）、淡灰（几乎看不出）。
+         现在用淡天蓝，和站点主色同调，能看出分区又不抢眼；失败本身仍靠状态列的红色文字识别。 */
+      ${scope} tr.tm-row-fail > td {
+        background: #eaf2ff !important;
+        color: rgba(0, 0, 0, 0.85) !important;
+      }
+      ${scope} tr.tm-row-fail > td * {
+        color: inherit !important;
+      }
+      ${scope} tr.tm-row-fail td[data-tm-status="1"],
+      ${scope} tr.tm-row-fail td[data-tm-status="1"] * {
+        color: #ff4d4f !important;
+      }
     `;
 
     // 同名客户的竖线只画在「视觉第一列」上，所以先找出排第一且没隐藏的那一列
@@ -1401,6 +1411,12 @@
         text-overflow: ellipsis !important;
         white-space: nowrap !important;
         vertical-align: middle;
+      }
+      /* 站点自带的错因气泡（img 旁的 .ant-tooltip，常显、absolute 定位、宽度随文案涨）
+         不再让它露脸：文案一长就横穿相邻列，短文案又会被左侧相邻格压住。
+         改由脚本按感叹号位置浮一个（见 6.10）。 */
+      ${scope} td[data-tm-status="1"] .ant-tooltip {
+        display: none !important;
       }
     `;
 
@@ -1627,6 +1643,8 @@
 
     // 给状态格打标记：上面那套「放开溢出、让站点气泡不被裁」的 CSS 靠它定位
     cells[statusIdx].setAttribute("data-tm-status", "1");
+    // 错因不再用站点那块常显气泡，改由 6.10 的浮层贴在感叹号右侧显示
+    bindStatusTip(cells[statusIdx]);
 
     tr.classList.remove("tm-row-fail", "tm-row-refund");
     const statusText = normText(cells[statusIdx].innerText);
@@ -4237,6 +4255,151 @@
     } catch (error) {
       return false;
     }
+  }
+
+  /******************** 6.10) 「当前状态」格的错因：改为贴在感叹号右侧的浮层 ********************/
+  /* 站点把错因做成 img.errtipstyle 旁边一块常显的 .ant-tooltip（placement-left、absolute）。
+     问题：宽度跟着文案涨，长文案（如「纳税人 xxx 未登录或登录已失效…」）会横穿好几列；
+     短文案又会因为 left: -43px 跑到格子左侧、被相邻列压住。
+     这里只留文案，自己画一层：平时不显示，鼠标进到该格才浮出来，固定贴在感叹号右侧，
+     宽度封顶 340px 自动换行；右边放不下就翻到图标左侧，下边放不下就往上顶。 */
+  const STATUS_TIP_ID = "tm-status-tip";
+
+  function ensureStatusTipEl() {
+    let tip = document.getElementById(STATUS_TIP_ID);
+    if (tip) return tip;
+
+    const style = document.createElement("style");
+    style.id = STATUS_TIP_ID + "-style";
+    style.textContent = `
+      #${STATUS_TIP_ID} {
+        position: fixed; z-index: 2147483402; display: none;
+        box-sizing: border-box;
+        min-width: 96px; max-width: 340px;
+        padding: 7px 10px;
+        background: rgba(28, 32, 38, .96);
+        color: #fff;
+        border-radius: 6px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, .26);
+        font: 12px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        pointer-events: none;
+      }
+    `;
+    document.head.appendChild(style);
+
+    tip = document.createElement("div");
+    tip.id = STATUS_TIP_ID;
+    document.body.appendChild(tip);
+
+    // 页面/表格一滚，fixed 浮层就悬在原地了，直接收掉
+    document.addEventListener("scroll", hideStatusTip, true);
+    window.addEventListener("blur", hideStatusTip);
+
+    return tip;
+  }
+
+  /* 固定贴在锚点（那个红色感叹号）右侧，垂直居中对齐图标；右边放不下就翻到图标左侧。
+     不跟鼠标走 —— 鼠标在格子内怎么动，气泡都待在同一处，看文案时更稳。 */
+  function showStatusTip(text, anchor) {
+    if (!text) return;
+
+    const tip = ensureStatusTipEl();
+    tip.textContent = text;
+    tip.style.display = "block";
+
+    const rect = tip.getBoundingClientRect();
+    const base = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+    const gap = 8;
+
+    let left = 8;
+    let top = 8;
+
+    if (base) {
+      left = base.right + gap;
+      top = base.top + base.height / 2 - rect.height / 2;
+      // 右侧放不下就贴到图标左边
+      if (left + rect.width > window.innerWidth - 8) left = base.left - rect.width - gap;
+    }
+
+    if (left < 8) left = 8;
+    if (top < 8) top = 8;
+    if (top + rect.height > window.innerHeight - 8) top = window.innerHeight - rect.height - 8;
+
+    tip.style.left = Math.round(left) + "px";
+    tip.style.top = Math.round(top) + "px";
+  }
+
+  function hideStatusTip() {
+    const tip = document.getElementById(STATUS_TIP_ID);
+    if (tip && tip.style.display !== "none") tip.style.display = "none";
+  }
+
+  /* 只有真的带错因的格子才绑：普通行的状态格既没有错误图标、也没有气泡节点，直接返回。
+     注意站点那个 .ant-tooltip 是 **鼠标移入时才挂 DOM** 的（antd Tooltip 默认 trigger=hover），
+     而且 React 的事件代理挂在 root 上、晚于挂在格子上的原生监听器执行 ——
+     所以 mouseenter 里立刻读文案必然是空的，得等它把节点挂上来（实测 2026-11-04）。 */
+  function readStatusTipText(cell) {
+    const inner = cell.querySelector(".ant-tooltip-inner");
+    const icon = cell.querySelector(".errtipstyle");
+    return String(
+      (inner && inner.textContent) || (icon && icon.getAttribute("title")) || ""
+    ).trim();
+  }
+
+  function bindStatusTip(cell) {
+    if (!cell || cell.dataset.tmStatusTip === "1") return;
+    if (!cell.querySelector(".errtipstyle, .ant-tooltip-inner")) return;
+
+    cell.dataset.tmStatusTip = "1";
+
+    // 每个格子一份：token 用来作废「鼠标已经走了」的补读，observer 盯站点气泡挂载
+    let token = 0;
+    let observer = null;
+
+    const drop = () => {
+      token++;
+      if (observer) {
+        observer.disconnect();
+        observer = null;
+      }
+      hideStatusTip();
+    };
+
+    cell.addEventListener("mouseenter", () => {
+      const mine = ++token;
+
+      const tryShow = () => {
+        if (mine !== token) return true; // 鼠标已离开，别再弹
+        const text = readStatusTipText(cell);
+        if (!text) return false;
+        const icon = cell.querySelector(".errtipstyle");
+        showStatusTip(text, icon || cell);
+        return true;
+      };
+
+      if (tryShow()) return;
+
+      if (observer) observer.disconnect();
+      observer = new MutationObserver(() => {
+        if (tryShow() && observer) {
+          observer.disconnect();
+          observer = null;
+        }
+      });
+      observer.observe(cell, { childList: true, subtree: true });
+
+      // 站点一直没挂气泡（这行其实没文案）就别再盯着了
+      setTimeout(() => {
+        if (observer && mine === token) {
+          observer.disconnect();
+          observer = null;
+        }
+      }, 1500);
+    });
+
+    cell.addEventListener("mouseleave", drop);
   }
 
   /********** 浮层：鼠标停在金额格上看完整明细 **********/
