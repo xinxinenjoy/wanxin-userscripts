@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.49
+// @version      6.50
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -1258,6 +1258,17 @@
       }
       ${scope} .ant-table-body td[data-tm-amount="1"] > .tm-qty-hint.is-empty {
         color: #c2c8d0;
+      }
+      /* 只填了数量、没填单位（业务上确有这种特殊开票）：不当成错误、也不变红，
+         只在数字下面压一条浅虚线作记号 —— 具体提示在 hover 浮层的脚注里（.tm-detail-note）。
+         ⚠️ 用 text-decoration 而不是 border-bottom：下划线不占行高，
+            上面算好的「5 + 15 + 13 + 2 = 35px」不会被这一笔画破。 */
+      ${scope} .ant-table-body td[data-tm-amount="1"] > .tm-qty-hint.is-no-unit {
+        text-decoration: underline dashed;
+        text-decoration-color: #d5dae1;
+        text-decoration-thickness: 1px;
+        text-underline-offset: 2px;
+        cursor: help;
       }
 
       ${scope} tr.tm-row-refund,
@@ -3916,11 +3927,11 @@
   /******************** 8.6) 商品明细：详情接口 → 金额格小字 + 悬停浮层 ********************/
   /* 列表接口（/invoice/merge/list）只给一个 custCount 汇总人数，逐行明细只存在详情接口里。
      ⇒ 对当前页每一行单独查一次详情（串行 + 间隔 70ms + 缓存 10 分钟），拿到 taxableList 后：
-        ① 金额格下面挂一行「数量 × 单价」；
+        ① 金额格下面挂一行「30人×685」（数量 + 单位 + 单价）；
         ② 鼠标停在金额格上 → 浮层里看完整明细（商品名称 / 单位 / 数量 / 单价 / 价税合计）。
 
      单价页面不提供，用 amount / taxableCustCount 现算（4200 / 12 = 350）。
-     ⚠️ 数量留空时这个键是 undefined（不是 0）⇒ 算不出单价，就标「数量未填」，不瞎猜。 */
+     ⚠️ 数量留空时这个键是 undefined（不是 0）⇒ 算不出单价，就标「不写明细」，不瞎猜。 */
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -4079,28 +4090,48 @@
     true
   );
 
-  // 金额格下面那行小字：单行「12 × 350」；多行只写「多条明细」。
+  // 金额格下面那行小字：单行「30人×685」；多行只写「多条明细」。
   /* ⚠️ 多行**不算**「合计人数 × 均价」（用户 2026-10-27 明确否掉）：
      不同商品单价本来就不一样，把人数相加再拿总金额除，得到的「均价」没有参考意义。
      而且「4 项 · 522 × 335.63」这种长串会把金额列硬生生撑宽。
-     想看每一行的人数/单价 → 鼠标停在金额格上，浮层里逐行列着，那才是有意义的。 */
+     想看每一行的人数/单价 → 鼠标停在金额格上，浮层里逐行列着，那才是有意义的。
+
+     ⚠️ 2026-11-05 用户口径：
+       ① 数量留空 ⇒ 这张票是「不写明细」开的（只有金额、没开数量单位和单价），
+          打「不写明细」。原来叫「数量未填」，容易被读成「这里漏填了」。
+       ② 有数量就把单位夹在数量和单价中间：30人×685（单位原样照抄明细里的「单位」列）。
+          不加空格是为了别把金额列撑宽 —— 这行是 nowrap + 省略号，多一个字就可能被截。
+       ③ 只写了数量、没写单位 **不算错**（业务上确有这种特殊开票）：
+          照常显示「30×685」，数字下面压一条浅虚线；提示本身放进 hover 浮层底部的脚注里。
+          ⛔ 别用原生 title 提示 —— 金额格的浮层 220ms 就自己弹了，原生 tooltip 随后又压上来，
+             两个框叠在一起（状态格那边就是因为同样的原因把站点 tooltip 屏蔽了）。 */
+  const NO_DETAIL_LABEL = "不写明细";
+  const NO_UNIT_NOTE = "明细里只填了数量、没填单位（业务允许，不算错）";
+
   function buildDetailSummary(items) {
     if (!items.length) return "无商品明细";
 
     if (items.length === 1) {
       const item = items[0];
-      if (item.qty === null) return "数量未填";
-      if (item.unitPrice === null) return formatQty(item.qty);
-      return formatQty(item.qty) + " × " + formatPrice(item.unitPrice);
+      if (item.qty === null) return NO_DETAIL_LABEL;
+      const qtyText = formatQty(item.qty) + (item.unit || "");
+      if (item.unitPrice === null) return qtyText;
+      return qtyText + "×" + formatPrice(item.unitPrice);
     }
 
     return "多条明细";
+  }
+
+  // 「只写了数量、没写单位」：单条明细 + 有数量 + 单位空。不算错，只提示。
+  function isQtyWithoutUnit(items) {
+    return items.length === 1 && items[0].qty !== null && !items[0].unit;
   }
 
   function renderDetailHint(cell, items) {
     if (!cell) return;
 
     const text = buildDetailSummary(items);
+    const noUnit = isQtyWithoutUnit(items);
     cell.setAttribute("data-tm-amount", "1");
 
     let hint = cell.querySelector(":scope > .tm-qty-hint");
@@ -4113,10 +4144,9 @@
 
     // ⚠️ 同值不写：脚本自己盯着整张表，写回一样的值也算一次变更
     if (hint.textContent !== text) hint.textContent = text;
-    hint.classList.toggle(
-      "is-empty",
-      text === "数量未填" || text === "无商品明细" || text.indexOf("数量未填") !== -1
-    );
+    // 缺单位只加一条浅虚线作记号，提示文案在浮层脚注里（见 NO_UNIT_NOTE），不改字色、不拦截
+    hint.classList.toggle("is-no-unit", noUnit);
+    hint.classList.toggle("is-empty", text === NO_DETAIL_LABEL || text === "无商品明细");
   }
 
   // 每行处理时都会走到这里：缓存命中直接画，没命中就排队
@@ -4614,6 +4644,10 @@
         border-top: 1px solid #e8ebf0; margin-top: 3px; padding-top: 6px; font-weight: 500;
       }
       #${DETAIL_POP_ID} .tm-detail-empty { color: #97a1ae; padding: 8px 0 2px; }
+      /* 「只填了数量没填单位」的脚注：灰字、不标红 —— 业务允许，只是提醒一句 */
+      #${DETAIL_POP_ID} .tm-detail-note {
+        margin-top: 5px; font-size: 11px; line-height: 15px; color: #97a1ae;
+      }
     `;
     document.head.appendChild(style);
 
@@ -4692,12 +4726,21 @@
       "合计 " +
       items.length +
       " 项" +
-      (knownQty.length ? " · " + formatQty(totalQty) + (unit ? " " + unit : "") : " · 数量未填");
+      (knownQty.length ? " · " + formatQty(totalQty) + (unit ? " " + unit : "") : " · " + NO_DETAIL_LABEL);
     totalRow.append(
       totalLabel,
       buildDetailCell("tm-detail-amount", formatPrice(totalAmount))
     );
     pop.appendChild(totalRow);
+
+    /* 有数量却没单位（业务允许的特殊开票）：脚注里说一句就完事 ——
+       ⛔ 不算错、不标红、不拦操作；金额格那行只留一条浅虚线作记号（见 .is-no-unit）。 */
+    if (items.some((item) => item.qty !== null && !item.unit)) {
+      const note = document.createElement("div");
+      note.className = "tm-detail-note";
+      note.textContent = NO_UNIT_NOTE;
+      pop.appendChild(note);
+    }
   }
 
   function positionDetailPop(pop, cell) {
