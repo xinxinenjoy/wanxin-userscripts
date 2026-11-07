@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.6制卡管理查询
 // @namespace    https://tampermonkey.net/
-// @version      0.5.8
+// @version      0.5.11
 // @description  查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
@@ -55,7 +55,7 @@
   const PANEL_VIEWPORT_MARGIN = 40;
 
   // 版本号单一来源：改动时与文件头 @version 一并同步
-  const SCRIPT_VERSION = '0.5.8';
+  const SCRIPT_VERSION = '0.5.11';
 
   const PROCESS_API = '/soa-card/api/v1/bqcard/process/page';
   const POOL_API = '/soa-card/api/v1/card/business/pool/display';
@@ -1188,6 +1188,27 @@
   const FIXED_CARD_CATEGORIES = ['贵宾', '邀约', '核磁', 'CT'];
   const CARD_CATEGORY_ORDER = [...FIXED_CARD_CATEGORIES, '其他'];
 
+  // 卡种口径（红领巾 2026-11-07 定）：**只有 贵宾 / 邀约 / 核磁 / CT 四类，归到「其他」的整类不要**。
+  //
+  // 「其他」= 储值卡、电商卡等非制卡类。它在面板里**既不显示、也不计数** ——
+  // 矩阵不出「其他」行、进度表不出「其他」列、简报也不提「其他类型 N 张」
+  // （09:13 先要「显示但不计数」，09:16 改口「连显示也不需要」⇒ 最终整类剔除）。
+  //
+  // 起因：v0.5.8 及以前「已办理」取名下全部卡张数，只要有一张「其他」就会顶超计划
+  // （实测牛新芝：贵宾25 + 邀约3 + 核磁4 + 其他1 = 33，计划 30 ⇒ 虚报「超 3 张」，实际超 2 张）。
+  //
+  // 所以：**入口过滤一次，展示与计数共用同一份卡** ——
+  //   summarizePersonnel / countCardsForNames / buildDepartmentProgress / buildPersonProgress / 搜索索引
+  // 全走 filterCountedCards，矩阵「数量」列相加 == 已办理，任何一处都对得上。
+  // ⛔ 别再拆「展示用全量、计数用四类」那两套（0.5.10 试过，他不要）。
+  function isCountedCard(card) {
+    return FIXED_CARD_CATEGORIES.includes(getCardCategoryLabel(card?.activity_name));
+  }
+
+  function filterCountedCards(cards) {
+    return (Array.isArray(cards) ? cards : []).filter(isCountedCard);
+  }
+
   // 把一批卡按卡种聚合，返回**全键**计数（没出现的卡种补 0）。
   // v0.4.0 只返回出现过的卡种（数组）。那时卡种是缀在姓名后面的小标签，缺项无所谓；
   // 现在卡种是固定列，缺一个键整行数量就会左移一格、列语义全错 —— 必须给全键。
@@ -1323,7 +1344,8 @@
       ? names
       : new Set(Array.isArray(names) ? names : []);
 
-    return (Array.isArray(cards) ? cards : [])
+    // 与 summarizePersonnel 同一个口径：只数四类卡，否则下拉里的「x/y」会和下面的 KPI 打架。
+    return filterCountedCards(cards)
       .filter((card) => set.has(getCardSaleName(card)))
       .length;
   }
@@ -1347,7 +1369,8 @@
     return DEPARTMENT_ORDER.map((department) => {
       const people = PERSONNEL_PLAN.filter((item) => item.department === department);
       const plan = getPlanForPeople(people);
-      const deptCards = people.flatMap((item) => grouped.get(item.name) || []);
+      // 「其他」整类剔除（见 filterCountedCards）⇒ 列、行、剩余/超出全部同源。
+      const deptCards = filterCountedCards(people.flatMap((item) => grouped.get(item.name) || []));
       const current = deptCards.length;
 
       return {
@@ -1372,7 +1395,8 @@
     const grouped = groupCardsBySaleName(cards);
 
     return people.map((item) => {
-      const personCards = grouped.get(item.name) || [];
+      // 同部门视角：单一口径，其他整类剔除。
+      const personCards = filterCountedCards(grouped.get(item.name) || []);
       const current = personCards.length;
       const plan = Number(item.plan || 0);
 
@@ -1390,8 +1414,9 @@
   function summarizePersonnel(cards, department = '全部部门', personName = '全部人员') {
     const people = getPersonnelBase(department, personName);
     const names = new Set(people.map((x) => x.name));
-    const matchedCards = (Array.isArray(cards) ? cards : []).filter(
-      (card) => names.has(getCardSaleName(card))
+    // 「其他」整类剔除（见 filterCountedCards）⇒ 展示、计数、点开明细全部同源这一份。
+    const matchedCards = filterCountedCards(
+      (Array.isArray(cards) ? cards : []).filter((card) => names.has(getCardSaleName(card)))
     );
 
     const plan = people.reduce((sum, x) => sum + Number(x.plan || 0), 0);
@@ -4006,11 +4031,6 @@
       <div class="hlj-brief-line">
         <span>查询区间 <b>${escapeHtml(queryStart)} ～ ${escapeHtml(queryEnd)}</b></span>
         <span>本次卡池数据 <b>${cards.length}</b> 张</span>
-        ${
-          Number(categorySummary.other || 0) > 0
-            ? `<span class="is-muted">其他类型 <b>${Number(categorySummary.other || 0)}</b> 张</span>`
-            : ''
-        }
         <span class="is-muted">更新时间：${escapeHtml(data.updatedAt || '-')}</span>
       </div>
 
@@ -4482,6 +4502,7 @@
       `;
     };
 
+    // 「其他」整类不显示（红领巾 2026-11-07 09:16 定）—— 数据层已过滤，这里只会拿到四类。
     const rowHtml = cardRows.map((row) => `
       <tr>
         <td>${escapeHtml(row.category)}</td>
@@ -4862,7 +4883,8 @@
       return PERSONNEL_PLAN.map((item) => ({
         department: item.department,
         name: item.name,
-        current: (grouped.get(item.name) || []).length,
+        // 只数四类卡，搜索结果里显示的进度与下拉 / KPI 保持一致
+        current: filterCountedCards(grouped.get(item.name) || []).length,
         plan: Number(item.plan || 0),
       }));
     })();
