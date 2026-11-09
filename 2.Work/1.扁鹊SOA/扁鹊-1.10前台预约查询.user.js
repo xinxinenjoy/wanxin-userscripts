@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.10前台预约查询
 // @namespace    https://tampermonkey.net/
-// @version      1.6.0
+// @version      1.9.3
 // @description  在 SOA 顶部工具组加一个「前台预约查询」入口：一个输入框，自动识别填的是预约单号还是身份证号；未到检一次查全部分院，已到检/已取消再按玫瑰园 → 宝龙 → 长垣 逐院查，结果按表格汇总；每行「详情」可看订单名称、本地单/全国单、健康顾问、金额与套餐项目。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_xmlhttpRequest
@@ -33,11 +33,14 @@
  *   **与请求体无关**，所以三个分院、三个页签都能用同一套算法现场算。
  *   实测：拿抓到的 mntimestamp + mnsign 反算，公式命中。
  *
- * 三个页签对应的查询口径（v1.4.0 修正，2026-11-07 前台抓包核对）：
+ * 三个页签对应的查询口径（v1.7.0 定稿，2026-11-09 真机实测；v1.4.0 那版「已到检走 order」已被推翻）：
  *   未到检   serviceName = orderMerge，appointmentStatus = [TO_APPOINTMENT, APPOINTMENT_FINISH]
  *   **一次查全部分院**（req.onlySelfBranch = false），不用按分院循环
- *   已到检   serviceName = order，appointmentStatus = CHECKED      ← 分院维度
+ *   已到检   serviceName = hcOrder，**不带状态条件**（它对状态键一律忽略）← 分院维度
+ *            ＋ order + [APPOINTMENT_FINISH, CHECKED, CANCEL] 兜底（字段更全，见 queryBranch）
  *   已取消   serviceName = order，appointmentStatus = CANCEL       ← 分院维度
+ *   ⚠️ 别再只按 appointmentStatus 过滤：已出报告 / 报告已生成这类记录在 order 里根本没有
+ *     appointmentStatus 字段，会被整批筛掉（71434246578738 就是这么「查无数据」的）。
  *
  * 🔴 v1.3.x 的错（红领巾 2026-11-07 用 410726199006133031 指出「未到检查不到」）：
  *   旧版把四个状态塞进一个 order 请求、按分院循环，以为一份数据能盖住三个页签。
@@ -98,6 +101,68 @@
  *   **点「详情」才发请求**：几十条记录一起预拉会把接口打满，所以做成懒加载，
  *   同一条记录只拉一次（成功失败都缓存），失败原因写在段落标题后面。
  *   顺带：金额加千分位（整单十几万，不分节读不出来）；项目明细表限高 300px 自己滚、表头吸顶。
+ *
+ * v1.7.0（2026-11-09，红领巾「71434246578738 前台查得到、脚本说无数据」）：
+ *   真因不是参数写错，是**状态过滤口径不全** —— 这条记录在 order 里没有 appointmentStatus 字段，
+ *   状态只有 serviceOrderStatus(Code) = 已出报告 / EXPORT_REPORT，于是被 appointmentStatus 过滤筛掉。
+ *   修法：分院槽位改成 order ∪ hcOrder 两份取并集（hcOrder = 该分院该单号/证件的全部服务单，
+ *   不认任何状态条件），去重键 vid / SOA 订单号，重复时留 order 那份（字段更全）。
+ *   实测数据与推导过程写在 queryBranch 的注释里；从未到检页面回来的记录不受影响。
+ *
+ * v1.8.0（2026-11-09，红领巾三句话）：
+ *   ① 「想看人员套餐对应的加项包分别是什么、价格、几选几」⇒ 套餐卡里新增加项包组块：
+ *      组标题照抄系统文案「第 N 组 · X 选 Y」（N = groupNum 组序号，X = 选项数，
+ *      Y = maxOption 最多选几个；有 miniNumber 时补「最少 Z 个」，
+ *      依据是前台前端包 umi.c13371c0.js 里那段 `第N组（X选Y，最少选择Z个）`），
+ *      组内一行一个加项包，列【加项包 / 原价 / 成交价 / 项目数】，组头右侧给组内合计。
+ *      ⚠️ addPackageList 里**没有价格**，只有 addGroupId ⇒ 拿它当 packageCode，同 billCode 再查一次
+ *      querySelectedPackages（批量：实测 7 个 addGroupId 一次传回 7 条，但**返回顺序与入参不一致**，
+ *      只能按 packageName 对号）。
+ *   ② 「原始数据不要这样直接列出来」⇒ 「列表记录 / 收费明细」原来那几十行「字段名 / 值」改成
+ *      按语义分组的卡片（人员 / 预约与到检 / 订单与单位 / 费用），字段值翻译成中文，
+ *      空字段收进折叠，全字段折叠 + 原始 JSON 都还在（一个字段都不丢）。
+ *      收费明细前面加一张「费用构成」表（项目 / 原价 / 成交价 / 支付状态 + 合计），
+ *      跟前台登记页「套餐和加项信息」那张表同口径。
+ *   ③ 「先标准价，后结算价，和系统保持一致」⇒ 全站金额统一 `原价 ¥x · 成交 ¥y`
+ *      （前台列名就是「原价 / 实际成交价」），列表金额格也从「成交大字 + 标准小字」翻过来。
+ *
+ * v1.9.0（2026-11-09，红领巾两句，都是浮层里的顺序）：
+ *   ① 「将获取到的订单数据往下移，首先展示这个人的信息」⇒ 浮层从上到下改成
+ *      人员信息 → 订单信息 → 套餐（主套餐 → 加项包）→ 预约与订单信息 → 收费明细 → 原始 JSON。
+ *      人员组用 detailInfoGroups(raw, { only: '人员' }) 单独拎出来置顶，
+ *      下面那段 skip 掉人员组，同一个人的姓名/证件不会出现两遍。
+ *   ② 「加项包放到主套餐下边」⇒ 加项包组块从「套餐头下面」挪到「套餐内项目」之后，
+ *      前面加一行「加项包 · N 组 / M 个可选」小标题；套餐 meta 行里那句加项包概况随之去掉（不重复）。
+ *
+ * v1.9.1（2026-11-09，红领巾澄清「人员信息」的含义）：
+ *   ① 他说的「人员信息」不是姓名证件，而是**这个人的套餐、加项包、金额**。
+ *      ⇒ 浮层顺序再换：「套餐 · 加项包 · 金额」置顶 → 订单信息 → 人员与预约信息 → 收费明细；
+ *      v1.9.0 那个「人员置顶」撤掉（姓名证件那类基础资料优先级最低，回到下面那一段里）。
+ *   ② 「加项包最好也能支持查看项目」⇒ 加项包行末的「N 项」改成按钮，点开在下一行摊出项目明细表
+ *      （复用套餐内项目那张表，最大高度 210px 自己滚）。
+ *
+ * v1.9.2（2026-11-09，红领巾四张标注图 + 四条要求）：
+ *   ① 「套餐内容默认展开，现有的高度就够用，多出来的部分滚动查看」⇒ 主套餐项目的 <details> 加回 open，
+ *      但不能放开高度：仍靠 .qt-items-scroll 的 300px 限高自己滚（放开就是把加项包顶到屏幕外，
+ *      v1.9.0 踩过一次）。
+ *   ② 「给套餐也加一个底色，和加项包区分开」⇒ 套餐卡从 #fcfdff（≈白）换成冷色 #f1f6fd + 蓝边，
+ *      加项包保持暖色 #fffdf8；加项包本来就是套在套餐卡里的，同色系根本分不出块。
+ *   ③ 「加项包部分原价、成交价、项目错位了」⇒ 不是数据问题，是 **CSS 选择器权重**：
+ *      `.qt-addon-table thead th { text-align:left }`(0,1,2) 压过 `.qt-ad-price { text-align:right }`(0,1,0)，
+ *      表头被拽回左对齐、数据格还是右对齐 ⇒ 三列整体错开一截。补 th 级右对齐规则把表头拉回来；
+ *      收费明细表（`.qt-fee-table th`）同一个毛病，一并治。
+ *   ④ 「订单信息放到最下边」+ 图里「收费明细 这部分上移」⇒ 顺序定稿：
+ *      套餐·加项包·金额 → 收费明细 → 预约与订单信息 → 订单信息 → 原始 JSON。
+ *   ⑤ 图里划叉的也照做了：人员卡（姓名/性别/年龄/证件/婚姻/手机/VIP）、「其它」卡、费用卡、
+ *      以及收费明细下面重复出现的那份分组卡全部撤掉；「订单与单位」只留打勾的四项
+ *      （订单名称 / 单位名称 / 体检卡号 / 套餐名称）。没上卡片的字段仍收在「其余 N 个字段」折叠条里。
+ *
+ * v1.9.3（2026-11-09，红领巾：「人员姓名、手机号、这个也是需要的」）：
+ *   v1.9.2 ⑤ 的读图读偏了 —— 他那张图上人员卡里**姓名和手机号是打勾的**，划叉的是性别 / 年龄 /
+ *   证件类型 / 证件号 / 婚姻状况 / VIP（这些在列表表格和浮层标题里本来就有）。
+ *   ⇒ 「人员」组回到信息段最前面，只带 姓名 + 手机号（有 notSecretPhone 明文就用明文）；
+ *   同一个值两套字段名（name/customerName、phone/customerPhone）不再重复成两行。
+ *   该段标题也按系统口径改回「人员与预约信息」。浮层顺序不变（v1.9.2 ④ 的定稿）。
  */
 
 (function () {
@@ -129,7 +194,7 @@
   const REPORT_TEXT = '报表工具';
   const HOST_SOA = 'checkup-soa3.health-100.cn';
 
-  const SCRIPT_VERSION = '1.6.0';
+  const SCRIPT_VERSION = '1.9.3';
 
   // 前台（登记）站点
   const QT_ORIGIN = 'https://checkup-register.health-100.cn';
@@ -172,6 +237,9 @@
   //    所以 order 也查 APPOINTMENT_FINISH，查完再把这些「已预约未到检」的记录统一搬进未到检那块（见 migrateNotYet）。
   const QT_SERVICE_MERGE = 'orderMerge';
   const QT_SERVICE_BRANCH = 'order';
+  // v1.7.0：'order' 会把「已出报告 / 报告已生成」这类后期状态按 appointmentStatus 筛掉，
+  // 这些记录只有 hcOrder（登记服务单全量视图）能给 ⇒ 分院查询两份取并集，见 queryBranch。
+  const QT_SERVICE_CHECKED = 'hcOrder';
   const QT_STATUS_NOTYET = ['TO_APPOINTMENT', 'APPOINTMENT_FINISH'];
   const QT_STATUS_BRANCH = ['APPOINTMENT_FINISH', 'CHECKED', 'CANCEL'];
 
@@ -209,6 +277,8 @@
 
   const REQUEST_TIMEOUT = 20000;
   const BRANCH_GAP_MS = 120;
+  // 逐条拉单条详情时的并发上限（3 个分院 × 20 条一起串行太慢，全并发又会把接口打满）
+  const DETAIL_CONCURRENCY = 4;
   // 一个分院最多先列几行，剩下的收在「展开全部」里（表格行矮，可以比卡片多放几条）
   const RECORD_PREVIEW_COUNT = 5;
 
@@ -239,6 +309,25 @@
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /*
+   * 限并发地跑 async 映射：结果按原顺序回填。
+   * 用途单一 —— 逐条拉「单条详情」时别串行（30+ 条会拖到半分钟），也别全放出去打满接口。
+   */
+  async function mapLimit(list, limit, fn) {
+    const out = new Array(list.length);
+    let cursor = 0;
+    const size = Math.max(1, Math.min(limit, list.length));
+    const workers = new Array(size).fill(0).map(async () => {
+      while (cursor < list.length) {
+        const idx = cursor;
+        cursor += 1;
+        out[idx] = await fn(list[idx], idx);
+      }
+    });
+    await Promise.all(workers);
+    return out;
   }
 
   function escapeHtml(value) {
@@ -374,44 +463,81 @@
   }
 
   /*
-   * 分院查询：已到检 / 已取消（这两个是真按分院分的）。
-   *   serviceName = 'order'
-   *   req.appointmentStatus = [CHECKED, CANCEL]
-   *   req.vid                  = 预约单号         （输入的是 14 位单号时）
-   *   req.certificateNumber    = 身份证号         （输入的是身份证时）
-   * 实测（2026-11-06 / 11-07，真实登录态）：
-   *   - branch-code 头 + req.branchCode 双管齐下，跨院不会串（同一 vid 在 X7/FC 查回 0 条）；
-   *   - req.certificateNumber 有效：同一个身份证在 X1 命中、X7/FC 回 0 条；
-   *   - ⚠️ 未到检记录（未预约 / 已预约）**在这个服务里根本查不到**，
-   *     2026-11-07 用 410726199006133031 实测：三个分院 × 四状态全返回 0，
-   *     而 orderMerge 一次就回 3 条 ⇒ 见下面的 queryNotYet。
+   * 一个服务的一页列表（分院槽位要打两次，抽出来）。
    */
-  async function queryBranch(branch, keyword) {
+  async function postList(serviceName, branch, req, pageSize) {
     const headers = await buildQtHeaders(branch.code);
-    const req = {
-      branchCode: branch.code,
-      appointmentStatus: QT_STATUS_BRANCH.slice(),
-    };
-    if (keyword.type === 'cert') req.certificateNumber = keyword.value;
-    else req.vid = keyword.value;
-
-    const body = {
-      pageRequest: {
-        pageNum: 1,
-        // 按身份证查可能命中多次到检，多留一些
-        pageSize: keyword.type === 'cert' ? 30 : 20,
-        req,
-      },
-      serviceName: QT_SERVICE_BRANCH,
-    };
-
-    const json = await gmPost(QT_LIST_API, body, headers);
+    const json = await gmPost(QT_LIST_API, { pageRequest: { pageNum: 1, pageSize, req }, serviceName }, headers);
     const data = (json && json.data) || {};
     const items = Array.isArray(data.content) ? data.content : [];
     // 服务端总数：一页装不下时（按身份证查常见）用于提示「只显示前 N 条」
     const total = Number(data.totalSize ?? data.totalElements ?? items.length);
     const records = items.map((item) => mapRecord(item, branch));
     return { records, total: Number.isFinite(total) ? total : records.length };
+  }
+
+  /*
+   * 分院查询：已到检 / 已取消 / 已预约未到检（这三个都按分院）。
+   *   serviceName = 'order'    + appointmentStatus = [APPOINTMENT_FINISH, CHECKED, CANCEL]
+   *   serviceName = 'hcOrder'  + 不带任何状态条件
+   *   req.vid              = 预约单号（输入的是 14 位单号时）
+   *   req.certificateNumber = 身份证号（输入的是身份证时）
+   *
+   * 🔴 v1.7.0 修「前台查得到、脚本提示无数据」（红领巾 2026-11-09 用 71434246578738）：
+   *   这条记录的 order 数据里**根本没有 appointmentStatus 字段**，状态只有
+   *   serviceOrderStatus(Code) = 已出报告 / EXPORT_REPORT ⇒ 带 appointmentStatus 过滤的请求
+   *   被服务端按状态筛掉，回 0 条。实测（真实登录态 · 本机 Chrome 9222，2026-11-09）：
+   *     order   + [APPOINTMENT_FINISH, CHECKED, CANCEL] + vid  → 0 条
+   *     order   + [CHECKED] + vid                              → 0 条
+   *     order   + 不带 appointmentStatus + vid                  → 1 条（白亮东，EXPORT_REPORT）
+   *     hcOrder + vid（带不带 [CHECKED] 都一样）                → 1 条（白亮东，REPORT_CREATED）
+   *   且 hcOrder **对所有状态条件一律忽略**：拿 410726199105163033 传 appointmentStatus=[CHECKED]，
+   *   照样回 12 条 CANCEL（serviceOrderStatus / serviceOrderStatusCode / checkupOrderStatus / status
+   *   这几个键也都不认）⇒ 它就是个「该分院该单号/证件的全部服务单」视图。
+   *   ⇒ 所以不再单靠某一支，改成**两份取并集**：
+   *     ① order    带 [APPOINTMENT_FINISH, CHECKED, CANCEL]：已取消 / 已预约未到检，字段最全
+   *                （nameListUid、明文证件号、branchVid —— 详情浮层靠它换套餐编码）
+   *     ② hcOrder  不带状态过滤：已到检的后期状态（已出报告 / 报告已生成 / 主检中…）只有这里有，
+   *                顺带把 order 漏掉的早期已取消也补齐（同一证件：order 2 条、hcOrder 12 条）
+   *     同一单去重键 = 预约单号 vid / SOA 订单号，重复时**留 order 那份**（字段多）。
+   *   跨院隔离照旧：hcOrder 在 X7 / FC 查同一 vid 都是 0 条 ⇒ 不会串院。
+   *   未到检（未预约 / 已预约）仍然只有 order / orderMerge 有，hcOrder 一条都不给（验过）。
+   */
+  async function queryBranch(branch, keyword) {
+    const pageSize = keyword.type === 'cert' ? 50 : 20;
+    const base = { branchCode: branch.code };
+    if (keyword.type === 'cert') base.certificateNumber = keyword.value;
+    else base.vid = keyword.value;
+
+    const primary = await postList(
+      QT_SERVICE_BRANCH,
+      branch,
+      { ...base, appointmentStatus: QT_STATUS_BRANCH.slice() },
+      pageSize
+    );
+    // hcOrder 不认状态条件，就别传了 —— 传了也只是白搭，还容易被后来人误读成「在过滤」
+    const full = await postList(QT_SERVICE_CHECKED, branch, { ...base }, pageSize);
+
+    const seen = new Set();
+    const records = [];
+    // ⚠️ 这里是「两个服务返回的同一单」去重，**不能直接复用 recKeyList**：
+    //    一个 SOA 订单下可能挂多次预约（实测 410726199105163033 在 X1 有 徐林霞 两条
+    //    2026-07-22 的服务单共用同一个订单号），用「vid + 订单号」双键会把不同单当成重复。
+    //    ⇒ 有预约单号就只认单号；没有单号（未预约那批）才退到「订单号 + 预约日期」。
+    const identityOf = (rec) => (rec.vid
+      ? `v:${rec.vid}`
+      : (rec.soaOrderNo ? `s:${rec.soaOrderNo}|${rec.apptDate || ''}` : `n:${rec.name}|${rec.statusCode}`));
+    const push = (rec) => {
+      const key = identityOf(rec);
+      if (seen.has(key)) return;
+      seen.add(key);
+      records.push(rec);
+    };
+    primary.records.forEach(push);
+    full.records.forEach(push);
+
+    // total 只用来提示「接口共 N 条 / 本次只取前 M 条」，并集没有权威总数，取全量口径与实际条数的较大值
+    return { records, total: Math.max(full.total, records.length) };
   }
 
   /*
@@ -524,7 +650,9 @@
 
     // 未到检是跨分院的，记录里没有分院码；实测用任意分院码查同一张订单都返回一样的结果
     const branchCode = branch && !branch.merged && branch.code ? branch.code : DEFAULT_BRANCH_CODE;
-    const cert = String(raw.notSecretCertificateNumber || raw.certificateNumber || '');
+    // hcOrder 那份只有脱敏证件号（622******0818），列表项没 packageCode 时拿它去换套餐编码会查空，
+    // 所以优先用单条详情里取到的明文证件号（rec.certFull）
+    const cert = String(rec.certFull || raw.notSecretCertificateNumber || raw.certificateNumber || '');
     const nameListUid = String(raw.nameListUid || '');
 
     const out = { order: null, before: null, packages: [], pkgCodes: [], error: '' };
@@ -577,6 +705,38 @@
         '套餐明细'
       );
       out.packages = Array.isArray(j3 && j3.data) ? j3.data : [];
+    }
+
+    // ④ 加项包的价格（v1.8.0）
+    //    addPackageGroupList 里只给了 addGroupId / addGroupName，没有一分钱的价格；
+    //    但 addGroupId 本身就是套餐编码，拿它当 packageCode 再查一次 querySelectedPackages 就有
+    //    checkPrice（原价）/ settlementPrice（成交价）/ details（项目）。
+    //    实测（2026-11-09，26百威 段亮）：同一个 billCode 一次传 7 个 addGroupId → 7 条全回，
+    //    **但返回顺序跟入参不一致**（腰椎/颈椎被换了位）⇒ 只能按 packageName 对号，不能按下标。
+    out.addPackages = Object.create(null);
+    const addIds = [];
+    out.packages.forEach((pkg) => {
+      (Array.isArray(pkg?.addPackageGroupList) ? pkg.addPackageGroupList : []).forEach((grp) => {
+        (Array.isArray(grp?.addPackageList) ? grp.addPackageList : []).forEach((a) => {
+          const id = String(a?.addGroupId || '');
+          if (id && !addIds.includes(id)) addIds.push(id);
+        });
+      });
+    });
+    if (addIds.length) {
+      const j4 = await safePost(
+        QT_SELPKG_API,
+        {
+          billCode: soaOrderNo,
+          branchCode,
+          packages: addIds.slice(0, 40).map((packageCode) => ({ packageCode })),
+          replaceItemInfos: [],
+        },
+        '加项包价格'
+      );
+      (Array.isArray(j4 && j4.data) ? j4.data : []).forEach((p) => {
+        out.addPackages[String(p?.packageName || '')] = p;
+      });
     }
 
     return out;
@@ -704,20 +864,26 @@
             slot.status = 'empty';
           } else {
             // 详情接口要 branchCode，未到检是合并口径拿不到准分院，本来就查不到金额，直接跳过
+            // ⚠️ v1.7.0：并集之后记录变多（一个证件能到 30+ 条），串行拉详情会把一次查询拖到
+            //    30 秒以上（实测 35 条 = 34.7s）⇒ 改成限并发，最多同时 4 条
             if (!branch.merged) {
-              for (const rec of list) {
-                if (!rec.vid) continue;
+              await mapLimit(list, DETAIL_CONCURRENCY, async (rec) => {
+                if (!rec.vid) return;
                 rec.detail = await fetchDetail(branch.code, rec.vid).catch(() => null);
                 rec.detailRaw = rec.detail?.raw || null;
                 if (rec.detail?.apptDate) rec.apptDate = rec.detail.apptDate;
                 if (rec.detail?.certFull) rec.certFull = rec.detail.certFull;
                 if (rec.detail?.customerName) rec.name = rec.detail.customerName;
-              }
+              });
             }
             // 详情浮层按 `分院码#序号` 取记录，顺便记下它属于哪个槽位
             list.forEach((rec, idx) => {
               rec.__branch = branch;
-              state.byKey.set(`${branch.code}#${idx}`, rec);
+              // v1.8.0：键要绑在**记录**上，不能靠渲染时的序号 ——
+              // 「已预约未到检」会被 migrateNotYet 搬到未到检块，渲染那边按 `${slot.branch.code}#${idx}`
+              // 算出来是 `*#0`，而这里注册的是 `X7#0` ⇒ 点详情没反应（实测 71005527887761 复现）。
+              if (!rec.__key) rec.__key = `${branch.code}#${idx}`;
+              state.byKey.set(rec.__key, rec);
             });
             slot.status = 'ok';
             slot.records = list;
@@ -766,6 +932,23 @@
   }
 
   /*
+   * 价格口径统一（v1.8.0，红领巾 2026-11-09）：
+   *   「先标准价，后结算价」—— 跟前台登记页那张表一致（列名是「原价 / 实际成交价」）。
+   *   standard = checkPrice，settle = settlementPrice。
+   *   两个价相同时只显示一个，别写「¥510.00 / 成交 ¥510.00」这种废话。
+   */
+  function pricePair(standard, settle, sep = ' · ') {
+    const hasStd = Number.isFinite(standard);
+    const hasSet = Number.isFinite(settle);
+    if (!hasStd && !hasSet) return '—';
+    if (hasStd && hasSet && standard === settle) return moneyText(standard);
+    const parts = [];
+    if (hasStd) parts.push(`<span class="qt-pm-std" title="标准价（原价）">原价 ${moneyText(standard)}</span>`);
+    if (hasSet) parts.push(`<span class="qt-pm-set" title="结算价（实际成交价）">成交 ${moneyText(settle)}</span>`);
+    return parts.join(sep);
+  }
+
+  /*
    * 结果分成两块（红领巾 2026-11-07）：
    *   ① 未到检：不分院，单独一块，单号列兼当「预约单号 / 订单号」；
    *   ② 已到检 / 已取消：按分院，每个分院一种底色，扫一眼就知道是哪家的。
@@ -803,15 +986,24 @@
     return `<td class="qt-c-act"><button type="button" class="qt-detail" data-key="${escapeHtml(key)}">详情</button></td>`;
   }
 
+  /*
+   * 金额单元格（v1.8.0）：先原价（标准），后成交（结算），跟前台登记页一致。
+   * settle / standard 都可能拿不到（未到检的收费接口返回空）⇒ 谁有显示谁。
+   */
+  function moneyCellHtml(settle, standard) {
+    const hasStd = Number.isFinite(standard);
+    const hasSet = Number.isFinite(settle);
+    if (!hasStd && !hasSet) return { text: '—', sub: '' };
+    const main = hasStd ? moneyText(standard) : moneyText(settle);
+    const sub = hasStd && hasSet && standard !== settle ? `<i>成交 ${moneyText(settle)}</i>` : '';
+    return { text: main, sub };
+  }
+
   // 分院表的一行（已到检 / 已取消）
   function renderBranchRow(rec, branch, key) {
     const detail = rec.detail || null;
     const certText = rec.certFull || rec.certMasked || '—';
-    const settle = detail ? detail.settle : null;
-    const standard = detail ? detail.standard : null;
-    const standardSub = Number.isFinite(standard) && standard !== settle
-      ? `<i>标准 ${moneyText(standard)}</i>`
-      : '';
+    const money = moneyCellHtml(detail ? detail.settle : null, detail ? detail.standard : null);
     const statusText = rec.statusText || rec.statusCode || '—';
     const statusShort = STATUS_SHORT[rec.statusCode] || statusText;
     const branchLabel = branch.short || rec.branchShort || '—';
@@ -822,7 +1014,7 @@
         <td class="qt-c-name" title="${escapeHtml(rec.name || '')}">${escapeHtml(rec.name || '—')}</td>
         <td class="qt-c-cert" title="${escapeHtml(certText)}">${escapeHtml(certText || '—')}</td>
         <td class="qt-c-date">${escapeHtml(rec.apptDate || '—')}</td>
-        <td class="qt-c-money">${moneyText(settle)}${standardSub}</td>${statusCell(detail, statusText, statusShort)}
+        <td class="qt-c-money" title="原价 / 成交价">${money.text}${money.sub}</td>${statusCell(detail, statusText, statusShort)}
         <td class="qt-c-vid">${escapeHtml(rec.vid || '—')}</td>${detailCell(key)}
       </tr>
     `;
@@ -832,11 +1024,7 @@
   function renderNotYetRow(rec, key) {
     const detail = rec.detail || null;
     const certText = rec.certFull || rec.certMasked || '—';
-    const settle = detail ? detail.settle : null;
-    const standard = detail ? detail.standard : null;
-    const standardSub = Number.isFinite(standard) && standard !== settle
-      ? `<i>标准 ${moneyText(standard)}</i>`
-      : '';
+    const money = moneyCellHtml(detail ? detail.settle : null, detail ? detail.standard : null);
     const statusText = rec.statusText || rec.statusCode || '—';
     const statusShort = STATUS_SHORT[rec.statusCode] || statusText;
     const docText = rec.vid || rec.soaOrderNo || '—';
@@ -849,7 +1037,7 @@
         <td class="qt-c-name" title="${escapeHtml(rec.name || '')}">${escapeHtml(rec.name || '—')}</td>
         <td class="qt-c-cert" title="${escapeHtml(certText)}">${escapeHtml(certText || '—')}</td>
         <td class="qt-c-date">${escapeHtml(rec.apptDate || '—')}</td>
-        <td class="qt-c-money">${moneyText(settle)}${standardSub}</td>${statusCell(detail, statusText, statusShort, branchNote)}
+        <td class="qt-c-money" title="原价 / 成交价">${money.text}${money.sub}</td>${statusCell(detail, statusText, statusShort, branchNote)}
         <td class="qt-c-vid" title="${escapeHtml(docTitle)}">${escapeHtml(docText)}</td>${detailCell(key)}
       </tr>
     `;
@@ -899,7 +1087,7 @@
       const expanded = !!state.expanded['*'];
       const shown = expanded ? all : all.slice(0, RECORD_PREVIEW_COUNT);
       meta = `${all.length} 条`;
-      rows = shown.map((rec, idx) => renderNotYetRow(rec, `${slot.branch.code}#${idx}`)).join('');
+      rows = shown.map((rec, idx) => renderNotYetRow(rec, rec.__key || `${slot.branch.code}#${idx}`)).join('');
       if (all.length > RECORD_PREVIEW_COUNT) rows += moreRow('*', all.length, expanded, NOTYET_COLS);
       if (slot.total > all.length) rows += noteRow(`接口共 ${slot.total} 条，本次只取了前 ${all.length} 条`, NOTYET_COLS);
     }
@@ -956,7 +1144,7 @@
       hit += all.length;
       const expanded = !!state.expanded[branch.code];
       const shown = expanded ? all : all.slice(0, RECORD_PREVIEW_COUNT);
-      rows.push(shown.map((rec, idx) => renderBranchRow(rec, branch, `${branch.code}#${idx}`)).join(''));
+      rows.push(shown.map((rec, idx) => renderBranchRow(rec, branch, rec.__key || `${branch.code}#${idx}`)).join(''));
       if (all.length > RECORD_PREVIEW_COUNT) rows.push(moreRow(branch.code, all.length, expanded, BRANCH_COLS));
       if (slot.total > all.length) {
         rows.push(noteRow(`${branch.short}：接口共 ${slot.total} 条，本次只取了前 ${all.length} 条`, BRANCH_COLS));
@@ -1099,10 +1287,12 @@
       <div class="qt-kv">
         ${keys.map((k) => {
           const text = fmtDetailValue(src[k]);
+          // 客户身份这类一整坨 JSON 会把这个格子撑到天边，折叠区里截断显示，全量看原始 JSON
+          const shown = text.length > 400 ? `${text.slice(0, 400)}…` : text;
           const label = DETAIL_LABELS[k] || k;
           return `
             <div class="qt-kv-k" title="${escapeHtml(k)}">${escapeHtml(label)}</div>
-            <div class="qt-kv-v${text ? '' : ' is-blank'}">${escapeHtml(text || '—')}</div>
+            <div class="qt-kv-v${shown ? '' : ' is-blank'}">${escapeHtml(shown || '—')}</div>
           `;
         }).join('')}
       </div>
@@ -1136,15 +1326,226 @@
     ].join('');
   }
 
+  /*
+   * 「原始数据」可读化（v1.8.0 建，v1.9.2 按红领巾的叉号收窄，v1.9.3 补回姓名/手机号）
+   * 原来是把接口字段拍成几十行「字段名 / 值」，一半空值、一半英文码，扫不动；
+   * v1.8.0 按语义分了四组（人员 / 预约与到检 / 订单与单位 / 费用）+ 一张「其它」。
+   * v1.9.2 他在这几块上划了叉：其它、费用（折扣 80 那种）、以及收费明细下面重复出现的那一份，
+   * 人员卡也只当整块撤掉 —— v1.9.3 更正：他划的是性别/年龄/证件/婚姻/VIP 那几行，
+   * **姓名和手机号是打勾要留的**，所以人员组回来，只带这两个字段。现在共三组：
+   *   人员（姓名 / 手机号 · 明文优先）
+   *   预约与到检（预约单号/日期/时段/分院/服务单状态 —— 他打了勾的）
+   *   订单与单位（只留订单名称/单位名称/体检卡号/套餐名称 —— 他打了勾的四项）
+   * 费用那几项在「套餐·加项包·金额」和「收费明细」里已经说得更清楚。
+   * 一个字段都不丢：没进卡片的字段统一收进「其余 N 个字段」折叠条，最下面还有原始 JSON。
+   */
+  const INFO_GROUPS = [
+    {
+      /*
+       * v1.9.3：v1.9.2 的叉号读偏了。他划掉的是性别 / 年龄 / 证件类型 / 证件号 / 婚姻 / VIP 这些
+       * 一排基础资料（跟列表表格、浮层标题重复），**姓名和手机号是留着的**（图上这两个打了勾）。
+       * 前台核身份第一眼就是「这单是不是这个人的、电话能不能打通」，所以只留这两项回到卡片里；
+       * 其余仍然只进「其余 N 个字段」折叠条。
+       */
+      title: '人员',
+      keys: ['name', 'customerName', 'phone', 'customerPhone'],
+    },
+    {
+      title: '预约与到检',
+      // 只留看得懂的。overTwoHour / pregnantEnabled 这类 0 / DISABLE 的开关旗标挪到折叠区，
+      // 否则卡片上就是「孕妇检查 DISABLE」这种原文，跟「原始数据直接列出来」一个毛病。
+      keys: ['vid', 'appointmentStatus', 'appointmentDate', 'appointmentTimeSlot', 'appointmentModeStr',
+        'appointBranchName', 'branchName', 'checkupDate', 'serviceOrderStatus', 'checkupOrderStatus',
+        'checkinTime', 'checkoutTime', 'checkinChannel'],
+    },
+    {
+      // 只列他打勾的四项。SOA订单号 / 单位代码 / 订单购买来源 都划掉了
+      //（订单号最下面的「订单信息」里有完整的一条，这里再来一遍是噪音）
+      title: '订单与单位',
+      keys: ['orderName', 'companyName', 'cardNumber', 'packageName'],
+    },
+  ];
+
+  // 码值翻译：状态码用 STATUS_TEXT，性别/婚姻/证件类型/会员类型这套枚举在下面
+  // （只翻能确认的，翻不出来就原样显示，绝不猜）
+  const INFO_CODE_TEXT = {
+    ID_CARD: '身份证', PASSPORT: '护照', HK_MACAO_PASS: '港澳通行证', TAIWAN_PASS: '台湾通行证',
+    MALE: '男', FEMALE: '女',
+    MARRIED: '已婚', UNMARRIED: '未婚', DIVORCED: '离异', WIDOWED: '丧偶',
+    COMMON: '普通会员', SILVER: '银卡', GOLD: '金卡', DIAMOND: '钻石卡',
+  };
+
+  function infoValueText(key, value) {
+    const raw = fmtDetailValue(value);
+    if (!raw) return '';
+    if (STATUS_TEXT[raw]) return STATUS_TEXT[raw];
+    if (INFO_CODE_TEXT[raw]) return INFO_CODE_TEXT[raw];
+    return raw;
+  }
+
+  function infoGroupCard(title, rows, mod) {
+    return `
+      <div class="qt-ig${mod ? ' ' + mod : ''}">
+        <div class="qt-ig-head">${escapeHtml(title)}</div>
+        <div class="qt-ig-grid">
+          ${rows.map(([k, v]) => `
+            <div class="qt-ig-row">
+              <span class="qt-ig-k">${escapeHtml(k)}</span>
+              <span class="qt-ig-v" title="${escapeHtml(v)}">${escapeHtml(v)}</span>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+  }
+
+  /*
+   * 卡片只放「看得懂、一眼要」的字段：
+   *   · 有中文对应版的码字段（genderCode / appointmentType / ...CN）不重复列；
+   *   · 超长值（客户身份那种一整坨 JSON）不往卡片里塞，收进折叠；
+   *   · 没有中文标签的技术字段（picPath / seqNo / 内部 ID）也只进折叠。
+   * 折叠区是「其余 N 个字段」= 全部没进卡片的字段（含空值），加上最下面的原始 JSON，一个字段都不丢。
+   *
+   * opts.only / opts.skip：只渲染某一组 / 跳过某组（v1.9.0 加，用来把「人员」单独拎出去）。
+   *   v1.9.1 起浮层顺序换成「套餐置顶、人员回到一段里」，这两个开关暂时没人调用，
+   *   留着是因为再调顺序时一行就能拆开，不用重写这三十行。
+   *   只渲染某一组时（opts.only）不再出「其它」和空字段折叠，那些都留在下面那段里。
+   */
+  function detailInfoGroups(obj, opts) {
+    const src = obj || {};
+    const only = (opts && opts.only) || '';
+    const skip = new Set((opts && opts.skip) || []);
+    const scalars = Object.keys(src).filter((k) => src[k] === null || typeof src[k] !== 'object');
+    if (!scalars.length) return '<div class="qt-kv-empty">（这个接口没返回字段）</div>';
+
+    const shown = new Set();
+    const cards = [];
+
+    // 值能不能上卡片：空 / 超长（>90 字）都不上
+    const cardValue = (k) => {
+      const text = fmtDetailValue(src[k]);
+      if (!text || text.length > 90) return '';
+      return infoValueText(k, src[k]);
+    };
+
+    // 明文孪生字段（certificateNumber ↔ notSecretCertificateNumber、phone ↔ notSecretPhone）：
+    // 接口给的「X」经常是 622******0818 这种掩码，明文在 notSecretX 里。
+    // ⇒ 有明文就用明文显示在 X 的标签上，notSecretX 自己不再单独出一行（v1.9.0）
+    const plainOf = (k) => {
+      if (/^notSecret/.test(k)) return '';
+      const twin = `notSecret${k.charAt(0).toUpperCase()}${k.slice(1)}`;
+      const v = fmtDetailValue(src[twin]);
+      return v && v.length <= 90 ? v : '';
+    };
+
+    // 有中文孪生字段（genderCode→gender、appointmentType→appointmentTypeCN）就只显示中文那个
+    const hasChineseTwin = (k) => {
+      const twins = [];
+      if (/Code$/.test(k)) twins.push(k.replace(/Code$/, ''));
+      twins.push(`${k}CN`);
+      return twins.some((t) => t !== k && fmtDetailValue(src[t]) !== '');
+    };
+
+    INFO_GROUPS.forEach((group) => {
+      // only 模式：只要那一组；否则按 skip 跳过
+      const wanted = only ? group.title === only : !skip.has(group.title);
+      if (!wanted) {
+        // 这一组本次不渲染 ⇒ 它名下的字段算「已展示」，别再漏进「其它」或折叠区
+        group.keys.forEach((k) => {
+          if (k in src) shown.add(k);
+        });
+        return;
+      }
+      const rows = [];
+      group.keys.forEach((k) => {
+        // 明文字段只做「值来源」，不单独成行（原始字段名留在折叠区里，一个都不丢）
+        if (/^notSecret/.test(k)) return;
+        if (!(k in src) || shown.has(k) || hasChineseTwin(k)) return;
+        const plain = plainOf(k);
+        const text = plain || cardValue(k);
+        if (!text) return;
+        shown.add(k);
+        // 同一个值两套字段名（name / customerName、phone / customerPhone）不重复成两行
+        if (rows.some(([, v]) => v === text)) return;
+        rows.push([DETAIL_LABELS[k] || k, text]);
+      });
+      if (rows.length) cards.push(infoGroupCard(group.title, rows, only ? 'is-wide' : ''));
+    });
+
+    // only 模式到此为止：不重复出「其它」，也不重复出空字段折叠
+    if (only) {
+      return cards.length
+        ? `<div class="qt-ig-wrap">${cards.join('')}</div>`
+        : '<div class="qt-kv-empty">这条记录没有人员字段（可能来自缓存）</div>';
+    }
+
+    // v1.9.2：「其它」卡片撤掉（他划了叉：预约类型 / 刷卡校验 / 是否替换单 / 一堆内部 ID 全是噪音）。
+    // 没进上面两组的字段照样不漏 —— 全都落在下面的「其余 N 个字段」折叠条里，点开能查。
+    const left = scalars.filter((k) => !shown.has(k));
+    const leftHtml = left.length
+      ? `<details class="qt-blanks"><summary>其余 ${left.length} 个字段（含空值与长文本，点开看）</summary>${detailKvRows(left, src)}</details>`
+      : '';
+
+    if (!cards.length) {
+      return `<div class="qt-kv-empty">（这个接口的字段都是空的）${leftHtml}</div>`;
+    }
+
+    return `<div class="qt-ig-wrap">${cards.join('')}</div>${leftHtml}`;
+  }
+
+  /*
+   * 费用构成（orderDetail.packages）：前台登记页「套餐和加项信息」那张表的同口径版本 ——
+   * 每行一个套餐/加项包，先原价后成交价，最后一行合计。
+   */
+  function detailFeeTable(data) {
+    const list = Array.isArray(data?.packages) ? data.packages : [];
+    if (!list.length) return '';
+    const sumStd = sumBy(list, 'checkPrice');
+    const sumSet = sumBy(list, 'settlementPrice');
+    const rows = list.map((p) => `
+      <tr>
+        <td class="qt-fee-name" title="${escapeHtml(String(p?.packageName || ''))}">${escapeHtml(String(p?.packageName || '—'))}</td>
+        <td class="qt-fee-num">${Number.isFinite(Number(p?.checkPrice)) ? moneyText(Number(p.checkPrice)) : '—'}</td>
+        <td class="qt-fee-num is-settle">${Number.isFinite(Number(p?.settlementPrice)) ? moneyText(Number(p.settlementPrice)) : '—'}</td>
+        <td class="qt-fee-pay">${escapeHtml(String(p?.payStatusStr || p?.payStatus || '—'))}</td>
+      </tr>
+    `).join('');
+    return `
+      <div class="qt-fee">
+        <table class="qt-fee-table">
+          <thead>
+            <tr>
+              <th scope="col" class="qt-fee-name">项目 / 套餐</th>
+              <th scope="col" class="qt-fee-num">原价</th>
+              <th scope="col" class="qt-fee-num">成交价</th>
+              <th scope="col" class="qt-fee-pay">支付状态</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+          <tfoot>
+            <tr>
+              <td class="qt-fee-name">合计 ${list.length} 项</td>
+              <td class="qt-fee-num">${Number.isFinite(sumStd) ? moneyText(sumStd) : '—'}</td>
+              <td class="qt-fee-num is-settle">${Number.isFinite(sumSet) ? moneyText(sumSet) : '—'}</td>
+              <td class="qt-fee-pay"></td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    `;
+  }
+
+  // 收费接口里每个套餐的原始字段：收进折叠，别跟上面的费用表抢版面（字段一个不少）
   function detailPackages(data) {
     const list = Array.isArray(data?.packages) ? data.packages : [];
     if (!list.length) return '';
-    return list.map((pkg, i) => `
+    const inner = list.map((pkg, i) => `
       <div class="qt-pkg">
         <div class="qt-pkg-head">套餐 ${i + 1}${pkg?.packageName ? ` · ${escapeHtml(String(pkg.packageName))}` : ''}</div>
         ${detailKv(pkg)}
       </div>
     `).join('');
+    return `<details class="qt-blanks"><summary>收费接口里每个套餐的字段（${list.length} 个，点开看）</summary>${inner}</details>`;
   }
 
   // ---- v1.6.0 订单信息 / 套餐项目 ----
@@ -1221,7 +1622,7 @@
       ['联系人', [order.contacts, order.contactNumber].filter(Boolean).join(' · ')],
       ['有效期', [order.beginDate, order.endDate].filter(Boolean).join(' ~ ')],
       ['单位地址', String(order.corpAddress || '')],
-      ['订单备注', String(order.remark || '')],
+      // 订单备注动辄几百字（华润雪花那种条款），格子里放不下 ⇒ 单独折叠在下面，见 remarkBlock
     ].filter(([, v]) => String(v || '').trim());
 
     const grid = rows.length
@@ -1231,16 +1632,22 @@
         `).join('')}</div>`
       : '';
 
-    // remark3 常写成「健管顾问：xxx(a96652) 换行 联系电话：xxx」，单独一行显示，免得挤在格子里
+    // 备注原文里常带换行（remark3 是「健管顾问：xxx(a96652) 换行 联系电话：xxx」那种），
+    // 长起来能到几百字 ⇒ 收进折叠区，别把「订单信息」这一段撑成一面墙
+    const remark = String(order.remark || '').trim();
     const remark3 = String(order.remark3 || '').trim();
-    const remark3Html = remark3
-      ? `<div class="qt-order-remark">${escapeHtml(remark3).replace(/\n/g, '<br />')}</div>`
+    const remarkBlock = remark || remark3
+      ? `<details class="qt-blanks">
+           <summary>订单备注${remark ? `（${remark.length} 字）` : ''}</summary>
+           ${remark ? `<div class="qt-order-remark">${escapeHtml(remark).replace(/\n/g, '<br />')}</div>` : ''}
+           ${remark3 ? `<div class="qt-order-remark">${escapeHtml(remark3).replace(/\n/g, '<br />')}</div>` : ''}
+         </details>`
       : '';
 
     return `
       ${head}
       ${grid}
-      ${remark3Html}
+      ${remarkBlock}
       <details class="qt-blanks">
         <summary>订单全部 ${Object.keys(order).length} 个字段</summary>
         ${detailKv(order)}
@@ -1248,9 +1655,16 @@
     `;
   }
 
-  // 项目明细表：一个套餐里的检查项（details[]）
-  function detailItemsTable(items) {
+  /*
+   * 项目明细表：一个套餐 / 一个加项包里的检查项（details[]）
+   *   opts.plain（v1.9.1）：加项包展开时用 —— 只要「项目 / 商品名 / 原价」。
+   *   原因：项目级的 settlePrice 是**按项折算**出来的值，跟加项包那一行的实际成交价对不上
+   *   （实测腰椎侧位包 原价¥60 成交¥0，项目行却写着成交¥50），两列并排放只会让人怀疑数据错了。
+   *   加项包到底成交多少钱，看包那一行；这里只回答「这个包里是哪几个项目」。
+   */
+  function detailItemsTable(items, opts) {
     const list = Array.isArray(items) ? items : [];
+    const plain = !!(opts && opts.plain);
     if (!list.length) return '<div class="qt-kv-empty">这个套餐没返回项目明细</div>';
 
     const rows = list.map((it) => {
@@ -1263,7 +1677,7 @@
           <td class="qt-it-name" title="${escapeHtml(name)}">${escapeHtml(name || '—')}</td>
           <td class="qt-it-goods" title="${escapeHtml(goods)}">${escapeHtml(goods || '—')}</td>
           <td class="qt-it-price">${Number.isFinite(sale) ? moneyText(sale) : '—'}</td>
-          <td class="qt-it-price">${Number.isFinite(settle) ? moneyText(settle) : '—'}</td>
+          ${plain ? '' : `<td class="qt-it-price">${Number.isFinite(settle) ? moneyText(settle) : '—'}</td>`}
         </tr>
       `;
     }).join('');
@@ -1271,19 +1685,110 @@
     // 项目可能几十项，表格限高自己滚，别把浮层撑成一条长卷
     return `
       <div class="qt-items-scroll">
-      <table class="qt-item-table">
+      <table class="qt-item-table${plain ? ' is-plain' : ''}">
         <thead>
           <tr>
             <th scope="col" class="qt-it-name">项目</th>
             <th scope="col" class="qt-it-goods">商品名</th>
-            <th scope="col" class="qt-it-price">标准价</th>
-            <th scope="col" class="qt-it-price">结算价</th>
+            <th scope="col" class="qt-it-price" title="标准价">原价</th>
+            ${plain ? '' : '<th scope="col" class="qt-it-price" title="接口返回的项目结算价（套餐整体结算后按项折算，不是单项单独售价）">成交价</th>'}
           </tr>
         </thead>
         <tbody>${rows}</tbody>
       </table>
       </div>
     `;
+  }
+
+  /*
+   * 加项包组（v1.8.0 —— 红领巾 2026-11-09：「想看人员套餐对应的加项包分别是什么、价格、几选几」）
+   *   结构：addPackageGroupList[] = { groupNum, maxOption, addPackageList[{addGroupId, addGroupName}] }
+   *
+   *   「几选几」的口径**不是我推的，是系统自己的文案**：
+   *     前台前端包 umi.c13371c0.js 里那段渲染是
+   *       "第" + groupNum + "组（" + frontPackageList.length + "选" + maxOption + "，最少选择" + (miniNumber||0) + "个）"
+   *     ⇒ groupNum = **组序号**（第几组，不是「选几个」），maxOption = **最多选几个**，
+   *        选项总数 = addPackageList.length，miniNumber = 最少选几个（接口常常不返回）。
+   *   实测样本（同一单，26百威中国投资-员工套餐-男）：
+   *     组1：groupNum=1, maxOption=1, 2 个选项 ⇒ 第 1 组 · 2 选 1（腰椎侧位 / 颈椎侧位）
+   *     组2：groupNum=2, maxOption=5, 5 个选项 ⇒ 第 2 组 · 5 选 5（5 个公司筛查包）
+   *   价格：addPackageList 里只有编码，拿 addGroupId 当 packageCode 再查一次（见 fetchOrderFull ④），
+   *        返回只按 packageName 对号（顺序不可靠）。
+   */
+  function detailAddonGroups(pkg, addMap) {
+    const groups = Array.isArray(pkg?.addPackageGroupList) ? pkg.addPackageGroupList : [];
+    const map = addMap || {};
+    const blocks = [];
+
+    groups.forEach((grp, gi) => {
+      const opts = Array.isArray(grp?.addPackageList) ? grp.addPackageList : [];
+      if (!opts.length) return;
+
+      // 照抄系统文案：第 N 组（X 选 Y，最少选择 Z 个）
+      const total = opts.length;
+      const maxPick = Number(grp?.maxOption);
+      const minPick = Number(grp?.miniNumber);
+      const groupNo = Number.isFinite(Number(grp?.groupNum)) ? Number(grp.groupNum) : gi + 1;
+      const rule = Number.isFinite(maxPick)
+        ? `${total} 选 ${maxPick}${Number.isFinite(minPick) && minPick > 0 ? `，最少 ${minPick} 个` : ''}`
+        : `${total} 个可选`;
+
+      let sumStd = 0;
+      let hasSumStd = false;
+      let sum = 0;
+      let hasSum = false;
+      const rows = opts.map((a) => {
+        const name = String(a?.addGroupName || '');
+        const hit = map[name] || null;
+        const standard = hit ? Number(hit.checkPrice) : NaN;
+        const settle = hit ? Number(hit.settlementPrice ?? hit.receviceSettlePrice) : NaN;
+        if (Number.isFinite(standard)) {
+          sumStd += standard;
+          hasSumStd = true;
+        }
+        if (Number.isFinite(settle)) {
+          sum += settle;
+          hasSum = true;
+        }
+        const items = Array.isArray(hit?.details) ? hit.details : [];
+        const itemTitle = items.map((x) => String(x?.itemName || x?.goodsName || '')).filter(Boolean).join('、');
+        // v1.9.1：加项包也能看项目了 —— 「N 项」点开，下一行摊出明细表
+        return `
+          <tr>
+            <td class="qt-ad-name" title="${escapeHtml(name)}">${escapeHtml(name)}</td>
+            <td class="qt-ad-price">${Number.isFinite(standard) ? moneyText(standard) : '—'}</td>
+            <td class="qt-ad-price is-settle">${Number.isFinite(settle) ? moneyText(settle) : '—'}</td>
+            <td class="qt-ad-items" title="${escapeHtml(itemTitle)}">${items.length
+              ? `<button type="button" class="qt-ad-exp" data-role="addon-toggle" data-count="${items.length}" aria-expanded="false" title="点开看这 ${items.length} 个项目">${items.length} 项 ▾</button>`
+              : '—'}</td>
+          </tr>
+          ${items.length
+            ? `<tr class="qt-ad-detail-row" style="display:none"><td colspan="4">${detailItemsTable(items, { plain: true })}</td></tr>`
+            : ''}`;
+      }).join('');
+
+      blocks.push(`
+        <div class="qt-addon">
+          <div class="qt-addon-head">
+            <span class="qt-addon-title">第 ${escapeHtml(String(groupNo))} 组 · ${escapeHtml(rule)}</span>
+            ${(hasSumStd || hasSum) ? `<span class="qt-addon-sum">合计：${pricePair(hasSumStd ? sumStd : NaN, hasSum ? sum : NaN)}</span>` : ''}
+          </div>
+          <table class="qt-addon-table">
+            <thead>
+              <tr>
+                <th scope="col" class="qt-ad-name">加项包</th>
+                <th scope="col" class="qt-ad-price">原价</th>
+                <th scope="col" class="qt-ad-price">成交价</th>
+                <th scope="col" class="qt-ad-items">项目</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      `);
+    });
+
+    return blocks.join('');
   }
 
   function detailPkgList(packages, info) {
@@ -1295,39 +1800,55 @@
       return `<div class="qt-kv-empty">${escapeHtml(tips.join('；') || '这一单没有套餐数据')}</div>`;
     }
 
-    return list.map((pkg, i) => {
+    const sumStd = sumBy(list, 'checkPrice');
+    let sumSet = 0;
+    let hasSumSet = false;
+    list.forEach((p) => {
+      const n = Number(p?.settlementPrice ?? p?.receviceSettlePrice);
+      if (Number.isFinite(n)) {
+        sumSet += n;
+        hasSumSet = true;
+      }
+    });
+    // 只有一个套餐时，合计就写在套餐头上了，再来一条纯属重复
+    const sumBar = list.length > 1 && (Number.isFinite(sumStd) || hasSumSet)
+      ? `<div class="qt-pkg-sum"><span class="qt-pkg-sum-k">主套餐合计</span><span class="qt-pkg-sum-v">${pricePair(sumStd, hasSumSet ? sumSet : NaN)}</span></div>`
+      : '';
+
+    return sumBar + list.map((pkg, i) => {
       const details = Array.isArray(pkg?.details) ? pkg.details : [];
       const settle = Number(pkg?.settlementPrice ?? pkg?.receviceSettlePrice);
       const standard = Number(pkg?.checkPrice);
       const addGroups = Array.isArray(pkg?.addPackageGroupList) ? pkg.addPackageGroupList : [];
-      const addNames = [];
-      addGroups.forEach((g) => {
-        (Array.isArray(g?.addPackageList) ? g.addPackageList : []).forEach((a) => {
-          if (a?.addGroupName) addNames.push(String(a.addGroupName));
-        });
-      });
+      const addCount = addGroups.reduce((n, g) => n + (Array.isArray(g?.addPackageList) ? g.addPackageList.length : 0), 0);
 
       const sub = [
         pkg?.payStatusStr ? String(pkg.payStatusStr) : '',
         payTypeText(pkg?.soaPayType),
         details.length ? `${details.length} 个项目` : '',
+        // 加项包概况写在下面的「加项包 · N 组」小标题里，这里不重复
       ].filter(Boolean).join(' · ');
+
+      // v1.9.2：主套餐项目改回**默认展开**（红领巾：「套餐内容默认展开，现有的高度就够用，
+      // 多出来的部分滚动查看」）。高度不放大，仍走 .qt-items-scroll 的 300px 限高自己滚，
+      // 所以加项包不会被顶得太远。
+      const addonHtml = addCount
+        ? `<div class="qt-addon-cap">加项包 · ${addGroups.length} 组 / ${addCount} 个可选</div>
+           ${detailAddonGroups(pkg, info?.addPackages)}`
+        : '';
 
       return `
         <div class="qt-pkg">
           <div class="qt-pkg-head">
             <span class="qt-pkg-name">套餐 ${i + 1} · ${escapeHtml(String(pkg?.packageName || pkg?.packageAlias || '—'))}</span>
-            <span class="qt-pkg-price">
-              ${Number.isFinite(settle) ? moneyText(settle) : '—'}
-              ${Number.isFinite(standard) && standard !== settle ? `<i>标准 ${moneyText(standard)}</i>` : ''}
-            </span>
+            <span class="qt-pkg-price">${pricePair(standard, settle)}</span>
           </div>
           <div class="qt-pkg-meta">${escapeHtml(sub)}</div>
-          ${addNames.length ? `<div class="qt-pkg-add">加项包：${escapeHtml(addNames.join('、'))}</div>` : ''}
           <details class="qt-blanks" open>
-            <summary>项目明细 ${details.length} 项</summary>
+            <summary>主套餐项目 ${details.length} 项</summary>
             ${detailItemsTable(details)}
           </details>
+          ${addonHtml}
         </div>
       `;
     }).join('');
@@ -1363,19 +1884,19 @@
             <button type="button" class="qt-modal-x" data-role="close" title="关闭">✕</button>
           </div>
           <div class="qt-modal-body">
-            <div class="qt-sec-title">订单信息 · soaOrderDetail<em data-role="order-state"></em></div>
-            <div data-role="order-box">${renderOrderBox(rec)}</div>
-
-            <div class="qt-sec-title">套餐与项目 · querySelectedPackages<em data-role="pkg-state"></em></div>
+            <div class="qt-sec-title">套餐 · 加项包 · 金额<em>querySelectedPackages</em><em data-role="pkg-state"></em></div>
             <div data-role="pkg-box">${renderPkgBox(rec)}</div>
 
-            <div class="qt-sec-title">列表记录 · query/list</div>
-            ${raw ? detailKv(raw) : '<div class="qt-kv-empty">这条记录没有原始数据（可能来自缓存）</div>'}
-
-            <div class="qt-sec-title">收费明细 · orderDetail</div>
+            <div class="qt-sec-title">收费明细<em>orderDetail</em></div>
             ${detailRaw
-              ? `${detailKv(detailRaw)}${detailPackages(detailRaw)}`
+              ? `${detailFeeTable(detailRaw)}${detailPackages(detailRaw)}`
               : `<div class="qt-kv-empty">${branch?.merged ? '未到检还没有收费记录，接口不返回' : '该单没有返回详情数据'}</div>`}
+
+            <div class="qt-sec-title">人员与预约信息<em>query/list</em></div>
+            ${raw ? detailInfoGroups(raw) : '<div class="qt-kv-empty">这条记录没有原始数据（可能来自缓存）</div>'}
+
+            <div class="qt-sec-title">订单信息<em>soaOrderDetail</em><em data-role="order-state"></em></div>
+            <div data-role="order-box">${renderOrderBox(rec)}</div>
 
             <details class="qt-raw">
               <summary>原始 JSON（含查询条件）</summary>
@@ -1425,7 +1946,23 @@
     document.body.appendChild(holder);
 
     holder.addEventListener('click', (e) => {
-      if (e.target.closest?.('[data-role="close"]') || e.target.dataset?.role === 'mask') closeDetail();
+      if (e.target.closest?.('[data-role="close"]') || e.target.dataset?.role === 'mask') {
+        closeDetail();
+        return;
+      }
+      // 加项包的「N 项 ▾」：摊开/收起紧跟着的明细行（v1.9.1）
+      const toggle = e.target.closest?.('[data-role="addon-toggle"]');
+      if (toggle) {
+        const tr = toggle.closest('tr');
+        const row = tr && tr.nextElementSibling;
+        if (row && row.classList.contains('qt-ad-detail-row')) {
+          const open = row.style.display === 'none';
+          row.style.display = open ? '' : 'none';
+          toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+          toggle.classList.toggle('is-open', open);
+          toggle.textContent = open ? `${toggle.dataset.count} 项 ▴` : `${toggle.dataset.count} 项 ▾`;
+        }
+      }
     });
 
     loadOrderFull(rec, branch);
@@ -1861,22 +2398,143 @@
         border-radius:0 7px 7px 0; white-space:pre-wrap; word-break:break-word;
       }
 
-      /* ---- 套餐与项目 ---- */
+      /* ---- 套餐与项目 ----
+       * v1.9.2：套餐卡换成冷色底（#f1f6fd），跟加项包的暖色底（#fffdf8）一眼分得开。
+       * 原来两边都是接近白的 #fcfdff / #fffdf8，而加项包又是套在套餐卡里面的，
+       * 视觉上分不清哪块是主套餐、哪块是加项包。
+       */
       #${IDS.modal} .qt-pkg {
-        margin-top:9px; padding:8px 10px; background:#fcfdff;
-        border:1px solid #eef2f7; border-radius:9px;
+        margin-top:9px; padding:8px 10px; background:#f1f6fd;
+        border:1px solid #d7e4f5; border-radius:9px;
       }
       #${IDS.modal} .qt-pkg-head {
         display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:0;
       }
       #${IDS.modal} .qt-pkg-name { font-size:11.5px; font-weight:800; color:#334155; word-break:break-word; }
       #${IDS.modal} .qt-pkg-price {
-        flex:0 0 auto; font-size:12px; font-weight:800; color:#b45309;
+        flex:0 0 auto; font-size:11.5px; font-weight:800; color:#475569;
         font-variant-numeric:tabular-nums; white-space:nowrap;
       }
-      #${IDS.modal} .qt-pkg-price i { font-style:normal; font-weight:600; font-size:10px; color:#94a3b8; margin-left:4px; }
       #${IDS.modal} .qt-pkg-meta { margin-top:3px; font-size:10.5px; color:#64748b; }
       #${IDS.modal} .qt-pkg-add  { margin-top:3px; font-size:10.5px; color:#7c5a12; }
+
+      /* ---- v1.8.0 价格口径：先原价（标准），后成交（结算） ---- */
+      #${IDS.modal} .qt-pm-std { color:#475569; }
+      #${IDS.modal} .qt-pm-set { color:#b45309; font-weight:800; }
+
+      /* 主套餐合计条 */
+      #${IDS.modal} .qt-pkg-sum {
+        display:flex; align-items:baseline; gap:8px; margin-top:9px; padding:5px 9px;
+        background:#f7faff; border:1px dashed #cddbf0; border-radius:8px;
+        font-size:11px; font-variant-numeric:tabular-nums;
+      }
+      #${IDS.modal} .qt-pkg-sum-k { color:#64748b; font-weight:700; }
+      #${IDS.modal} .qt-pkg-sum-v { color:#1f2937; font-weight:800; }
+
+      /* ---- 加项包（v1.8.0）：暖色块，跟主套餐的冷色区分开 ---- */
+      #${IDS.modal} .qt-addon-cap {
+        margin:9px 0 2px; padding-top:7px; border-top:1px dashed #e6ddca;
+        font-size:10.5px; font-weight:800; color:#8a5a00; letter-spacing:.02em;
+      }
+      #${IDS.modal} .qt-addon {
+        margin-top:7px; border:1px solid #f0e4cd; border-radius:8px; overflow:hidden;
+        background:#fffdf8;
+      }
+      #${IDS.modal} .qt-addon-head {
+        display:flex; align-items:baseline; justify-content:space-between; gap:8px;
+        padding:4px 8px; background:#fdf6e8; border-bottom:1px solid #f2e8d5;
+      }
+      #${IDS.modal} .qt-addon-title { font-size:10.5px; font-weight:800; color:#8a5a00; }
+      #${IDS.modal} .qt-addon-sum {
+        font-size:10px; font-weight:700; color:#a16207; font-variant-numeric:tabular-nums; white-space:nowrap;
+      }
+      #${IDS.modal} .qt-addon-table { width:100%; border-collapse:collapse; table-layout:fixed; }
+      #${IDS.modal} .qt-addon-table thead th {
+        padding:3px 8px; text-align:left; font-size:9.5px; font-weight:700; color:#a08a63;
+        background:#fffdf8; border-bottom:1px solid #f4ecdd;
+      }
+      #${IDS.modal} .qt-addon-table td {
+        padding:3px 8px; font-size:10.5px; color:#4b5563; border-bottom:1px solid #faf3e6;
+        line-height:1.4;
+      }
+      #${IDS.modal} .qt-addon-table tr:last-child td { border-bottom:0; }
+      #${IDS.modal} .qt-ad-name { width:56%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      #${IDS.modal} .qt-ad-price {
+        width:15%; text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums;
+      }
+      #${IDS.modal} .qt-ad-items { width:14%; text-align:right; white-space:nowrap; color:#9aa4b2; }
+      #${IDS.modal} .qt-addon-table td.is-settle { color:#b45309; font-weight:700; }
+
+      /* 🔴 v1.9.2 修「表头和数据行对不齐」：
+         上面那句选择器 thead th { text-align:left } 的权重是 (0,1,2)，
+         压过 .qt-ad-price { text-align:right } 的 (0,1,0) ⇒ 表头被拽回左对齐，
+         而数据格是右对齐，于是「原价 / 成交价 / 项目」三列表头整体偏左一截，
+         看着像列错位。这里用同样带 th 的选择器把表头拉回右对齐（权重更高）。
+         收费明细表的 .qt-fee-table th { text-align:left } 同理，一起治。 */
+      #${IDS.modal} .qt-addon-table thead th.qt-ad-price,
+      #${IDS.modal} .qt-addon-table thead th.qt-ad-items { text-align:right; }
+      #${IDS.modal} .qt-fee-table thead th.qt-fee-num { text-align:right; }
+
+      /* ---- 加项包项目展开（v1.9.1）：点「N 项 ▾」摊出明细行 ---- */
+      #${IDS.modal} .qt-ad-exp {
+        font:inherit; font-size:9.5px; font-weight:700; color:#a16207;
+        background:#fff; border:1px solid #ecd9b6; border-radius:4px;
+        padding:1px 5px; cursor:pointer; white-space:nowrap;
+      }
+      #${IDS.modal} .qt-ad-exp:hover { background:#fdf6e8; border-color:#e0c191; }
+      #${IDS.modal} .qt-ad-exp.is-open { background:#fdf1dd; border-color:#dcc08c; }
+      #${IDS.modal} .qt-ad-detail-row > td { padding:0 6px 7px; background:#fffefb; }
+      #${IDS.modal} .qt-ad-detail-row .qt-items-scroll { max-height:210px; margin-top:0; }
+
+      /* ---- 信息分组卡（v1.8.0）：原始字段改成人话，一组一卡 ---- */
+      #${IDS.modal} .qt-ig-wrap {
+        display:grid; grid-template-columns:repeat(auto-fit, minmax(225px, 1fr));
+        gap:7px; margin-top:7px;
+      }
+      #${IDS.modal} .qt-ig {
+        border:1px solid #eef2f7; border-radius:8px; overflow:hidden; background:#fcfdff;
+      }
+      #${IDS.modal} .qt-ig-head {
+        padding:4px 8px; font-size:10px; font-weight:800; color:#5b7089;
+        background:#f4f7fb; border-bottom:1px solid #eef2f7;
+      }
+      #${IDS.modal} .qt-ig-grid { padding:3px 8px 5px; }
+      /* 人员卡铺满整行时排两列，否则一条一行的拉得老长 */
+      #${IDS.modal} .qt-ig.is-wide .qt-ig-grid {
+        display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); column-gap:20px;
+      }
+      #${IDS.modal} .qt-ig-row {
+        display:flex; gap:8px; padding:2px 0; font-size:10.5px; line-height:1.45;
+        border-bottom:1px dashed #f2f5f9;
+      }
+      #${IDS.modal} .qt-ig-row:last-child { border-bottom:0; }
+      #${IDS.modal} .qt-ig-k { flex:0 0 66px; color:#8b97a8; }
+      #${IDS.modal} .qt-ig-v { flex:1 1 auto; color:#1f2937; word-break:break-word; }
+
+      /* ---- 费用构成表（v1.8.0）：跟前台「套餐和加项信息」同口径 ---- */
+      #${IDS.modal} .qt-fee {
+        margin-top:8px; border:1px solid #eef2f7; border-radius:8px; overflow:auto;
+        scrollbar-gutter:stable;
+      }
+      #${IDS.modal} .qt-fee-table { width:100%; border-collapse:collapse; table-layout:fixed; }
+      #${IDS.modal} .qt-fee-table th {
+        padding:4px 8px; text-align:left; font-size:10px; font-weight:700; color:#64748b;
+        background:#f8fafc; border-bottom:1px solid #eef2f7;
+      }
+      #${IDS.modal} .qt-fee-table td {
+        padding:4px 8px; font-size:10.5px; color:#1f2937; border-bottom:1px solid #f5f8fb;
+        line-height:1.4;
+      }
+      #${IDS.modal} .qt-fee-table tfoot td {
+        background:#fafbfd; border-top:1px solid #e6ebf1; border-bottom:0;
+        font-weight:800; color:#334155;
+      }
+      #${IDS.modal} .qt-fee-name { width:52%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      #${IDS.modal} .qt-fee-num {
+        width:17%; text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums;
+      }
+      #${IDS.modal} .qt-fee-table td.is-settle { color:#b45309; font-weight:800; }
+      #${IDS.modal} .qt-fee-pay { width:14%; white-space:nowrap; color:#64748b; }
 
       #${IDS.modal} .qt-items-scroll {
         max-height:300px; overflow:auto; margin-top:5px;
@@ -1902,6 +2560,10 @@
       #${IDS.modal} .qt-item-table tr:last-child td { border-bottom:0; }
       #${IDS.modal} .qt-item-table .qt-it-name  { width:35%; }
       #${IDS.modal} .qt-item-table .qt-it-goods { width:33%; }
+      /* 加项包展开表只有 3 列，重新分配宽度 */
+      #${IDS.modal} .qt-item-table.is-plain .qt-it-name  { width:46%; }
+      #${IDS.modal} .qt-item-table.is-plain .qt-it-goods { width:38%; }
+      #${IDS.modal} .qt-item-table.is-plain .qt-it-price { width:16%; }
       #${IDS.modal} .qt-item-table td.qt-it-goods { color:#64748b; }
       #${IDS.modal} .qt-item-table .qt-it-price {
         width:16%; text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums;
