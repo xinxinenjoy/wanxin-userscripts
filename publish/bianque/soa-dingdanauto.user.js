@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.17
+// @version      2.18
 // @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -65,6 +65,23 @@
  *     new File / new DataTransfer / input.files = dt.files
  *       —— 含 Object.defineProperty(input,"files",...) 兜底与原型 setter 调用，
  *          三种写法主世界都读得到（length 一致）
+ *
+ * 关于合同页“数据未就绪”（v2.18 起）：
+ * - 现象（2026-11-12）：脚本带页面跳到“合同”页签时，合同页数据可能还没刷出来
+ *   —— 对方单位 / 客户合同主体 / 合同日期 / 提交名单时限 要么整块不可编辑、
+ *   要么该带出的值为空；点“编辑”也进不了可编辑态，脚本就卡在
+ *   “等待合同表单进入编辑状态”。人工按 F5 后同样的操作恢复正常。
+ * - 判断（推断，未取得运行态证据）：合同页组件是拿着“还没就绪的订单数据”
+ *   挂载的，自己不会重取 ⇒ 延长等待无用，必须让它重新挂载。
+ * - 处理：① 进合同页先过一次 contractPageDataReady()（容器可见 + 无 loading 遮罩
+ *   + 三个关键控件都在），不就绪就自动“切走页签 → 切回”重挂载，最多 2 次；
+ *   ② 点了“编辑”但 15 秒内字段仍不可编辑 ⇒ 判定未就绪，重挂载后再试一次；
+ *   ③ 仍不成就抛 FlowBlockedError 明确提示“请按 F5 后重跑”，绝不空等 60 秒。
+ * - ⚠️ 触发条件刻意用“点了编辑仍不可编辑”这个**运行态信号**，而不是猜
+ *   “某个字段该有值却没有”—— 后者会把合法的空值（如合同日期）误判成未加载。
+ * - 客户合同主体（甲方）是**软字段**：为空不拦保存；为空时用订单的客户名称
+ *   补一次（字段定位走表单标签文本，该输入框没有稳定 id）。
+ *   ⚠️ antd 字数统计“9 / 100”会混进 control 的 textContent，判空前先剥掉。
  */
 
 (function () {
@@ -141,6 +158,19 @@
       45000,
     CONTRACT_FINAL_VERIFY_TIMEOUT:
       15000,
+
+    /*
+     * 合同页"数据未就绪"相关的几个时限（v2.18）。
+     * 详见 remountContractTab / ensureContractPageReady 上方的说明。
+     */
+    CONTRACT_DATA_READY_TIMEOUT:
+      8000,
+    CONTRACT_EDITABLE_TIMEOUT:
+      15000,
+    CONTRACT_REMOUNT_MAX_ATTEMPTS:
+      2,
+    CONTRACT_TAB_SWITCH_TIMEOUT:
+      8000,
     LANDING_COPY_TIMEOUT:
       30000,
     /*
@@ -1322,6 +1352,16 @@
     if (!state.endValue) {
       issues.push(
         "结束日期为空"
+      );
+    }
+
+    /*
+     * 客户合同主体为空不拦保存（软字段），但要在卡点诊断里露出来，
+     * 否则“为什么不往下走”会看不明白。
+     */
+    if (!state.customerValue) {
+      issues.push(
+        "客户合同主体为空"
       );
     }
 
@@ -3057,18 +3097,13 @@
     );
   }
 
-  async function enterEditMode(
-    token = null
+  async function clickEditAndWaitEditable(
+    token = null,
+    {
+      editableLabel =
+        "合同表单进入编辑状态"
+    } = {}
   ) {
-    if (
-      formLooksEditable()
-    ) {
-      log(
-        "表单已处于编辑状态，跳过编辑按钮。"
-      );
-      return;
-    }
-
     const editButton =
       await waitForReactiveCondition(
         () =>
@@ -3078,6 +3113,8 @@
           label:
             "合同页编辑按钮",
           token,
+          timeout:
+            CONFIG.CONTRACT_EDITABLE_TIMEOUT,
           blockerCheck:
             () =>
               getVisibleErrorFeedback(),
@@ -3101,8 +3138,10 @@
         null,
       {
         label:
-          "合同表单进入编辑状态",
+          editableLabel,
         token,
+        timeout:
+          CONFIG.CONTRACT_EDITABLE_TIMEOUT,
         blockerCheck:
           () =>
             getVisibleErrorFeedback(),
@@ -3117,6 +3156,78 @@
     log(
       "✓ 已进入编辑状态"
     );
+  }
+
+  async function enterEditMode(
+    token = null
+  ) {
+    if (
+      formLooksEditable()
+    ) {
+      log(
+        "表单已处于编辑状态，跳过编辑按钮。"
+      );
+      return;
+    }
+
+    try {
+      await clickEditAndWaitEditable(
+        token
+      );
+
+      return;
+    } catch (error) {
+      if (
+        !(error instanceof
+          FlowWaitTimeoutError)
+      ) {
+        throw error;
+      }
+
+      /*
+       * 点过“编辑”却始终进不了可编辑态 —— 这就是“合同页数据未就绪”
+       * 的典型表现（人工 F5 后同样的操作正常）。自动重载合同页再来一次。
+       */
+      warn(
+        "点击“编辑”后合同字段仍未变为可编辑，判断合同页数据未就绪，自动重新加载合同页..."
+      );
+    }
+
+    const remounted =
+      await remountContractTab(
+        token
+      );
+
+    if (!remounted) {
+      throw new FlowBlockedError(
+        "合同页疑似数据未就绪：点击“编辑”后字段仍不可编辑，且自动重新加载合同页失败。请按 F5 刷新页面后重跑本流程。"
+      );
+    }
+
+    try {
+      await ensureContractPageReady(
+        token
+      );
+
+      await clickEditAndWaitEditable(
+        token,
+        {
+          editableLabel:
+            "合同表单进入编辑状态（重新加载后）"
+        }
+      );
+    } catch (error) {
+      if (
+        error instanceof
+        FlowWaitTimeoutError
+      ) {
+        throw new FlowBlockedError(
+          "合同页数据未就绪：已自动重新加载合同页并重试，字段仍不可编辑。请按 F5 刷新页面后重跑本流程。"
+        );
+      }
+
+      throw error;
+    }
   }
 
   function getSelectVisibleText(input) {
@@ -4046,6 +4157,428 @@
     };
   }
 
+  /*
+   * ── 客户合同主体（甲方）空值兜底（v2.18 新增） ──
+   *
+   * 规则：只在该字段**当前为空**时，用订单页面上的客户名称填一次；
+   *       已有值一律不动（人工改过的值优先）。
+   *
+   * 字段定位一律走**标签文本**，不依赖 id —— 这个输入框在页面上没有稳定 id。
+   * ⚠️ antd 字数统计“9 / 100”会混进 control 的 textContent，
+   *    判断“是否已有值”前必须先剥掉，否则空字段会被误判成有值。
+   */
+
+  const CUSTOMER_PARTY_LABEL =
+    "客户合同主体";
+
+  const CUSTOMER_NAME_LABELS = [
+    "客户名称",
+    "客户全称",
+    "客户简称"
+  ];
+
+  function findFormItemByLabel(
+    label,
+    scope = document,
+    {
+      visibleOnly = false
+    } = {}
+  ) {
+    const target =
+      compactText(label);
+
+    if (!target) {
+      return null;
+    }
+
+    return (
+      Array.from(
+        scope.querySelectorAll(
+          ".ant-form-item"
+        )
+      ).find(item => {
+        /*
+         * 同一页面会挂多个合同类型的隐藏表单项，
+         * 只认当前真正显示的那一份，否则会对着隐藏字段判空。
+         */
+        if (
+          visibleOnly &&
+          !isVisible(item)
+        ) {
+          return false;
+        }
+
+        const text =
+          compactText(
+            item.querySelector(
+              ".ant-form-item-label"
+            )?.textContent
+          );
+
+        return Boolean(
+          text &&
+          text.includes(target)
+        );
+      }) ||
+      null
+    );
+  }
+
+  function readFormItemDisplayText(
+    item
+  ) {
+    const text =
+      cleanText(
+        item?.querySelector(
+          ".ant-form-item-control-input-content"
+        )?.textContent
+      );
+
+    return text
+      .replace(
+        /\s*\d+\s*\/\s*\d+\s*$/,
+        ""
+      )
+      .trim();
+  }
+
+  function getCustomerContractPartyState() {
+    const container =
+      getContractContainer();
+
+    const item =
+      (
+        container
+          ? findFormItemByLabel(
+              CUSTOMER_PARTY_LABEL,
+              container,
+              {
+                visibleOnly: true
+              }
+            )
+          : null
+      ) ||
+      findFormItemByLabel(
+        CUSTOMER_PARTY_LABEL,
+        document,
+        {
+          visibleOnly: true
+        }
+      ) ||
+      null;
+
+    const input =
+      item?.querySelector(
+        "input, textarea"
+      ) ||
+      null;
+
+    return {
+      item,
+      input,
+      value:
+        cleanText(
+          input?.value
+        ) ||
+        readFormItemDisplayText(
+          item
+        )
+    };
+  }
+
+  function readFormItemOwnValue(
+    item
+  ) {
+    return (
+      cleanText(
+        item?.querySelector(
+          "input, textarea"
+        )?.value
+      ) ||
+      readFormItemDisplayText(
+        item
+      )
+    );
+  }
+
+  function getFormItemLabelText(
+    item
+  ) {
+    /*
+     * antd 的必填星号在 label 里，去掉再比，否则 "*客户" 匹配不上 "客户"。
+     */
+    return compactText(
+      item?.querySelector(
+        ".ant-form-item-label"
+      )?.textContent
+    ).replace(
+      /^\*+/,
+      ""
+    );
+  }
+
+  function readCustomerNameFromDocument() {
+    for (
+      const label
+      of CUSTOMER_NAME_LABELS
+    ) {
+      const item =
+        findFormItemByLabel(
+          label,
+          document,
+          {
+            visibleOnly: true
+          }
+        );
+
+      if (!item) {
+        continue;
+      }
+
+      /*
+       * 别把“客户合同主体”当成客户名称的来源。
+       */
+      if (
+        getFormItemLabelText(
+          item
+        ).includes(
+          CUSTOMER_PARTY_LABEL
+        )
+      ) {
+        continue;
+      }
+
+      const value =
+        readFormItemOwnValue(
+          item
+        );
+
+      if (value) {
+        return value;
+      }
+    }
+
+    /*
+     * 最后兜底：标签**恰好**是“客户”（不做包含匹配，
+     * 否则“客户编号 / 客户联系人”会被误当成客户名称）。
+     */
+    const exact =
+      Array.from(
+        document.querySelectorAll(
+          ".ant-form-item"
+        )
+      ).find(item => {
+        return (
+          isVisible(item) &&
+          getFormItemLabelText(
+            item
+          ) === "客户"
+        );
+      });
+
+    return readFormItemOwnValue(
+      exact
+    );
+  }
+
+  /*
+   * 读取“该订单的客户名称”。
+   * 优先直接读当前文档（合同页若已带出客户名称就不用切页签）；
+   * 读不到再临时切到“基本信息”读一次，然后切回合同页。
+   * ⚠️ 编辑态下绝不切页签，否则会丢掉已填内容。
+   */
+  async function resolveOrderCustomerName(
+    token = null
+  ) {
+    const direct =
+      readCustomerNameFromDocument();
+
+    if (direct) {
+      return direct;
+    }
+
+    if (formLooksEditable()) {
+      return "";
+    }
+
+    const infoTab =
+      findTabByText(
+        "基本信息"
+      );
+
+    if (!infoTab) {
+      return "";
+    }
+
+    log(
+      "合同补充：当前页面取不到客户名称，临时切到“基本信息”读取..."
+    );
+
+    infoTab.click();
+
+    const found =
+      await waitFor(
+        () =>
+          readCustomerNameFromDocument() ||
+          null,
+        6000,
+        150
+      );
+
+    throwIfFlowCancelled(
+      token
+    );
+
+    const contractTab =
+      findTabByText(
+        "合同"
+      );
+
+    if (contractTab) {
+      contractTab.click();
+
+      await waitFor(
+        () =>
+          contractPageVisible(),
+        CONFIG.CONTRACT_TAB_SWITCH_TIMEOUT,
+        150
+      );
+
+      /*
+       * 切回来时合同页多半是重新挂载的空壳，必须再确认一次就绪，
+       * 否则紧接着的“进入编辑态”又会撞上同一个坑。
+       */
+      await ensureContractPageReady(
+        token
+      );
+    }
+
+    if (found) {
+      log(
+        `✓ 已读取订单客户名称：${found}`
+      );
+    }
+
+    return found || "";
+  }
+
+  async function fillCustomerContractParty(
+    name,
+    token = null
+  ) {
+    const want =
+      cleanText(name);
+
+    if (!want) {
+      return {
+        skipped: true,
+        reason: "no-name"
+      };
+    }
+
+    throwIfFlowCancelled(
+      token
+    );
+
+    /*
+     * 进入编辑态后 DOM 可能被重建，所以这里重新定位、重新判空。
+     */
+    const state =
+      getCustomerContractPartyState();
+
+    if (!state.input) {
+      warn(
+        "未找到“客户合同主体（甲方）”输入框，跳过自动补填。"
+      );
+
+      return {
+        skipped: true,
+        reason: "field-missing"
+      };
+    }
+
+    if (state.value) {
+      return {
+        skipped: true,
+        reason: "has-value",
+        value: state.value
+      };
+    }
+
+    if (
+      state.input.disabled ||
+      state.input.readOnly
+    ) {
+      warn(
+        "客户合同主体（甲方）为空，但当前不可编辑，需人工补填。"
+      );
+
+      return {
+        skipped: true,
+        reason: "readonly"
+      };
+    }
+
+    /*
+     * 程序写 value 会绕过 maxlength（如页面上那个 100 字上限），
+     * 写超长值反而会让表单校验报错，宁可不填并提示。
+     */
+    const maxLength =
+      Number(
+        state.input.getAttribute(
+          "maxlength"
+        )
+      );
+
+    if (
+      maxLength > 0 &&
+      want.length > maxLength
+    ) {
+      warn(
+        `客户名称“${want}”超过该字段长度上限 ${maxLength} 字，跳过自动填写，请人工处理。`
+      );
+
+      return {
+        skipped: true,
+        reason: "too-long"
+      };
+    }
+
+    log(
+      `合同补充：客户合同主体（甲方）为空，填入订单客户名称“${want}”...`
+    );
+
+    const stable =
+      await waitForStableControlledValue(
+        state.input,
+        want,
+        token
+      );
+
+    if (!stable) {
+      warn(
+        "客户合同主体（甲方）写入后未能稳定保持，需人工检查。"
+      );
+
+      return {
+        skipped: true,
+        reason: "unstable"
+      };
+    }
+
+    state.input.focus();
+    state.input.blur();
+
+    log(
+      `✓ 客户合同主体（甲方）：${state.input.value}`
+    );
+
+    return {
+      skipped: false,
+      value: state.input.value
+    };
+  }
+
   function getContractFormSnapshot() {
     const company =
       getCurrentContractField(
@@ -4095,7 +4628,15 @@
         cleanText(
           inspection?.value
         ),
-      inspectionApplicable
+      inspectionApplicable,
+      /*
+       * 客户合同主体（甲方）是“软”字段：
+       * 为空不拦保存，但为空时脚本会尝试用订单客户名称补一次，
+       * 所以这里只作为变更检测/保存后复核的参照。
+       */
+      customerValue:
+        getCustomerContractPartyState()
+          .value
     };
   }
 
@@ -4176,6 +4717,26 @@
     ) {
       mismatches.push(
         `提交名单时限：预期“${expected.inspectionValue}”，保存后“${actual?.inspectionValue || "空"}”`
+      );
+    }
+
+    /*
+     * 客户合同主体是软字段：比较时忽略空白差异，
+     * 避免后端对名称做空格/换行归一化就误判成“保存失败”。
+     */
+    if (
+      compactText(
+        expected?.customerValue
+      ) &&
+      compactText(
+        expected?.customerValue
+      ) !==
+        compactText(
+          actual?.customerValue
+        )
+    ) {
+      mismatches.push(
+        `客户合同主体：预期“${expected.customerValue}”，保存后“${actual?.customerValue || "空"}”`
       );
     }
 
@@ -5808,12 +6369,303 @@
     );
   }
 
+  /*
+   * ── 合同页“数据未就绪”自愈（v2.18 新增） ──
+   *
+   * 现象（红领巾 2026-11-12）：
+   *   脚本带着页面跳到“合同”页签时，合同页的数据可能还没刷出来 ——
+   *   对方单位 / 客户合同主体 / 合同日期 / 提交名单时限 这些字段
+   *   要么整块不可编辑、要么该带出的值为空；点“编辑”也进不了可编辑态，
+   *   脚本就一直停在“等待合同表单进入编辑状态”。人工按 F5 后又正常。
+   *
+   * 判断（推断，未取得运行态证据）：
+   *   合同页组件是拿着“还没就绪的订单数据”挂载的，自己不会重取
+   *   ⇒ 单纯延长等待没有意义，必须让它重新挂载（等价于 F5 后重进）。
+   *
+   * 处理：把“重新挂载合同页组件”做成自愈动作 —— 切走页签再切回，
+   * 最多 CONFIG.CONTRACT_REMOUNT_MAX_ATTEMPTS 次；仍不成就在面板明确报错
+   * 让用户按 F5，绝不空等。
+   *
+   * ⚠️ 触发条件刻意选“点了编辑但字段仍不可编辑”这个**运行态信号**，
+   *    而不是猜“某个字段该有值却没有” —— 后者会把合法的空值误判成未加载。
+   */
+
+  function getContractLoadingMask() {
+    const container =
+      getContractContainer();
+
+    if (!container) {
+      return null;
+    }
+
+    return (
+      Array.from(
+        container.querySelectorAll(
+          ".ant-spin-spinning, .ant-spin-blur, .ant-skeleton"
+        )
+      ).find(isVisible) ||
+      null
+    );
+  }
+
+  /*
+   * 合同页“骨架已渲染”判定：容器可见、无 loading 遮罩、
+   * 三个带 id 的关键控件都在且属于当前可见表单。
+   * 注意：这里**不**要求字段有值 —— 合同日期为空是合法状态。
+   */
+  function contractPageDataReady() {
+    if (!contractPageVisible()) {
+      return false;
+    }
+
+    if (getContractLoadingMask()) {
+      return false;
+    }
+
+    const fields = [
+      CONFIG.CONTRACT_COMPANY_SELECTOR,
+      CONFIG.CONTRACT_BEGIN_SELECTOR,
+      CONFIG.CONTRACT_END_SELECTOR
+    ].map(
+      selector =>
+        getCurrentContractField(
+          selector
+        )
+    );
+
+    return fields.every(
+      field =>
+        field &&
+        isContractFieldApplicable(
+          field
+        )
+    );
+  }
+
+  /*
+   * 找一个“非合同”的订单页签用于把合同页切走。
+   * 优先“基本信息”（最轻量），但必须排除 .order-desc（订单描述不是页签）。
+   */
+  function findOtherOrderTab() {
+    return (
+      findTabByText(
+        "基本信息"
+      ) ||
+      Array.from(
+        document.querySelectorAll(
+          ".tabs-wrap .tabs .tab"
+        )
+      ).find(tab => {
+        return (
+          isVisible(tab) &&
+          !tab.classList.contains(
+            "order-desc"
+          ) &&
+          compactText(
+            tab.textContent
+          ) !==
+            compactText(
+              "合同"
+            )
+        );
+      }) ||
+      null
+    );
+  }
+
+  /*
+   * 把合同页组件重新挂载一次（切走 → 切回）。
+   * 只在**未进入编辑态**时调用，避免丢掉已填内容。
+   */
+  async function remountContractTab(
+    token = null
+  ) {
+    if (formLooksEditable()) {
+      /*
+       * 已经能编辑就别重挂载了 —— 那会把用户/脚本已填的值弄丢。
+       */
+      return true;
+    }
+
+    const otherTab =
+      findOtherOrderTab();
+
+    if (!otherTab) {
+      return false;
+    }
+
+    const beforeHash =
+      String(
+        location.hash || ""
+      );
+
+    otherTab.click();
+
+    const left =
+      await waitFor(
+        () =>
+          !contractPageVisible() ||
+          String(
+            location.hash || ""
+          ) !== beforeHash,
+        3000,
+        100
+      );
+
+    if (!left) {
+      /*
+       * 切不走：可能是页面把编辑态锁死了。不硬来，交给调用方报错。
+       */
+      return false;
+    }
+
+    throwIfFlowCancelled(
+      token
+    );
+
+    await nextPaint(2);
+
+    const contractTab =
+      await waitFor(
+        () =>
+          findTabByText(
+            "合同"
+          ),
+        CONFIG.CONTRACT_TAB_SWITCH_TIMEOUT,
+        100
+      );
+
+    if (!contractTab) {
+      return false;
+    }
+
+    contractTab.click();
+
+    await waitFor(
+      () =>
+        contractPageVisible(),
+      CONFIG.CONTRACT_TAB_SWITCH_TIMEOUT,
+      100
+    );
+
+    return contractPageVisible();
+  }
+
+  /*
+   * 进入合同页后确认“数据确实加载出来了”。
+   * 已就绪时立即返回，不产生任何等待。
+   */
+  async function ensureContractPageReady(
+    token = null
+  ) {
+    if (contractPageDataReady()) {
+      return true;
+    }
+
+    /*
+     * 第一步：先按“只是渲染慢”处理，给一次短等待。
+     */
+    try {
+      await waitForReactiveCondition(
+        () =>
+          contractPageDataReady() ||
+          null,
+        {
+          label:
+            "合同页数据加载",
+          token,
+          timeout:
+            CONFIG.CONTRACT_DATA_READY_TIMEOUT,
+          blockerCheck:
+            () =>
+              getVisibleErrorFeedback(),
+          diagnose:
+            () =>
+              getFlowWaitDiagnostic(
+                "等待合同页字段渲染完成"
+              )
+        }
+      );
+
+      return true;
+    } catch (error) {
+      if (
+        !(error instanceof
+          FlowWaitTimeoutError)
+      ) {
+        throw error;
+      }
+    }
+
+    /*
+     * 第二步：判定为“数据没加载出来”，重新挂载合同页再看。
+     */
+    for (
+      let attempt = 1;
+      attempt <=
+      CONFIG.CONTRACT_REMOUNT_MAX_ATTEMPTS;
+      attempt++
+    ) {
+      throwIfFlowCancelled(
+        token
+      );
+
+      log(
+        `合同页数据未就绪，自动切走再切回“合同”页签重新加载（第${attempt}次）...`
+      );
+
+      const remounted =
+        await remountContractTab(
+          token
+        );
+
+      if (!remounted) {
+        warn(
+          "合同页切不出去（可能被编辑态锁住），停止自动重载。"
+        );
+
+        break;
+      }
+
+      throwIfFlowCancelled(
+        token
+      );
+
+      const ready =
+        await waitFor(
+          contractPageDataReady,
+          CONFIG.CONTRACT_DATA_READY_TIMEOUT,
+          150
+        );
+
+      if (ready) {
+        log(
+          "✓ 合同页已重新加载完成"
+        );
+
+        return true;
+      }
+    }
+
+    throw new FlowBlockedError(
+      `合同页数据未能加载完成：字段为空或整块不可编辑。已自动重载合同页 ${CONFIG.CONTRACT_REMOUNT_MAX_ATTEMPTS} 次仍无效，请按 F5 刷新页面后重跑本流程。`
+    );
+  }
+
   async function ensureContractTabVisible(
     token = null
   ) {
     if (
       contractPageVisible()
     ) {
+      /*
+       * 人已经在合同页，但数据不一定是这一份 —— 仍要过一次就绪检查。
+       * 已就绪时是同步返回，零成本。
+       */
+      await ensureContractPageReady(
+        token
+      );
+
       return true;
     }
 
@@ -5862,6 +6714,13 @@
               "已点击合同页签，等待当前合同类型内容显示"
             )
       }
+    );
+
+    /*
+     * 容器可见 ≠ 数据已就绪：这一步负责识别“空壳页面”并自动重挂载。
+     */
+    await ensureContractPageReady(
+      token
     );
 
     log(
@@ -9361,15 +10220,79 @@
       );
     }
 
+    /*
+     * 兜一层就绪检查：直接调用本函数（“处理合同”按钮）时，
+     * 合同页可能只是个还没取到数据的空壳。
+     */
+    await ensureContractPageReady(
+      token
+    );
+
     const initialState =
       getContractCompletionState();
 
+    /*
+     * 客户合同主体（甲方）为空时，先取一次“该订单的客户名称”。
+     * 取名字可能临时切页签，所以必须赶在进入编辑态**之前**做。
+     */
+    const customerParty =
+      getCustomerContractPartyState();
+
+    /*
+     * 判空只看“有没有值”，不看“有没有 input”：
+     * 查看态下该字段可能渲染成纯文本而不是 input，
+     * 若按 input 是否存在来判，这个兜底会静默失效。
+     */
+    const customerPartyEmpty =
+      Boolean(
+        customerParty.item
+      ) &&
+      !customerParty.value;
+
+    let orderCustomerName = "";
+
+    if (customerPartyEmpty) {
+      try {
+        orderCustomerName =
+          await resolveOrderCustomerName(
+            token
+          );
+      } catch (error) {
+        if (
+          error instanceof
+            FlowCancelledError ||
+          error instanceof
+            FlowBlockedError
+        ) {
+          throw error;
+        }
+
+        orderCustomerName = "";
+      }
+
+      if (!orderCustomerName) {
+        warn(
+          "客户合同主体（甲方）为空，但未能从页面读取到订单客户名称，本次不自动填写，请人工补填。"
+        );
+      }
+    }
+
+    const needsFieldEdit =
+      initialState.formNeedsEdit ||
+      Boolean(
+        customerPartyEmpty &&
+        orderCustomerName
+      );
+
     if (
+      !needsFieldEdit &&
       initialState.complete &&
       !formLooksEditable()
     ) {
       log(
-        "✓ 合同字段及当前合同类型的上传文件已完整，验证通过并跳过重复处理。"
+        customerPartyEmpty
+          ? "✓ 合同必填字段及上传文件已完整（客户合同主体仍为空，已提示人工补填），跳过重复处理。"
+          : "✓ 合同字段及当前合同类型的上传文件已完整，验证通过并跳过重复处理。"
       );
 
       updatePanelStatus(
@@ -9384,7 +10307,7 @@
       false;
 
     if (
-      initialState.formNeedsEdit
+      needsFieldEdit
     ) {
       log(
         "合同补充：检测到当前可见合同字段缺失，仅补充缺失内容..."
@@ -9400,6 +10323,20 @@
       await selectConfiguredContractCompany(
         token
       );
+
+      /*
+       * 客户合同主体（甲方）为空 → 用订单客户名称补一次。
+       * 已有值时不碰（人工改过的值优先）。
+       */
+      if (
+        customerPartyEmpty &&
+        orderCustomerName
+      ) {
+        await fillCustomerContractParty(
+          orderCustomerName,
+          token
+        );
+      }
 
       await setContractDates(
         token
@@ -9435,6 +10372,10 @@
         (
           before.endValue !==
           after.endValue
+        ) ||
+        (
+          before.customerValue !==
+          after.customerValue
         ) ||
         (
           before.inspectionValue !==
@@ -12019,6 +12960,6 @@
   routeCheck();
 
   console.log(
-    "[SOA智能审批] v2.13 已加载"
+    "[SOA智能审批] v2.18 已加载"
   );
 })();
