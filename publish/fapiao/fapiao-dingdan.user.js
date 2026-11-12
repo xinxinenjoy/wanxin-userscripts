@@ -1,11 +1,20 @@
 // ==UserScript==
 // @name         发票-1.2订单页面
 // @namespace    https://tampermonkey.net/soa-order-invoice/
-// @version      1.36
+// @version      1.37
 // @description  发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。
 
 // @match        https://checkup-soa3.health-100.cn/*
-// @grant        none
+// 打包 ZIP 必须读到发票文件字节，而 xforceplus 短链不放行 CORS（2026-11-12 实测：
+// fetch 两种凭证模式都被拦，no-cors 只能拿到 opaque），只能走 GM 通道。
+// ⚠️ 一旦有了 grant，脚本就从「页面上下文」挪进沙箱：
+//   · window.fetch 的赋值不再影响页面 → installTruthHook 里那处必须改成 unsafeWindow.fetch
+//   · XHR 的 prototype 是共享对象，patch 照旧生效，不用动
+//   · localStorage 同源，不受影响
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      s.xforceplus.com
+// @connect      tw-doc.xforceplus.com
 
 // @author       WanXin
 // @publishGroup fapiao
@@ -2721,15 +2730,221 @@
     return link;
   }
 
-  function triggerFileDownload(url) {
+  /* fileName 只有 blob 下载会用到（打好的 zip 要从内存落盘，必须靠 download 属性给名字）；
+     短链下载保持原样，不带 download —— 带上反而会让 IDM 认不出目标文件名。 */
+  function triggerFileDownload(url, fileName) {
     const anchor = document.createElement("a");
     anchor.href = url;
+    if (fileName) anchor.download = fileName;
     anchor.rel = "noopener";
     anchor.style.display = "none";
     document.body.appendChild(anchor);
     anchor.click();
     // ⚠️ 不能立刻 remove —— 下载接管（含 IDM 抢链）要一拍时间，删早了会把下载一起取消
     setTimeout(() => anchor.remove(), 20000);
+    // blob: 地址不主动回收会一直占着这份内存（40 张 PDF 就是十几 MB）
+    if (url.startsWith("blob:")) setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  /********** 打包 ZIP：自己拼 STORE 格式的压缩包 **********/
+  /* 为什么不用 JSZip：@require 要走外网 CDN，取不到时整份脚本都可能不执行
+     （这个脚本是干活用的，不能赌网络）。而 ZIP 的 STORE 模式只有「本地头 + 中央目录」
+     两段结构，拼出来不到 100 行，零依赖、离线可用，也不给脚本涨 100KB。
+     PDF / OFD 本身就是压缩过的，XML 只有几 KB，不压缩几乎不亏体积。 */
+  const ZIP_CONCURRENCY = 4; // 并发取文件数。实测单个 300~1000ms（冷启动 6s+），4 张并行比较稳
+  const ZIP_FILE_TIMEOUT = 60000;
+  const ZIP_CHARSET_FLAG = 0x0800; // 通用标志位 11：文件名按 UTF-8 编码（中文单位名必须，否则解压乱码）
+
+  const ZIP_CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let index = 0; index < 256; index += 1) {
+      let value = index;
+      for (let bit = 0; bit < 8; bit += 1) {
+        value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+      }
+      table[index] = value >>> 0;
+    }
+    return table;
+  })();
+
+  function zipCrc32(bytes) {
+    let crc = 0xffffffff;
+    for (let index = 0; index < bytes.length; index += 1) {
+      crc = ZIP_CRC_TABLE[(crc ^ bytes[index]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function zipDosDateTime(date) {
+    return {
+      time:
+        (date.getHours() << 11) |
+        (date.getMinutes() << 5) |
+        (date.getSeconds() >> 1),
+      day:
+        ((date.getFullYear() - 1980) << 9) |
+        ((date.getMonth() + 1) << 5) |
+        date.getDate(),
+    };
+  }
+
+  // files: [{ name, data: Uint8Array }]
+  function buildZipBlob(files) {
+    const encoder = new TextEncoder();
+    const localChunks = [];
+    const centralChunks = [];
+    const stamp = zipDosDateTime(new Date());
+    let offset = 0;
+
+    files.forEach((file) => {
+      const nameBytes = encoder.encode(file.name);
+      const data = file.data;
+      const crc = zipCrc32(data);
+
+      /* 本地文件头：30 字节定长 + 文件名 */
+      const local = new Uint8Array(30 + nameBytes.length);
+      const localView = new DataView(local.buffer);
+      localView.setUint32(0, 0x04034b50, true); // 签名 PK\003\004
+      localView.setUint16(4, 20, true); // 解压所需版本 2.0
+      localView.setUint16(6, ZIP_CHARSET_FLAG, true);
+      localView.setUint16(8, 0, true); // 压缩方法 0 = STORE
+      localView.setUint16(10, stamp.time, true);
+      localView.setUint16(12, stamp.day, true);
+      localView.setUint32(14, crc, true);
+      localView.setUint32(18, data.length, true); // 压缩后大小
+      localView.setUint32(22, data.length, true); // 原始大小
+      localView.setUint16(26, nameBytes.length, true);
+      localView.setUint16(28, 0, true); // extra 字段长度
+      local.set(nameBytes, 30);
+
+      localChunks.push(local, data);
+
+      /* 中央目录项：46 字节定长 + 文件名 */
+      const central = new Uint8Array(46 + nameBytes.length);
+      const centralView = new DataView(central.buffer);
+      centralView.setUint32(0, 0x02014b50, true); // 签名 PK\001\002
+      centralView.setUint16(4, 20, true); // 创建版本
+      centralView.setUint16(6, 20, true); // 解压所需版本
+      centralView.setUint16(8, ZIP_CHARSET_FLAG, true);
+      centralView.setUint16(10, 0, true);
+      centralView.setUint16(12, stamp.time, true);
+      centralView.setUint16(14, stamp.day, true);
+      centralView.setUint32(16, crc, true);
+      centralView.setUint32(20, data.length, true);
+      centralView.setUint32(24, data.length, true);
+      centralView.setUint16(28, nameBytes.length, true);
+      centralView.setUint16(30, 0, true); // extra 长度
+      centralView.setUint16(32, 0, true); // 注释长度
+      centralView.setUint16(34, 0, true); // 起始磁盘号
+      centralView.setUint16(36, 0, true); // 内部属性
+      centralView.setUint32(38, 0, true); // 外部属性
+      centralView.setUint32(42, offset, true); // 对应本地头的偏移
+      central.set(nameBytes, 46);
+      centralChunks.push(central);
+
+      offset += local.length + data.length;
+    });
+
+    const centralSize = centralChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+
+    /* 中央目录结束记录：22 字节定长 */
+    const end = new Uint8Array(22);
+    const endView = new DataView(end.buffer);
+    endView.setUint32(0, 0x06054b50, true); // 签名 PK\005\006
+    endView.setUint16(8, files.length, true);
+    endView.setUint16(10, files.length, true);
+    endView.setUint32(12, centralSize, true);
+    endView.setUint32(16, offset, true);
+
+    return new Blob([...localChunks, ...centralChunks, end], {
+      type: "application/zip",
+    });
+  }
+
+  /* GM 通道取字节：绕开 CORS 读 s.xforceplus.com 的短链（会 302 到 tw-doc.xforceplus.com）。
+     任何失败都收敛成 null —— 调用方按「这张没取到」处理，不中断整批。 */
+  function gmGetBinary(url) {
+    return new Promise((resolve) => {
+      if (typeof GM_xmlhttpRequest !== "function") {
+        resolve(null);
+        return;
+      }
+      try {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url,
+          responseType: "arraybuffer",
+          timeout: ZIP_FILE_TIMEOUT,
+          onload: (response) => {
+            const ok = response.status >= 200 && response.status < 400;
+            const buffer = response.response;
+            resolve(
+              ok && buffer && buffer.byteLength ? new Uint8Array(buffer) : null
+            );
+          },
+          onerror: () => resolve(null),
+          ontimeout: () => resolve(null),
+          onabort: () => resolve(null),
+        });
+      } catch (error) {
+        resolve(null);
+      }
+    });
+  }
+
+  /* 文件名规则（2026-11-12 用户定）：压缩包 =「单位名 + 几张发票」，
+     包内单个文件 =「单位名_金额_申请单号」，同一客户不会互相覆盖。 */
+  const FILE_ILLEGAL_CHARS = /[\\/:*?"<>|\u0000-\u001f]/g;
+
+  function sanitizeFilePart(text, maxLength) {
+    const cleaned = String(text || "")
+      .replace(FILE_ILLEGAL_CHARS, " ")
+      .replace(/\s+/g, " ")
+      .replace(/^[.\s]+|[.\s]+$/g, "")
+      .trim();
+    return cleaned.slice(0, maxLength || 60).trim();
+  }
+
+  function pickUnitName(item, applyCode) {
+    return sanitizeFilePart(
+      safeReplaceText((item && item.customer) || "") ||
+        (item && item.seller) ||
+        (item && item.applyNo) ||
+        applyCode,
+      40
+    );
+  }
+
+  function buildEntryName(item, applyCode, format) {
+    const unit = pickUnitName(item, applyCode);
+    const amount = sanitizeFilePart(
+      String((item && item.amount) || "").replace(/[¥￥,\s]/g, ""),
+      20
+    );
+    const serial = sanitizeFilePart(
+      (item && item.applyNo) || applyCode,
+      40
+    );
+    return [unit, amount, serial].filter(Boolean).join("_") + "." + format;
+  }
+
+  // 同名文件加 (2)(3)，不加的话解压时会互相覆盖
+  function uniqueEntryName(name, used) {
+    const seen = used.get(name) || 0;
+    used.set(name, seen + 1);
+    if (!seen) return name;
+
+    const dot = name.lastIndexOf(".");
+    const suffix = "(" + (seen + 1) + ")";
+    return dot > 0
+      ? name.slice(0, dot) + suffix + name.slice(dot)
+      : name + suffix;
+  }
+
+  function buildZipName(entries, format) {
+    const units = [...new Set(entries.map((entry) => entry.unit).filter(Boolean))];
+    const unitPart = units.length === 1 ? units[0] : "多家单位";
+    return `${unitPart}_${entries.length}张发票_${DOWNLOAD_FORMAT_LABEL[format]}.zip`;
   }
 
   function showDownloadTip(text, ok, holdMs) {
@@ -3015,7 +3230,115 @@
     if (batchState) batchState.cancelled = true;
   }
 
-  async function startBatchDownload(type, codes) {
+  /* 打包下载：并发把选中发票的字节全取到内存 → 拼一个 zip → 单次落地。
+     和逐张下载的关键差别是「不点 <a> 触发浏览器下载」，所以不受 Chrome
+     「多文件下载」拦截，也不会被 IDM 逐张抢链（blob: 地址 IDM 不接管）。 */
+  async function startZipDownload(format, targets) {
+    const label = DOWNLOAD_FORMAT_LABEL[format];
+    const metaMap = new Map(
+      collectInvoiceRows().map((item) => [item.applyCode, item])
+    );
+
+    batchState = { format, total: targets.length, done: 0, cancelled: false };
+    refreshBatchHeadButtons();
+    showDownloadTip("正在取 " + label + " 文件 0/" + targets.length, true, 600000);
+
+    const picked = []; // { index, unit, name, data }
+    const usedNames = new Map();
+    let cursor = 0;
+
+    const takeNext = async () => {
+      const index = cursor;
+      cursor += 1;
+      const applyCode = targets[index];
+
+      let bytes = null;
+      try {
+        const urls = await getInvoiceUrls(applyCode);
+        const url = urls && urls[format];
+        if (url) bytes = await gmGetBinary(url);
+      } catch (error) {
+        bytes = null;
+      }
+
+      // 用户在取文件途中点了「停止」：已经取到的先不要了，直接收工
+      if (!batchState || batchState.cancelled) return;
+
+      if (bytes) {
+        const item = metaMap.get(applyCode) || {};
+        picked.push({
+          index,
+          unit: pickUnitName(item, applyCode),
+          name: uniqueEntryName(buildEntryName(item, applyCode, format), usedNames),
+          data: bytes,
+        });
+      }
+
+      batchState.done += 1;
+      refreshBatchHeadButtons();
+      showDownloadTip(
+        "正在取 " + label + " " + batchState.done + "/" + targets.length,
+        true,
+        600000
+      );
+    };
+
+    const workerCount = Math.min(ZIP_CONCURRENCY, targets.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (cursor < targets.length && batchState && !batchState.cancelled) {
+          await takeNext();
+        }
+      })
+    );
+
+    const cancelled = !batchState || batchState.cancelled;
+    batchState = null;
+    refreshBatchHeadButtons();
+
+    if (cancelled) {
+      showDownloadTip("已停止，未生成压缩包", false);
+      return;
+    }
+    if (!picked.length) {
+      showDownloadTip("一张都没取到 " + label + "，未生成压缩包", false);
+      return;
+    }
+
+    // 并发取完的顺序是乱的，按用户勾选的顺序排回去
+    picked.sort((left, right) => left.index - right.index);
+    showDownloadTip("正在打包 " + picked.length + " 个文件…", true, 600000);
+
+    let blob;
+    try {
+      blob = buildZipBlob(picked);
+    } catch (error) {
+      showDownloadTip(
+        "打包失败：" + ((error && error.message) || "未知错误"),
+        false
+      );
+      return;
+    }
+
+    triggerFileDownload(URL.createObjectURL(blob), buildZipName(picked, format));
+
+    const sizeMb = (blob.size / 1024 / 1024).toFixed(1);
+    const skipped = targets.length - picked.length;
+    if (skipped > 0) {
+      showDownloadTip(
+        "已打包 " + picked.length + " 张 " + label + "（" + sizeMb + "MB），" +
+          skipped + " 张没取到",
+        false
+      );
+      return;
+    }
+    showDownloadTip(
+      "已打包 " + picked.length + " 张 " + label + "（" + sizeMb + "MB）",
+      true
+    );
+  }
+
+  async function startBatchDownload(type, codes, options) {
     if (batchState) return;
 
     const format = DOWNLOAD_FORMAT_FIELD[type] ? type : "pdf";
@@ -3028,6 +3351,16 @@
     if (!targets.length) {
       showDownloadTip("没有可批量下载的发票", false);
       return;
+    }
+
+    /* 勾了「打包为 ZIP」就走打包。GM 通道不在（老版本管理器 / 被禁用）时不硬失败，
+       退回逐张下载并明说原因 —— 有降级总比点了没反应强。 */
+    if (options && options.zip) {
+      if (typeof GM_xmlhttpRequest === "function") {
+        await startZipDownload(format, targets);
+        return;
+      }
+      showDownloadTip("打包组件不可用，已改为逐张下载", false);
     }
 
     batchState = { format, total: targets.length, done: 0, cancelled: false };
@@ -3107,8 +3440,8 @@
     let panel = document.getElementById(panelId);
 
     // 新旧两版并存时，同名面板可能是旧版建的（结构、样式都对不上），校验后重建
-    // build 3 = 8 列网格 + 表头（2026-11-03），build 2 是原来三列的 flex 版
-    if (panel && panel.dataset.tmBuild !== "3") {
+    // build 4 = 多一个「打包为 ZIP」勾选框（2026-11-12），build 3 = 8 列网格 + 表头（2026-11-03）
+    if (panel && panel.dataset.tmBuild !== "4") {
       panel.remove();
       const oldStyle = document.getElementById(panelId + "-style");
       if (oldStyle) oldStyle.remove();
@@ -3253,12 +3586,21 @@
         background: #237ffe; border-color: #237ffe; color: #fff;
       }
       #${panelId} .tm-batch-btn.primary:hover { background: #1a6fe0; color: #fff; }
+      /* 「打包为 ZIP」勾选框：跟格式按钮同一行，靠右停靠 */
+      #${panelId} .tm-batch-zip {
+        display: inline-flex; align-items: center; gap: 6px;
+        margin-left: auto; padding: 4px 8px; border-radius: 6px;
+        font-size: 12px; color: #595959; cursor: pointer; user-select: none;
+      }
+      #${panelId} .tm-batch-zip:hover { color: #237ffe; background: #f4f8ff; }
+      #${panelId} .tm-batch-zip input { margin: 0; cursor: pointer; }
+      #${panelId} .tm-batch-zip input:disabled { cursor: not-allowed; }
     `;
     document.head.appendChild(style);
 
     panel = document.createElement("div");
     panel.id = panelId;
-    panel.dataset.tmBuild = "3";
+    panel.dataset.tmBuild = "4";
 
     const box = document.createElement("div");
     box.className = "tm-batch-box";
@@ -3295,6 +3637,22 @@
       });
       formats.appendChild(button);
     });
+
+    /* 「打包为 ZIP」：默认不勾（2026-11-12 用户定）—— 不勾就完全是原来的逐张下载，
+       勾上才走 GM 通道取字节 + 本地拼包。 */
+    const zipLabel = document.createElement("label");
+    zipLabel.className = "tm-batch-zip";
+    zipLabel.title =
+      "勾上后不逐张下载，把选中的发票打成一个压缩包一次落地。\n" +
+      "需要先把每张的文件取完再打包，比逐张下载慢一点；好处是不触发浏览器的多文件下载拦截。";
+    const zipBox = document.createElement("input");
+    zipBox.type = "checkbox";
+    zipBox.className = "tm-batch-zip-box";
+    zipBox.checked = false;
+    const zipText = document.createElement("span");
+    zipText.textContent = "打包为 ZIP";
+    zipLabel.append(zipBox, zipText);
+    formats.appendChild(zipLabel);
 
     const bar = document.createElement("label");
     bar.className = "tm-batch-bar";
@@ -3372,6 +3730,11 @@
       true
     );
 
+    // 勾了打包，按钮文案跟着变，免得以为还是逐张下
+    zipBox.addEventListener("change", () => {
+      start.textContent = zipBox.checked ? "开始打包" : "开始下载";
+    });
+
     start.addEventListener("click", () => {
       const codes = [...list.querySelectorAll(".tm-batch-item input")]
         .filter((input) => input.checked)
@@ -3382,7 +3745,7 @@
       const format = active ? active.dataset.format : "pdf";
 
       hide();
-      startBatchDownload(format, codes);
+      startBatchDownload(format, codes, { zip: zipBox.checked });
     });
 
     panel.tmSyncCount = syncCount;
@@ -5205,10 +5568,15 @@
     if (truthHookInstalled) return;
     truthHookInstalled = true;
 
-    const originalFetch = window.fetch;
+    /* ⚠️ 必须打在 unsafeWindow 上：本脚本现在带 @grant，跑在沙箱里，
+       给沙箱的 window.fetch 赋值改不到页面真正用的那个 fetch，旁听会「静默」失效
+       （后果：销方公司真值不纠正、明细缓存不落库，全都不报错）。
+       没有沙箱时 unsafeWindow === window，两种情形都成立。 */
+    const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+    const originalFetch = pageWindow.fetch;
 
     if (typeof originalFetch === "function") {
-      window.fetch = function () {
+      pageWindow.fetch = function () {
         const result = originalFetch.apply(this, arguments);
         const options = arguments[1] || {};
         const url =

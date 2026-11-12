@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.18
+// @version      2.21
 // @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -79,9 +79,45 @@
  *   ③ 仍不成就抛 FlowBlockedError 明确提示“请按 F5 后重跑”，绝不空等 60 秒。
  * - ⚠️ 触发条件刻意用“点了编辑仍不可编辑”这个**运行态信号**，而不是猜
  *   “某个字段该有值却没有”—— 后者会把合法的空值（如合同日期）误判成未加载。
- * - 客户合同主体（甲方）是**软字段**：为空不拦保存；为空时用订单的客户名称
- *   补一次（字段定位走表单标签文本，该输入框没有稳定 id）。
+ * - 客户合同主体（甲方）：**v2.19 起是硬必填**（页面本身就是必填），
+ *   为空时用订单的客户名称补一次；补不上就报阻塞项，绝不带着空值去点保存。
+ *   字段定位走表单标签文本（该输入框没有稳定 id）。
  *   ⚠️ antd 字数统计“9 / 100”会混进 control 的 textContent，判空前先剥掉。
+ *
+ * 关于合同页“直接跳进来数据不全”（v2.19 → v2.20，2026-11-12，**已拿到运行态证据**）：
+ * - 实测：从别处直接打开 `#/order/contract?oper=check&orderCode=...` 后跑“处理合同”，
+ *   表单控件都在、无 loading 遮罩，合同金额/合同人数/提交名单时限都有值，
+ *   但 **客户合同主体（甲方）为空**（页面自己标了必填红星）→ 脚本填不上 →
+ *   点“合同保存”被页面必填校验拦下（红字“请输入客户合同主体（甲方）”）→ 白等保存。
+ * - **真因（v2.20 真机核对）**：客户名称在「基本信息」页里叫 **单位名称**，
+ *   旧标签词表只有“客户名称 / 客户全称 / 客户简称” ⇒ 永远读不到；
+ *   且该字段是 **disabled 的普通 input + 普通 div 布局**，不是 `.ant-form-item`，
+ *   旧版按 antd 表单项去找同样找不到。
+ * - v2.19 的“自动 `location.reload()` + sessionStorage 续跑”**已被红领巾否掉**
+ *   （刷新后不会自动接着跑）⇒ v2.20 整套删除，也不再“等系统把它带过来”，改为：
+ *   ① 客户名称按 单位名称 → 客户名称 → 客户全称 → 单位全称 → 单位简称 → 客户简称
+ *      依次查找，同时支持 antd form-item 与普通“标签 + 就近唯一 input”布局；
+ *   ② 先在当前页签读，读不到再读**隐藏节点**（基本信息 DOM 若仍挂载就零成本拿到），
+ *      两者都失败、且**不在编辑态**时，才临时切「基本信息」读一次再切回；
+ *   ③ 客户合同主体是**硬必填**：没值绝不点“合同保存”，直接报阻塞项，不再白等 45 秒；
+ *   ④ 填值写后静置 400ms 复查，被刷回空就重新定位再写（最多 2 次）。
+ *
+ * 关于“己方签单主体（乙方）”下拉打不开（v2.21，2026-11-12，**真机实测**）：
+ * - 现象：从「内勤复核」自动推进到合同补充时，进编辑态后卡在
+ *   “2/5 选择己方签单主体…”，36 秒后报“等待己方签单主体下拉选项超时”；
+ *   同一时刻页面控制台有两条
+ *   `Uncaught TypeError: Cannot read properties of null (reading 'getSelection')`。
+ * - 真机核对：**人工点**这个下拉能开；**只发键盘 ArrowDown** 也能开；
+ *   再“输入‘高新’→ 只剩一项 → Enter”能选中，Escape 收起后值还在。
+ *   ⇒ 是**合成 mousedown 触发了页面自身的报错**，antd 的 open 状态压根没置上，
+ *     不是数据没到、也不是选择器找错。脚本里没有 getSelection，锅在页面。
+ * - 处理：① `pickCompanyByKeyboard()` —— 焦点 → ArrowDown 打开 →
+ *   （有配置名称就打进搜索框，等到“只剩唯一一项且文本完全一致”）→
+ *   ArrowDown → Enter → Escape 收起；全程不碰 mousedown；
+ *   ② 键盘不成才退回原来的鼠标路径，且每次只等 4s（原来 60s 兜底，白等）；
+ *   ③ 两条路都不成，报错里带 `describeAntSelectState()`：
+ *   下拉是否展开、面板数、选项数、**页面最近一条报错**（新增 error 旁听器），
+ *   省得下次又只能看到一句“超时”。
  */
 
 (function () {
@@ -139,6 +175,13 @@
       "#inspectionPeopleDay",
 
     PICKER_TIMEOUT: 3500,
+
+    /*
+     * 己方签单主体下拉：键盘打不开时，鼠标路径每次最多等这么久（v2.21）。
+     * 原来走 FLOW_WAIT_TIMEOUT（60s）的兜底等待，真机上白等 36 秒。
+     */
+    CONTRACT_DROPDOWN_TIMEOUT:
+      4000,
     UPLOAD_CONFIRM_TIMEOUT: 8000,
     POLL_INTERVAL: 100,
 
@@ -171,6 +214,12 @@
       2,
     CONTRACT_TAB_SWITCH_TIMEOUT:
       8000,
+
+    /*
+     * 客户合同主体（甲方）写入后被页面重绘刷回空时的重试次数（v2.20）。
+     */
+    CONTRACT_CUSTOMER_FILL_RETRY:
+      2,
     LANDING_COPY_TIMEOUT:
       30000,
     /*
@@ -517,6 +566,59 @@
         `[SOA流程自动化] ${message}`
       );
     }
+  }
+
+  /*
+   * 页面自身报错的旁听器（v2.21）。
+   *
+   * 起因：真机上点“己方签单主体（乙方）”下拉时，页面自己抛了两次
+   *   Uncaught TypeError: Cannot read properties of null (reading 'getSelection')
+   * 下拉根本没打开，脚本只能在超时后干巴巴报一句“等待下拉选项超时”，
+   * 分不清是页面挂了、还是选择器找错了。
+   * 这里把页面最近的报错记下来，卡点信息里直接带出去。
+   */
+  const pageErrors = [];
+
+  function installPageErrorObserver() {
+    try {
+      window.addEventListener(
+        "error",
+        event => {
+          const message =
+            cleanText(
+              event?.message ||
+                event?.error?.message ||
+                ""
+            );
+
+          if (!message) {
+            return;
+          }
+
+          pageErrors.push(
+            message
+          );
+
+          if (
+            pageErrors.length >
+            5
+          ) {
+            pageErrors.shift();
+          }
+        },
+        true
+      );
+    } catch (_) {
+      // 拿不到就退化成“没有页面报错信息”，不影响主流程。
+    }
+  }
+
+  function getRecentPageError() {
+    return pageErrors.length
+      ? pageErrors[
+          pageErrors.length - 1
+        ]
+      : "";
   }
 
   function getWebNoticeText() {
@@ -1356,8 +1458,8 @@
     }
 
     /*
-     * 客户合同主体为空不拦保存（软字段），但要在卡点诊断里露出来，
-     * 否则“为什么不往下走”会看不明白。
+     * 客户合同主体是页面必填项，为空会拦保存；
+     * 卡点诊断里必须露出来，否则“为什么不往下走”会看不明白。
      */
     if (!state.customerValue) {
       issues.push(
@@ -3306,6 +3408,506 @@
     return options;
   }
 
+  /*
+   * ─── antd Select（己方签单主体）的打开与选中（v2.21）───
+   *
+   * 真机实测（2026-11-12，v2.20 装机上跑）：
+   *   用合成 mousedown/mouseup/click 点 .ant-select-selector 时，
+   *   页面自己抛两次 TypeError: Cannot read properties of null (reading 'getSelection')，
+   *   下拉根本没打开 → 脚本白等 36 秒后报“等待己方签单主体下拉选项超时”。
+   *   同一时刻**人工点**能开、**只发键盘 ArrowDown** 也能开；
+   *   再“输入搜索词 → Enter”能选中，Escape 关掉后值还在。
+   * ⇒ 首选键盘路径（完全不碰页面那段有问题的 mousedown 逻辑），
+   *   键盘不成就退回原来的鼠标路径。
+   */
+
+  function getAntSelectRoot(input) {
+    return (
+      input?.closest?.(
+        ".ant-select"
+      ) ||
+      null
+    );
+  }
+
+  function isAntSelectOpen(input) {
+    const root =
+      getAntSelectRoot(
+        input
+      );
+
+    return Boolean(
+      root &&
+        (
+          root.classList.contains(
+            "ant-select-open"
+          ) ||
+          input?.getAttribute(
+            "aria-expanded"
+          ) === "true"
+        )
+    );
+  }
+
+  /*
+   * 给 antd Select 的内部 input 补一个键盘事件。
+   * ⚠️ keyCode / which 是只读 legacy 属性，KeyboardEvent 构造器塞不进去，
+   *    必须 Object.defineProperty 覆盖 —— rc-select 部分版本读的正是 which。
+   */
+  function fireSelectKey(
+    input,
+    key,
+    keyCode
+  ) {
+    if (!input) {
+      return;
+    }
+
+    [
+      "keydown",
+      "keyup"
+    ].forEach(type => {
+      let event = null;
+
+      try {
+        event =
+          new KeyboardEvent(
+            type,
+            {
+              key,
+              code: key,
+              bubbles: true,
+              cancelable: true
+            }
+          );
+      } catch (_) {
+        try {
+          event =
+            new Event(
+              type,
+              {
+                bubbles: true,
+                cancelable: true
+              }
+            );
+        } catch (__) {
+          return;
+        }
+      }
+
+      try {
+        Object.defineProperty(
+          event,
+          "keyCode",
+          {
+            get: () => keyCode
+          }
+        );
+
+        Object.defineProperty(
+          event,
+          "which",
+          {
+            get: () => keyCode
+          }
+        );
+      } catch (_) {
+        // 老浏览器不允许覆盖就按 key 走，rc-select 新版只看 key。
+      }
+
+      input.dispatchEvent(
+        event
+      );
+    });
+  }
+
+  /*
+   * 往 antd Select 的搜索框里打字。
+   * antd 内部是受控的：必须走原生 value setter + input 事件，
+   * React 才认这次输入（直接 input.value = x 会被下一次渲染抹掉）。
+   */
+  function typeIntoSelectSearch(
+    input,
+    text
+  ) {
+    if (!input || !text) {
+      return;
+    }
+
+    const setter =
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value"
+      )?.set;
+
+    try {
+      input.focus();
+
+      if (setter) {
+        setter.call(
+          input,
+          text
+        );
+      } else {
+        input.value =
+          text;
+      }
+
+      input.dispatchEvent(
+        new Event(
+          "input",
+          {
+            bubbles: true
+          }
+        )
+      );
+
+      input.dispatchEvent(
+        new Event(
+          "change",
+          {
+            bubbles: true
+          }
+        )
+      );
+    } catch (_) {
+      // 打不进去就走“无搜索词”的路径，由选项列表兜底。
+    }
+  }
+
+  async function waitForSelectOptions(
+    input,
+    timeout,
+    token = null
+  ) {
+    const deadline =
+      Date.now() + timeout;
+
+    let ticks = 0;
+
+    while (true) {
+      const found =
+        getVisibleContractCompanyOptions(
+          input
+        );
+
+      if (found.length) {
+        return found;
+      }
+
+      if (
+        Date.now() >= deadline
+      ) {
+        return [];
+      }
+
+      if (
+        ++ticks % 10 ===
+        0
+      ) {
+        throwIfFlowCancelled(
+          token
+        );
+      }
+
+      await sleep(120);
+    }
+  }
+
+  /*
+   * 卡点诊断：只剩一句“超时”没法判断问题在哪，把下拉真实状态带出来。
+   */
+  function describeAntSelectState(
+    input
+  ) {
+    const dropdowns =
+      Array.from(
+        document.querySelectorAll(
+          ".ant-select-dropdown"
+        )
+      );
+
+    const parts = [
+      `下拉展开=${
+        isAntSelectOpen(input)
+          ? "是"
+          : "否"
+      }`,
+      `下拉面板=${
+        dropdowns.length
+      }（可见 ${
+        dropdowns.filter(
+          isVisible
+        ).length
+      }）`,
+      `选项=${
+        document.querySelectorAll(
+          ".ant-select-item-option"
+        ).length
+      }`
+    ];
+
+    const pageError =
+      getRecentPageError();
+
+    if (pageError) {
+      parts.push(
+        `页面报错=${pageError}`
+      );
+    }
+
+    return parts.join(
+      "，"
+    );
+  }
+
+  /*
+   * 选中之后收尾：等字段文本出现 → 收起下拉 → 返回文本。
+   */
+  async function finishSelectPick(input) {
+    const selected =
+      await waitFor(
+        () =>
+          getSelectVisibleText(
+            input
+          ) || null,
+        4000,
+        120
+      );
+
+    /*
+     * 选中后下拉有时仍开着，会盖住下面的“客户合同主体 / 合同日期”，
+     * 必须收起来，否则下一步点不到。
+     */
+    if (
+      isAntSelectOpen(
+        input
+      )
+    ) {
+      fireSelectKey(
+        input,
+        "Escape",
+        27
+      );
+
+      await sleep(120);
+    }
+
+    return cleanText(
+      selected
+    );
+  }
+
+  /*
+   * 有些 Select 没开 showSearch，往搜索框写字不会过滤。
+   * 这时只能逐项 ArrowDown 高亮，直到高亮项文本与目标一致再回车。
+   * 循环上限按选项数封顶，绝不无限点。
+   */
+  async function walkToActiveOption(
+    input,
+    want
+  ) {
+    const dropdowns =
+      Array.from(
+        document.querySelectorAll(
+          ".ant-select-dropdown"
+        )
+      ).filter(
+        isVisible
+      );
+
+    const dropdown =
+      dropdowns[
+        dropdowns.length - 1
+      ];
+
+    if (!dropdown) {
+      return false;
+    }
+
+    const total =
+      dropdown.querySelectorAll(
+        ".ant-select-item-option"
+      ).length;
+
+    for (
+      let step = 0;
+      step < total + 2;
+      step++
+    ) {
+      fireSelectKey(
+        input,
+        "ArrowDown",
+        40
+      );
+
+      await sleep(60);
+
+      const active =
+        dropdown.querySelector(
+          ".ant-select-item-option-active"
+        );
+
+      if (!active) {
+        continue;
+      }
+
+      if (
+        cleanText(
+          active.textContent
+        ) === want
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /*
+   * 键盘路径：ArrowDown 打开 →（有搜索词就打字过滤，只留唯一精确命中）→
+   *            ArrowDown 定位 → Enter 选中 → Escape 收起下拉。
+   * 返回选中的文本；任何一步不满足就返回 ""，交给鼠标兜底。
+   */
+  async function pickCompanyByKeyboard(
+    input,
+    text,
+    token = null
+  ) {
+    const want =
+      cleanText(text);
+
+    try {
+      input.focus();
+    } catch (_) {
+      // 焦点拿不到时 ArrowDown 也可能照样生效，继续往下走。
+    }
+
+    fireSelectKey(
+      input,
+      "ArrowDown",
+      40
+    );
+
+    let options =
+      await waitForSelectOptions(
+        input,
+        2500,
+        token
+      );
+
+    if (!options.length) {
+      if (
+        !isAntSelectOpen(
+          input
+        )
+      ) {
+        fireSelectKey(
+          input,
+          "ArrowDown",
+          40
+        );
+
+        options =
+          await waitForSelectOptions(
+            input,
+            2000,
+            token
+          );
+      }
+
+      if (!options.length) {
+        return "";
+      }
+    }
+
+    throwIfFlowCancelled(
+      token
+    );
+
+    if (want) {
+      typeIntoSelectSearch(
+        input,
+        want
+      );
+
+      /*
+       * 等到“只剩唯一一项且文本完全一致”才按 Enter ——
+       * 否则回车选中的是高亮项，可能是别人家门诊部。
+       */
+      const only =
+        await waitFor(
+          () => {
+            const found =
+              getVisibleContractCompanyOptions(
+                input
+              );
+
+            return (
+              found.length === 1 &&
+              cleanText(
+                found[0].textContent
+              ) === want
+            )
+              ? found
+              : null;
+          },
+          2500,
+          120
+        );
+
+      if (!only) {
+        /*
+         * 搜索没生效（该 Select 可能没开 showSearch）⇒ 改用高亮逐项下移，
+         * 找到文本完全一致的那一项再回车；找不到就收手，交给鼠标兜底。
+         */
+        const walked =
+          await walkToActiveOption(
+            input,
+            want
+          );
+
+        if (!walked) {
+          fireSelectKey(
+            input,
+            "Escape",
+            27
+          );
+
+          return "";
+        }
+
+        fireSelectKey(
+          input,
+          "Enter",
+          13
+        );
+
+        return finishSelectPick(
+          input
+        );
+      }
+    }
+
+    fireSelectKey(
+      input,
+      "ArrowDown",
+      40
+    );
+
+    await sleep(80);
+
+    fireSelectKey(
+      input,
+      "Enter",
+      13
+    );
+
+    return finishSelectPick(
+      input
+    );
+  }
+
   async function selectConfiguredContractCompany(
     token = null
   ) {
@@ -3378,31 +3980,84 @@
         : `2/5 选择己方签单主体：${config.text}...`
     );
 
+    /*
+     * v2.21：先走键盘（真机验证可打开、可选中）。
+     * 合成 mousedown 点 .ant-select-selector 会让页面抛
+     * “Cannot read properties of null (reading 'getSelection')” 且下拉不开。
+     */
+    const pickedByKeyboard =
+      await pickCompanyByKeyboard(
+        input,
+        config.mode === "text"
+          ? config.text
+          : "",
+        token
+      );
+
+    if (
+      pickedByKeyboard &&
+      (
+        config.mode === "first" ||
+        pickedByKeyboard ===
+          cleanText(
+            config.text
+          )
+      )
+    ) {
+      log(
+        `✓ 己方签单主体：${pickedByKeyboard}`
+      );
+
+      return {
+        skipped: false,
+        value: pickedByKeyboard
+      };
+    }
+
+    if (pickedByKeyboard) {
+      throw new Error(
+        `己方签单主体选中结果异常：预期“${config.text}”，实际“${pickedByKeyboard}”`
+      );
+    }
+
+    log(
+      "合同补充：键盘未能选中，改用鼠标点击下拉重试..."
+    );
+
     fireMouseSequence(
       selector
     );
 
-    const options =
-      await waitForReactiveCondition(
-        () => {
-          const found =
-            getVisibleContractCompanyOptions(
-              input
-            );
-
-          return found.length
-            ? found
-            : null;
-        },
-        {
-          label:
-            "己方签单主体下拉选项",
-          token,
-          blockerCheck:
-            () =>
-              getVisibleErrorFeedback()
-        }
+    let options =
+      await waitForSelectOptions(
+        input,
+        CONFIG.CONTRACT_DROPDOWN_TIMEOUT,
+        token
       );
+
+    if (!options.length) {
+      /*
+       * 有些版本第一次点击只把焦点给了输入框，再点一次才开。
+       */
+      fireMouseSequence(
+        selector
+      );
+
+      options =
+        await waitForSelectOptions(
+          input,
+          CONFIG.CONTRACT_DROPDOWN_TIMEOUT,
+          token
+        );
+    }
+
+    if (!options.length) {
+      throw new Error(
+        `未能打开“己方签单主体（乙方）”下拉（${describeAntSelectState(
+          input
+        )}）。可在页面上手动选择该主体，或到“查看说明”里确认签单主体配置后重跑。`
+      );
+    }
 
     throwIfFlowCancelled(
       token
@@ -3487,10 +4142,30 @@
       );
     }
 
+    /*
+     * 选中后下拉有时仍开着，会盖住下面的“客户合同主体 / 合同日期”，
+     * 必须收起来，否则下一步点不到。
+     */
+    if (
+      isAntSelectOpen(
+        input
+      )
+    ) {
+      fireSelectKey(
+        input,
+        "Escape",
+        27
+      );
+
+      await sleep(120);
+    }
+
     if (
       config.mode === "text" &&
       selected !==
-        config.text
+        cleanText(
+          config.text
+        )
     ) {
       throw new Error(
         `己方签单主体选中结果异常：预期“${config.text}”，实际“${selected}”`
@@ -4171,9 +4846,20 @@
   const CUSTOMER_PARTY_LABEL =
     "客户合同主体";
 
+  /*
+   * 订单客户名称在页面上的标签词表（v2.20 真机核对）。
+   *
+   * ⚠️ 关键：SOA「基本信息」页里的字段叫 **单位名称**，不是“客户名称” ——
+   *   旧版只认“客户名称 / 客户全称 / 客户简称”，所以永远读不到，
+   *   进而填不上客户合同主体，最后带着空必填去点保存被页面拦下。
+   * 顺序即优先级：全称优先，简称只作最后兜底。
+   */
   const CUSTOMER_NAME_LABELS = [
+    "单位名称",
     "客户名称",
     "客户全称",
+    "单位全称",
+    "单位简称",
     "客户简称"
   ];
 
@@ -4317,45 +5003,390 @@
     );
   }
 
-  function readCustomerNameFromDocument() {
-    for (
-      const label
-      of CUSTOMER_NAME_LABELS
-    ) {
-      const item =
-        findFormItemByLabel(
-          label,
-          document,
-          {
-            visibleOnly: true
-          }
+  /*
+   * 标签文本归一：去空白、去必填星号、去中英文冒号。
+   */
+  function normalizeLabelText(
+    text
+  ) {
+    return cleanText(
+      text
+    ).replace(
+      /[*＊:：\s]/g,
+      ""
+    );
+  }
+
+  /*
+   * 从某个起点元素“就近”取输入框的值。
+   *
+   * 背景：基本信息页不是 antd 表单，字段布局至少有三种写法——
+   *   ① <div class="row"><label>单位名称：</label><input disabled></div>
+   *   ② <td>单位名称：</td><td><input disabled></td>
+   *   ③ <span>单位名称：</span><input disabled><span>单位联系人：</span><input disabled>
+   * 所以取值分三档：label 自身是 input → 紧邻兄弟是 input → 逐层向上找。
+   *
+   * ⚠️ 向上找时**只在第一层**允许“范围内有多个 input 就取 label 之后第一个”，
+   *    再往上就只认“恰好 1 个”。这是为了绝不把“单位联系人 / 单位电话”
+   *    的值填进客户合同主体（宁可读不到，也不填错）。
+   */
+  function readNearestInputValue(
+    startEl,
+    visibleOnly
+  ) {
+    if (!startEl) {
+      return "";
+    }
+
+    /*
+     * 用字面量 4（Node.DOCUMENT_POSITION_FOLLOWING），
+     * 免得测试环境里要额外注入 Node 全局。
+     */
+    const POSITION_FOLLOWING = 4;
+
+    const usable =
+      input =>
+        Boolean(
+          input &&
+          !(
+            visibleOnly &&
+            !isVisible(input)
+          )
         );
 
-      if (!item) {
+    const read =
+      input =>
+        cleanText(
+          input?.value
+        );
+
+    /* ① label 自己就是 input（少数布局把标签写成 input 的 aria-label） */
+    if (
+      usable(startEl) &&
+      startEl.matches?.(
+        "input, textarea"
+      )
+    ) {
+      return read(startEl);
+    }
+
+    /* ② 紧邻的下一个兄弟就是 input，或兄弟内恰好一个 input */
+    const next =
+      startEl.nextElementSibling;
+
+    if (next) {
+      if (
+        usable(next) &&
+        next.matches?.(
+          "input, textarea"
+        )
+      ) {
+        return read(next);
+      }
+
+      const insideNext =
+        Array.from(
+          next.querySelectorAll?.(
+            "input, textarea"
+          ) || []
+        ).filter(usable);
+
+      if (
+        insideNext.length === 1
+      ) {
+        return read(
+          insideNext[0]
+        );
+      }
+    }
+
+    /* ③ 逐层向上（≤4 层） */
+    let el =
+      startEl;
+
+    for (
+      let depth = 1;
+      depth <= 4 && el;
+      depth++
+    ) {
+      el =
+        el.parentElement;
+
+      if (!el) {
+        break;
+      }
+
+      const inputs =
+        Array.from(
+          el.querySelectorAll(
+            "input, textarea"
+          )
+        ).filter(usable);
+
+      if (!inputs.length) {
         continue;
       }
 
-      /*
-       * 别把“客户合同主体”当成客户名称的来源。
-       */
       if (
-        getFormItemLabelText(
-          item
-        ).includes(
-          CUSTOMER_PARTY_LABEL
-        )
+        inputs.length === 1
       ) {
+        return read(
+          inputs[0]
+        );
+      }
+
+      /*
+       * 只有第一层（label 的直接父级，通常就是“这一行/这一格”）
+       * 才允许按 DOM 顺序挑 label 之后的第一个 —— 再往上就可能是
+       * 整张表，挑出来的值没有意义。
+       */
+      if (depth === 1) {
+        const after =
+          inputs.find(
+            input =>
+              Boolean(
+                startEl.compareDocumentPosition(
+                  input
+                ) &
+                  POSITION_FOLLOWING
+              )
+          );
+
+        if (after) {
+          return read(after);
+        }
+      }
+    }
+
+    return "";
+  }
+
+  /*
+   * 按标签文本取值，**不依赖 antd form-item 结构**（v2.20）。
+   *
+   * SOA「基本信息」页不是标准 antd 表单，字段形如
+   *   单位名称：  [河南新飞智家科技有限公司]（disabled input）
+   * 旧版只查 .ant-form-item ⇒ 永远读不到。
+   */
+  function readFieldValueByLabels(
+    labels,
+    {
+      visibleOnly = false,
+      scope = null
+    } = {}
+  ) {
+    const targets =
+      labels.map(
+        normalizeLabelText
+      ).filter(Boolean);
+
+    if (!targets.length) {
+      return "";
+    }
+
+    /*
+     * “客户合同主体（甲方）”不能当成客户名称来源：
+     * 归一化后它不会命中上面的标签词，这里再加一道兜底。
+     */
+    const isPartyLabel =
+      labelText =>
+        labelText.includes(
+          CUSTOMER_PARTY_LABEL
+        );
+
+    /*
+     * ① antd 表单（label / control 配对），最准，先走它。
+     *    ⚠️ 必须按 targets 的顺序取，不能按 DOM 顺序
+     *    —— 否则“单位简称”出现在“单位名称”前面时会被先取走。
+     */
+    const items =
+      Array.from(
+        document.querySelectorAll(
+          ".ant-form-item"
+        )
+      )
+        .filter(
+          item =>
+            !(
+              visibleOnly &&
+              !isVisible(item)
+            )
+        )
+        .map(item => ({
+          item,
+          labelText:
+            normalizeLabelText(
+              item.querySelector(
+                ".ant-form-item-label"
+              )?.textContent
+            )
+        }))
+        .filter(
+          row =>
+            Boolean(
+              row.labelText
+            ) &&
+            !isPartyLabel(
+              row.labelText
+            )
+        );
+
+    for (const target of targets) {
+      const hit =
+        items.find(
+          row =>
+            row.labelText ===
+              target ||
+            row.labelText.startsWith(
+              target
+            )
+        );
+
+      if (!hit) {
         continue;
       }
 
       const value =
-        readFormItemOwnValue(
-          item
+        cleanText(
+          hit.item.querySelector(
+            "input, textarea"
+          )?.value
+        ) ||
+        readFormItemDisplayText(
+          hit.item
         );
 
       if (value) {
         return value;
       }
+    }
+
+    /*
+     * ② 非 antd 布局：**每个容器只遍历一次**文本节点，把命中标签的位置收集起来，
+     *    再按 targets 顺序逐个取值（同样是优先级优先）。
+     *    真机：基本信息里的「单位名称」是 disabled input + 普通 div 布局。
+     *
+     *    先扫 #register（订单基本信息容器），扫不到再退全文档 ——
+     *    #register 不一定就是那块，所以不能只扫它。
+     */
+    const collect =
+      root => {
+        const found =
+          new Map();
+
+        const walker =
+          document.createTreeWalker(
+            root,
+            NodeFilter.SHOW_TEXT
+          );
+
+        let node = null;
+
+        while (
+          (
+            node =
+              walker.nextNode()
+          )
+        ) {
+          const text =
+            normalizeLabelText(
+              node.nodeValue
+            );
+
+          if (
+            !text ||
+            !targets.includes(
+              text
+            ) ||
+            !node.parentElement
+          ) {
+            continue;
+          }
+
+          if (!found.has(text)) {
+            found.set(
+              text,
+              []
+            );
+          }
+
+          found.get(text).push(
+            node.parentElement
+          );
+        }
+
+        return found;
+      };
+
+    const pickFrom =
+      hits => {
+        for (const target of targets) {
+          for (const el of hits.get(target) || []) {
+            const value =
+              readNearestInputValue(
+                el,
+                visibleOnly
+              );
+
+            if (value) {
+              return value;
+            }
+          }
+        }
+
+        return "";
+      };
+
+    const roots = [];
+
+    if (scope) {
+      roots.push(scope);
+    } else {
+      const registerEl =
+        document.querySelector(
+          "#register"
+        );
+
+      if (registerEl) {
+        roots.push(registerEl);
+      }
+
+      roots.push(
+        document.body
+      );
+    }
+
+    for (const root of roots) {
+      const value =
+        pickFrom(
+          collect(root)
+        );
+
+      if (value) {
+        return value;
+      }
+    }
+
+    return "";
+  }
+
+  function readCustomerNameFromDocument(
+    {
+      visibleOnly = true,
+      scope = null
+    } = {}
+  ) {
+    const name =
+      readFieldValueByLabels(
+        CUSTOMER_NAME_LABELS,
+        {
+          visibleOnly,
+          scope
+        }
+      );
+
+    if (name) {
+      return name;
     }
 
     /*
@@ -4369,9 +5400,14 @@
         )
       ).find(item => {
         return (
-          isVisible(item) &&
-          getFormItemLabelText(
-            item
+          (
+            !visibleOnly ||
+            isVisible(item)
+          ) &&
+          normalizeLabelText(
+            getFormItemLabelText(
+              item
+            )
           ) === "客户"
         );
       });
@@ -4382,18 +5418,32 @@
   }
 
   /*
-   * 读取“该订单的客户名称”。
-   * 优先直接读当前文档（合同页若已带出客户名称就不用切页签）；
-   * 读不到再临时切到“基本信息”读一次，然后切回合同页。
-   * ⚠️ 编辑态下绝不切页签，否则会丢掉已填内容。
+   * 读取“该订单的客户名称”（v2.20 重写）。
+   *
+   * 顺序（越靠前越“不绕圈”）：
+   *   ① 当前页面可见区域 —— 合同页若自带客户信息直接拿走；
+   *   ② 全文档（含隐藏节点）—— 基本信息页签若只是 display:none 仍挂在 DOM 里，
+   *      这一步就能零成本拿到「单位名称」，完全不用切页签；
+   *   ③ 仍读不到且不在编辑态 —— 才临时切到“基本信息”读一次再切回。
+   * ⚠️ 编辑态下绝不切页签：页面会弹「合同信息还未保存」拦住，
+   *    而且切走会丢掉已填内容。
    */
   async function resolveOrderCustomerName(
     token = null
   ) {
     const direct =
-      readCustomerNameFromDocument();
+      readCustomerNameFromDocument() ||
+      readCustomerNameFromDocument(
+        {
+          visibleOnly: false
+        }
+      );
 
     if (direct) {
+      log(
+        `✓ 已读取订单客户名称：${direct}`
+      );
+
       return direct;
     }
 
@@ -4548,16 +5598,76 @@
       `合同补充：客户合同主体（甲方）为空，填入订单客户名称“${want}”...`
     );
 
-    const stable =
+    /*
+     * v2.19：写入后只等 2 帧不够。
+     * 实测这类表单会“晚到一次重绘把值刷回去”，
+     * 所以每次写完全静置 400ms 再复查，最多重试 CONTRACT_CUSTOMER_FILL_RETRY 次。
+     */
+    let filled =
+      "";
+
+    for (
+      let attempt = 1;
+      attempt <=
+      CONFIG.CONTRACT_CUSTOMER_FILL_RETRY;
+      attempt++
+    ) {
+      throwIfFlowCancelled(
+        token
+      );
+
+      /*
+       * 每次重试都重新定位：React 重绘可能把原来的 input 整个换掉。
+       */
+      const current =
+        getCustomerContractPartyState();
+
+      if (!current.input) {
+        break;
+      }
+
+      if (current.value) {
+        filled =
+          current.value;
+
+        break;
+      }
+
+      if (attempt > 1) {
+        log(
+          `客户合同主体（甲方）被页面刷回空，重试写入（第 ${attempt} 次）...`
+        );
+      }
+
       await waitForStableControlledValue(
-        state.input,
+        current.input,
         want,
         token
       );
 
-    if (!stable) {
+      current.input.focus();
+      current.input.blur();
+
+      await sleep(400);
+
+      throwIfFlowCancelled(
+        token
+      );
+
+      const verify =
+        getCustomerContractPartyState();
+
+      if (verify.value) {
+        filled =
+          verify.value;
+
+        break;
+      }
+    }
+
+    if (!filled) {
       warn(
-        "客户合同主体（甲方）写入后未能稳定保持，需人工检查。"
+        "客户合同主体（甲方）写入后未能保持，需人工检查（页面数据晚到后可能又把值刷回空了）。"
       );
 
       return {
@@ -4566,16 +5676,13 @@
       };
     }
 
-    state.input.focus();
-    state.input.blur();
-
     log(
-      `✓ 客户合同主体（甲方）：${state.input.value}`
+      `✓ 客户合同主体（甲方）：${filled}`
     );
 
     return {
       skipped: false,
-      value: state.input.value
+      value: filled
     };
   }
 
@@ -4584,7 +5691,6 @@
       getCurrentContractField(
         CONFIG.CONTRACT_COMPANY_SELECTOR
       );
-
     const begin =
       getCurrentContractField(
         CONFIG.CONTRACT_BEGIN_SELECTOR
@@ -4608,6 +5714,9 @@
         )
       );
 
+    const customerParty =
+      getCustomerContractPartyState();
+
     return {
       companyValue:
         getSelectVisibleText(
@@ -4630,13 +5739,17 @@
         ),
       inspectionApplicable,
       /*
-       * 客户合同主体（甲方）是“软”字段：
-       * 为空不拦保存，但为空时脚本会尝试用订单客户名称补一次，
-       * 所以这里只作为变更检测/保存后复核的参照。
+       * 客户合同主体（甲方）在页面上是**必填**（label 带红星，
+       * 校验文案“请输入客户合同主体（甲方）”）。
+       * v2.19 起改为硬字段：当前合同类型有这一项却为空 ⇒ 拦保存。
+       * customerApplicable 用来区分“该合同类型没有这一项”。
        */
+      customerApplicable:
+        Boolean(
+          customerParty.item
+        ),
       customerValue:
-        getCustomerContractPartyState()
-          .value
+        customerParty.value
     };
   }
 
@@ -4670,6 +5783,19 @@
     ) {
       issues.push(
         "提交名单时限为空"
+      );
+    }
+
+    /*
+     * 客户合同主体（甲方）：页面必填。空着就点“合同保存”只会被
+     * 页面校验拦下并留下红字，脚本还会白等 45 秒 —— 这里直接拦。
+     */
+    if (
+      snapshot.customerApplicable &&
+      !snapshot.customerValue
+    ) {
+      issues.push(
+        "客户合同主体（甲方）为空"
       );
     }
 
@@ -4721,7 +5847,7 @@
     }
 
     /*
-     * 客户合同主体是软字段：比较时忽略空白差异，
+     * 客户合同主体比较时忽略空白差异，
      * 避免后端对名称做空格/换行归一化就误判成“保存失败”。
      */
     if (
@@ -6651,6 +7777,7 @@
       `合同页数据未能加载完成：字段为空或整块不可编辑。已自动重载合同页 ${CONFIG.CONTRACT_REMOUNT_MAX_ATTEMPTS} 次仍无效，请按 F5 刷新页面后重跑本流程。`
     );
   }
+
 
   async function ensureContractTabVisible(
     token = null
@@ -10270,9 +11397,14 @@
         orderCustomerName = "";
       }
 
+      /*
+       * v2.20：不再“等系统把它带过来”，也不再刷新页面 ——
+       * 直接自己填。读不到客户名称就明说，保存前会被必填校验拦住，
+       * 不会出现“带着空值去点保存然后干等”的假卡死。
+       */
       if (!orderCustomerName) {
         warn(
-          "客户合同主体（甲方）为空，但未能从页面读取到订单客户名称，本次不自动填写，请人工补填。"
+          "客户合同主体（甲方）为空，且页面上读不到订单客户名称（基本信息里的“单位名称”）；本次不自动填写，请人工补填后重跑。"
         );
       }
     }
@@ -10290,9 +11422,7 @@
       !formLooksEditable()
     ) {
       log(
-        customerPartyEmpty
-          ? "✓ 合同必填字段及上传文件已完整（客户合同主体仍为空，已提示人工补填），跳过重复处理。"
-          : "✓ 合同字段及当前合同类型的上传文件已完整，验证通过并跳过重复处理。"
+        "✓ 合同字段及当前合同类型的上传文件已完整，验证通过并跳过重复处理。"
       );
 
       updatePanelStatus(
@@ -10355,8 +11485,20 @@
         );
 
       if (afterIssues.length) {
+        /*
+         * 客户主体为空基本只有一个原因：页面上读不到订单客户名称。
+         * 只说“为空”他会不知道怎么收场，这里把下一步动作写清楚，
+         * 并且不要再提“按 F5 重跑”（v2.20 已经不走刷新那条路了）。
+         */
+        const tip =
+          afterIssues.includes(
+            "客户合同主体（甲方）为空"
+          )
+            ? "\n请在本页手动填入客户合同主体（甲方）后点“合同保存”，再重跑本流程（其余字段脚本已填好）。"
+            : "";
+
         throw new FlowBlockedError(
-          `合同字段填写后复核未通过：${afterIssues.join("、")}`
+          `合同字段填写后复核未通过：${afterIssues.join("、")}${tip}`
         );
       }
 
@@ -12957,9 +14099,11 @@
     }
   })();
 
+  installPageErrorObserver();
+
   routeCheck();
 
   console.log(
-    "[SOA智能审批] v2.18 已加载"
+    "[SOA智能审批] v2.21 已加载"
   );
 })();
