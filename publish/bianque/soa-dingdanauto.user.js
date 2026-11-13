@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.21
+// @version      2.23
 // @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -118,6 +118,49 @@
  *   ③ 两条路都不成，报错里带 `describeAntSelectState()`：
  *   下拉是否展开、面板数、选项数、**页面最近一条报错**（新增 error 旁听器），
  *   省得下次又只能看到一句“超时”。
+ *
+ * 关于合同页两个下拉"选项还没拉回来就被点"（v2.22，2026-11-13）：
+ * - 现象（红领巾）：脚本一跳进合同页就往下走，「对应发单分院」「己方签单主体（乙方）」
+ *   这两个**远端下拉**的数据还没返回 —— 面板打开是空的，脚本 2.5 秒就判“打不开”，
+ *   后面的鼠标路径再等 4 秒×2 也白等，表现就是卡住。人工隔几秒再点就正常。
+ * - 关键认识：系统带出来的值（尤其签单主体）是**进编辑态之后**才渲染的。
+ *   脚本立刻读 ⇒ 读到空 ⇒ 以为要自己选 ⇒ 这时下拉也没数据 ⇒ 必然卡。
+ *   所以"等"的位置要提前到**刚进编辑态**，而不是等到点下拉时才发现空。
+ * - 处理（三层，全部只加等待与重开，不改任何判定口径）：
+ *   ① `waitForContractDomQuiet()` —— 编辑态进完后，等合同容器连续 500ms
+ *      无 DOM 变化再动手；
+ *   ② `waitForContractSelectsReady()` —— 再等两个下拉的 loading 标记消失；
+ *      签单主体为空时额外给 1.5 秒观察窗，等系统把它带出来（带出来后
+ *      `selectConfiguredContractCompany` 直接跳过，压根不碰下拉）；
+ *   ③ `waitForContractSelectOptions()` —— 真要点下拉时，预算 2.5s → 12s，
+ *      面板被页面重绘收起就每 900ms 自动再敲一次 ArrowDown（不再抢跑）。
+ * - 「对应发单分院」：脚本**不代选**（没有选择依据），仅在为空时提示一句；
+ *   它被纳入 loading 观测，作为"合同页数据是否就绪"的信号之一。
+ *
+ * 关于「客户合同主体（甲方）」为空却不填、直接报错（v2.23，2026-11-13，**真机核对**）：
+ * - 现象：v2.22 推完合同流程报「合同字段填写后复核未通过：客户合同主体（甲方）为空」，
+ *   而页面上客户名称（单位名称）明明是有的；他说"应该填充，而不是卡住"。
+ * - 真机核对（CDP 直读当时那个合同页，Chrome 157）：
+ *   ① 客户名称有**稳定 id**：`#register_corp_name`（disabled，值 = 封丘县审计局）；
+ *      基本信息页签切走后 `#register` 仍挂在 body 上（0×0 不可见）⇒
+ *      **不切页签也能读到**；
+ *   ② 客户主体输入框也有稳定 id：`#customerContractCompany`（maxlength=100）；
+ *   ③ 用脚本那套写法（原生 setter + input/change）往里写，**3.5 秒内值稳定不被刷回**
+ *      ⇒ 写值方式本身没问题，不是"写了又被冲掉"。
+ * - 真因（推断，但两个已知漏洞都指向它）：判空写成了
+ *     `Boolean(customerParty.item) && !customerParty.value`
+ *   —— 页面刚重挂载/刚重绘时 item 可能一时查不到 ⇒ 判成"不为空" ⇒
+ *   **整段补填被静默跳过** ⇒ 直到复核才报"为空"。这正是他描述的
+ *   "卡了一下之后又往下进行了，然后报这个"。
+ * - 处理：
+ *   ① 判空只看值（item 找不到不再等于"有值"），字段是否存在交给 fill 内部判；
+ *   ② 客户名称改 **id 直取 + 按 orderCode 缓存**（流程一开始就留底），
+ *      合同阶段不再现场找、更不切页签；
+ *   ③ 客户主体改按 **进编辑态之后**的状态判（查看态与编辑态不是同一份 DOM）；
+ *   ④ 写入复查 400ms → **递增 400/1200/2000ms**；填完日期/名单时限后**再补一次**
+ *      （整表重绘会把值刷掉）；
+ *   ⑤ 阻塞文案按原因分开写（读不到名字 / 写入被刷回 / 字段不可编辑 / 超长），
+ *      不再一律"请手动填"。
  */
 
 (function () {
@@ -179,9 +222,10 @@
     /*
      * 己方签单主体下拉：键盘打不开时，鼠标路径每次最多等这么久（v2.21）。
      * 原来走 FLOW_WAIT_TIMEOUT（60s）的兜底等待，真机上白等 36 秒。
+     * v2.22：4s → 8s —— 选项数据本身就慢的时候，4 秒不够，会误判成"打不开"。
      */
     CONTRACT_DROPDOWN_TIMEOUT:
-      4000,
+      8000,
     UPLOAD_CONFIRM_TIMEOUT: 8000,
     POLL_INTERVAL: 100,
 
@@ -216,10 +260,35 @@
       8000,
 
     /*
-     * 客户合同主体（甲方）写入后被页面重绘刷回空时的重试次数（v2.20）。
+     * 客户合同主体（甲方）写入后的复查节奏（v2.23）。
+     *
+     * 原来叫 CONTRACT_CUSTOMER_FILL_RETRY = 2（写 → 等 400ms → 复查）。
+     * 真机上页面数据晚到时，400ms 内那次重绘还没发生，复查"看起来成功了"，
+     * 几秒后值又被刷回空 ⇒ 复核报"为空"。改成递增等待，见
+     * fillCustomerContractParty 里的 fillWaits。
      */
-    CONTRACT_CUSTOMER_FILL_RETRY:
-      2,
+    CONTRACT_CUSTOMER_FILL_WAITS: [
+      400,
+      1200,
+      2000
+    ],
+
+    /*
+     * 合同页两个远端下拉（对应发单分院 / 己方签单主体）"数据未就绪"（v2.22）。
+     *
+     * 现象（2026-11-13 红领巾反馈）：脚本刚跳进合同页就动手，这两个下拉的选项
+     * 还在异步拉取 —— 面板打开是空的，脚本立刻判失败，看起来就是"卡住"；
+     * 人工等几秒再点就正常。处理：进编辑态后先等 DOM 静默，点下拉后
+     * "空面板就重开"，总共给 12 秒，而不是原来 2.5 秒就放弃。
+     */
+    CONTRACT_SELECT_READY_TIMEOUT:
+      12000,
+    CONTRACT_SELECT_REOPEN_INTERVAL:
+      900,
+    CONTRACT_FORM_SETTLE_QUIET:
+      500,
+    CONTRACT_FORM_SETTLE_TIMEOUT:
+      5000,
     LANDING_COPY_TIMEOUT:
       30000,
     /*
@@ -3615,7 +3684,500 @@
   }
 
   /*
-   * 卡点诊断：只剩一句“超时”没法判断问题在哪，把下拉真实状态带出来。
+   * ─── 下拉"数据未就绪"的等待与重开（v2.22）───
+   *
+   * 背景（红领巾 2026-11-13）：合同页「对应发单分院」「己方签单主体（乙方）」
+   * 两个都是远端下拉，脚本从别的页面跳过来后立刻动手，选项还没拉回来 ——
+   * 面板打开是空的，脚本当成"打不开"，于是卡住。人工等几秒再点就一切正常。
+   * ⇒ 不能把"空面板"当结论，要给它时间，并且面板被页面重绘收起时自动重开。
+   */
+
+  function getAntSelectDropdownEl(
+    input
+  ) {
+    const controlsId =
+      input?.getAttribute(
+        "aria-controls"
+      );
+
+    if (controlsId) {
+      const list =
+        document.getElementById(
+          controlsId
+        );
+
+      const dropdown =
+        list?.closest?.(
+          ".ant-select-dropdown"
+        );
+
+      if (dropdown) {
+        return dropdown;
+      }
+    }
+
+    const own =
+      getAntSelectRoot(
+        input
+      )?.querySelector?.(
+        ".ant-select-dropdown"
+      );
+
+    if (own) {
+      return own;
+    }
+
+    /*
+     * 兜底：antd 把面板挂在 body 上，且部分版本 input 上没有 aria-controls。
+     * 同一时刻同一页通常只开一个下拉，取最上层那个可见面板即可
+     * （只用于读状态/诊断，不用于"判断是否打开"）。
+     */
+    const visible =
+      Array.from(
+        document.querySelectorAll(
+          ".ant-select-dropdown"
+        )
+      )
+        .filter(isVisible)
+        .reverse();
+
+    return (
+      visible[0] ||
+      null
+    );
+  }
+
+  function hasSelectLoadingMark(
+    selectRoot
+  ) {
+    if (!selectRoot) {
+      return false;
+    }
+
+    return Boolean(
+      selectRoot.classList?.contains(
+        "ant-select-loading"
+      ) ||
+        selectRoot.querySelector?.(
+          ".ant-select-arrow-loading, .anticon-loading, .ant-spin-spinning"
+        )
+    );
+  }
+
+  /*
+   * 读下拉的"数据状态"：开没开、几项、是不是还在加载、空态文案。
+   * ⚠️ antd 的"暂无数据"既可能是真的没数据，也可能是首次拉取还没回来，
+   *    所以空态只能当"再等等"的信号，不能当结论。
+   */
+  function getAntSelectDataState(
+    input
+  ) {
+    const dropdown =
+      getAntSelectDropdownEl(
+        input
+      );
+
+    const options =
+      getVisibleContractCompanyOptions(
+        input
+      );
+
+    const emptyEl =
+      dropdown?.querySelector?.(
+        ".ant-select-item-empty, .ant-empty-normal"
+      );
+
+    return {
+      open:
+        isAntSelectOpen(
+          input
+        ),
+      optionCount:
+        options.length,
+      loading:
+        hasSelectLoadingMark(
+          getAntSelectRoot(
+            input
+          )
+        ) ||
+        Boolean(
+          dropdown?.querySelector?.(
+            ".ant-spin-spinning, .anticon-loading"
+          )
+        ),
+      emptyHint:
+        cleanText(
+          emptyEl?.textContent
+        ),
+      options
+    };
+  }
+
+  /*
+   * 等下拉选项真的出现（v2.22）。
+   *
+   * 与 waitForSelectOptions 的差别：
+   *   ① 预算 12 秒（原来 2.5 秒），专治"进页面就点、选项还没到"；
+   *   ② 面板被页面重绘收起时，每 900ms 自动再敲一次 ArrowDown；
+   *   ③ 字段 disabled / 不存在时立刻返回，不白等。
+   */
+  async function waitForContractSelectOptions(
+    input,
+    token = null,
+    timeout = CONFIG.CONTRACT_SELECT_READY_TIMEOUT
+  ) {
+    if (
+      !input ||
+      input.disabled
+    ) {
+      return [];
+    }
+
+    const deadline =
+      Date.now() + timeout;
+
+    let nextOpenAt = 0;
+    let ticks = 0;
+
+    while (true) {
+      const options =
+        getVisibleContractCompanyOptions(
+          input
+        );
+
+      if (options.length) {
+        return options;
+      }
+
+      if (
+        Date.now() >= deadline
+      ) {
+        return [];
+      }
+
+      /*
+       * 面板没开就别干等：再敲一次 ArrowDown。
+       * 间隔 900ms —— 太密会和页面自己的重绘抢状态。
+       */
+      if (
+        !isAntSelectOpen(
+          input
+        ) &&
+        Date.now() >= nextOpenAt
+      ) {
+        fireSelectKey(
+          input,
+          "ArrowDown",
+          40
+        );
+
+        nextOpenAt =
+          Date.now() +
+          CONFIG.CONTRACT_SELECT_REOPEN_INTERVAL;
+      }
+
+      if (
+        ++ticks % 20 ===
+        0
+      ) {
+        throwIfFlowCancelled(
+          token
+        );
+      }
+
+      await sleep(150);
+    }
+  }
+
+  /*
+   * 等合同容器"安静下来"（v2.22）。
+   *
+   * 判据：连续 quiet 毫秒没有 DOM 变化 ⇒ 编辑态渲染完、系统带出来的值已落地。
+   * ⚠️ 只能保证"当前这波渲染结束"，接口晚于它返回的情形由
+   *    waitForContractSelectOptions 兜底，所以这里等不到也不算失败。
+   */
+  function waitForContractDomQuiet(
+    quiet = CONFIG.CONTRACT_FORM_SETTLE_QUIET,
+    timeout = CONFIG.CONTRACT_FORM_SETTLE_TIMEOUT
+  ) {
+    const container =
+      getContractContainer();
+
+    if (
+      !container ||
+      typeof MutationObserver !==
+        "function"
+    ) {
+      return Promise.resolve(
+        false
+      );
+    }
+
+    return new Promise(
+      resolve => {
+        let done = false;
+        let quietTimer = null;
+        let hardTimer = null;
+
+        const finish = () => {
+          if (done) {
+            return;
+          }
+
+          done = true;
+
+          try {
+            observer.disconnect();
+          } catch (_) {
+            // 已经断开过就算了。
+          }
+
+          clearTimeout(
+            quietTimer
+          );
+          clearTimeout(
+            hardTimer
+          );
+
+          resolve(true);
+        };
+
+        const observer =
+          new MutationObserver(
+            () => {
+              clearTimeout(
+                quietTimer
+              );
+
+              quietTimer =
+                setTimeout(
+                  finish,
+                  quiet
+                );
+            }
+          );
+
+        hardTimer =
+          setTimeout(
+            finish,
+            timeout
+          );
+
+        quietTimer =
+          setTimeout(
+            finish,
+            quiet
+          );
+
+        try {
+          observer.observe(
+            container,
+            {
+              /*
+               * 不监听 attributes：hover / 校验态之类的 class 变化
+               * 会把"安静"一直往后推，白等到超时。
+               */
+              childList: true,
+              subtree: true,
+              characterData: true
+            }
+          );
+        } catch (_) {
+          finish();
+        }
+      }
+    );
+  }
+
+  /*
+   * 「对应发单分院」下拉（v2.22 新增定位）。
+   * 只用来判断"系统有没有带出值"，脚本本身不代选 —— 没有选择依据。
+   * 该字段不是 .ant-form-item 时就定位不到，返回 null，不影响主流程。
+   */
+  function getContractBranchSelect() {
+    const container =
+      getContractContainer();
+
+    const scopes =
+      container
+        ? [
+            container,
+            document
+          ]
+        : [document];
+
+    for (
+      const scope
+      of scopes
+    ) {
+      const item =
+        findFormItemByLabel(
+          "对应发单分院",
+          scope,
+          {
+            visibleOnly: true
+          }
+        );
+
+      const select =
+        item?.querySelector(
+          ".ant-select"
+        );
+
+      if (
+        select &&
+        isVisible(select)
+      ) {
+        return select;
+      }
+    }
+
+    return null;
+  }
+
+  function getContractBranchState() {
+    const select =
+      getContractBranchSelect();
+
+    const input =
+      select?.querySelector(
+        "input"
+      ) ||
+      null;
+
+    return {
+      select,
+      input,
+      value:
+        cleanText(
+          select?.querySelector(
+            ".ant-select-selection-item"
+          )?.textContent
+        ) ||
+        cleanText(
+          input?.value
+        )
+    };
+  }
+
+  /*
+   * 进编辑态后的就绪门（v2.22）。
+   *
+   * 为什么要它：系统带出来的值（尤其「己方签单主体」）是**进编辑态之后**
+   * 才渲染的。脚本如果立刻去读，会读到空 ⇒ 以为要自己选 ⇒ 这时下拉选项
+   * 也还没拉回来 ⇒ 面板是空的 ⇒ 卡住。等这一下比后面重试十次都省事。
+   *
+   * 判据（只观测、不改值）：
+   *   ① 合同容器 DOM 连续 500ms 无变化（编辑态渲染完成）；
+   *   ② 两个下拉没有 loading 标记；
+   *   ③ 签单主体为空时，再给 1.5 秒观察窗等系统把它带出来。
+   * 等不到也不抛错 —— 真正的兜底在 waitForContractSelectOptions。
+   */
+  async function waitForContractSelectsReady(
+    token = null
+  ) {
+    const settled =
+      await waitForContractDomQuiet();
+
+    if (settled) {
+      log(
+        "合同编辑态渲染已静止，继续处理字段。"
+      );
+    }
+
+    const deadline =
+      Date.now() +
+      CONFIG.CONTRACT_FORM_SETTLE_TIMEOUT;
+
+    let emptySince = 0;
+    let lastNote = "";
+
+    while (
+      Date.now() < deadline
+    ) {
+      throwIfFlowCancelled(
+        token
+      );
+
+      const companyInput =
+        getCurrentContractField(
+          CONFIG.CONTRACT_COMPANY_SELECTOR
+        );
+
+      const branch =
+        getContractBranchSelect();
+
+      const companyLoading =
+        hasSelectLoadingMark(
+          getAntSelectRoot(
+            companyInput
+          )
+        );
+
+      const branchLoading =
+        hasSelectLoadingMark(
+          branch
+        );
+
+      if (
+        companyLoading ||
+        branchLoading
+      ) {
+        emptySince = 0;
+
+        lastNote =
+          `签单主体加载=${companyLoading ? "是" : "否"}，发单分院加载=${branchLoading ? "是" : "否"}`;
+
+        await sleep(200);
+
+        continue;
+      }
+
+      const companyValue =
+        getSelectVisibleText(
+          companyInput
+        ) ||
+        cleanText(
+          companyInput?.value
+        );
+
+      /* 已有值，或字段压根不在页面上 ⇒ 没必要再等 */
+      if (
+        companyValue ||
+        !companyInput
+      ) {
+        return true;
+      }
+
+      /*
+       * 空值：系统可能晚一步才把值渲染出来，给 1.5 秒观察窗。
+       * 只等一次，不会让"系统本来就不带值"的订单白等太久。
+       */
+      if (!emptySince) {
+        emptySince =
+          Date.now();
+      }
+
+      if (
+        Date.now() -
+          emptySince >=
+        1500
+      ) {
+        return true;
+      }
+
+      await sleep(150);
+    }
+
+    warn(
+      `合同下拉数据仍在加载（${lastNote || "状态未知"}），先按已渲染内容继续，选择时会自动重试。`
+    );
+
+    return false;
+  }
+
+  /*
+   * 卡点诊断：只剩一句"超时"没法判断问题在哪，把下拉真实状态带出来。
    */
   function describeAntSelectState(
     input
@@ -3627,9 +4189,14 @@
         )
       );
 
+    const state =
+      getAntSelectDataState(
+        input
+      );
+
     const parts = [
       `下拉展开=${
-        isAntSelectOpen(input)
+        state.open
           ? "是"
           : "否"
       }`,
@@ -3641,11 +4208,25 @@
         ).length
       }）`,
       `选项=${
-        document.querySelectorAll(
-          ".ant-select-item-option"
-        ).length
+        state.optionCount
       }`
     ];
+
+    /*
+     * v2.22：把"还在加载 / 空态文案"一起带出来 ——
+     * 下次再卡，一眼能分辨是"数据没到"还是"根本没这项"。
+     */
+    if (state.loading) {
+      parts.push(
+        "状态=仍在加载"
+      );
+    }
+
+    if (state.emptyHint) {
+      parts.push(
+        `空态=${state.emptyHint}`
+      );
+    }
 
     const pageError =
       getRecentPageError();
@@ -3789,36 +4370,55 @@
       40
     );
 
-    let options =
-      await waitForSelectOptions(
-        input,
+    /*
+     * v2.22：原来这里只等 2.5 秒就判"打不开"，可刚跳进合同页时
+     * 下拉选项还在异步拉取，面板打开是空的 —— 白等 2.5 秒后放弃，
+     * 鼠标路径也跟着失败，表现出来就是"卡住"。
+     * 现在拆成两件事：① 面板到底打没打开（打不开才快速放弃，4 秒内）；
+     *                  ② 打开后等选项，空了会自动重开，预算 12 秒。
+     */
+    let opened =
+      await waitFor(
+        () =>
+          isAntSelectOpen(
+            input
+          ) ||
+          null,
         2500,
+        100
+      );
+
+    if (!opened) {
+      fireSelectKey(
+        input,
+        "ArrowDown",
+        40
+      );
+
+      opened =
+        await waitFor(
+          () =>
+            isAntSelectOpen(
+              input
+            ) ||
+            null,
+          1500,
+          100
+        );
+    }
+
+    if (!opened) {
+      return "";
+    }
+
+    const options =
+      await waitForContractSelectOptions(
+        input,
         token
       );
 
     if (!options.length) {
-      if (
-        !isAntSelectOpen(
-          input
-        )
-      ) {
-        fireSelectKey(
-          input,
-          "ArrowDown",
-          40
-        );
-
-        options =
-          await waitForSelectOptions(
-            input,
-            2000,
-            token
-          );
-      }
-
-      if (!options.length) {
-        return "";
-      }
+      return "";
     }
 
     throwIfFlowCancelled(
@@ -4029,26 +4629,33 @@
     );
 
     let options =
-      await waitForSelectOptions(
+      await waitForContractSelectOptions(
         input,
-        CONFIG.CONTRACT_DROPDOWN_TIMEOUT,
-        token
+        token,
+        CONFIG.CONTRACT_DROPDOWN_TIMEOUT
       );
 
     if (!options.length) {
       /*
        * 有些版本第一次点击只把焦点给了输入框，再点一次才开。
+       * v2.22：这次只补一次点击，等待交给"空面板自动重开"的那套 ——
+       * 原先是各等 4 秒、点两次，选项慢的时候照样白等。
        */
       fireMouseSequence(
         selector
       );
 
-      options =
-        await waitForSelectOptions(
+      const reopened =
+        await waitForContractSelectOptions(
           input,
-          CONFIG.CONTRACT_DROPDOWN_TIMEOUT,
-          token
+          token,
+          CONFIG.CONTRACT_DROPDOWN_TIMEOUT
         );
+
+      if (reopened.length) {
+        options =
+          reopened;
+      }
     }
 
     if (!options.length) {
@@ -4863,6 +5470,119 @@
     "客户简称"
   ];
 
+  /*
+   * 客户名称的**稳定 id**（v2.23 真机核对，Chrome 157 + 真订单）。
+   *
+   * 之前靠“标签文本 + 就近 input”找，能work但要遍历上百个 .ant-form-item。
+   * 真机上这两个字段其实一直有 id，而且**基本信息页签切走后 DOM 仍在**
+   * （#register 挂在 body 上，只是 0×0 不可见）—— 直接按 id 取，零成本、不用切页签。
+   *
+   *   #register_corp_name        单位名称（disabled input，= 客户全称）
+   *   #register_corp_short_name  单位简称
+   */
+  const CUSTOMER_NAME_IDS = [
+    "register_corp_name",
+    "register_corp_short_name"
+  ];
+
+  /*
+   * 客户合同主体（甲方）输入框的稳定 id（v2.23 真机核对）。
+   * 编辑态下它是 <input id="customerContractCompany" maxlength="100">。
+   */
+  const CUSTOMER_PARTY_INPUT_ID =
+    "customerContractCompany";
+
+  /*
+   * 订单客户名称缓存（按 orderCode 分桶）。
+   *
+   * 为什么缓存：合同页不一定还能读到基本信息（页签切走、DOM 重建），
+   * 而脚本在前面几个阶段（报价确认 / 内勤复核）本来就在订单详情页，
+   * 那时读一次留底，合同阶段直接用，不必现场绕。
+   */
+  let customerNameCache = {
+    orderCode: "",
+    value: ""
+  };
+
+  function getRouteOrderCode() {
+    const matched =
+      String(location.hash || "").match(
+        /[?&]orderCode=(SOA[A-Za-z0-9-]+)/i
+      );
+
+    return matched
+      ? matched[1]
+      : "";
+  }
+
+  function readCustomerNameById() {
+    for (
+      const id
+      of CUSTOMER_NAME_IDS
+    ) {
+      const el =
+        document.getElementById(
+          id
+        );
+
+      const value =
+        cleanText(
+          el?.value
+        );
+
+      if (value) {
+        return value;
+      }
+    }
+
+    return "";
+  }
+
+  /*
+   * 把“当前订单的客户名称”留底。读不到就什么都不做（不覆盖已有缓存）。
+   */
+  function rememberOrderCustomerName(
+    value
+  ) {
+    const name =
+      cleanText(value);
+
+    if (!name) {
+      return "";
+    }
+
+    customerNameCache = {
+      orderCode:
+        getRouteOrderCode(),
+      value: name
+    };
+
+    return name;
+  }
+
+  function recallOrderCustomerName() {
+    if (
+      !customerNameCache.value
+    ) {
+      return "";
+    }
+
+    const currentCode =
+      getRouteOrderCode();
+
+    /* 换了订单就别拿上一条的名字顶上去 */
+    if (
+      currentCode &&
+      customerNameCache.orderCode &&
+      currentCode !==
+        customerNameCache.orderCode
+    ) {
+      return "";
+    }
+
+    return customerNameCache.value;
+  }
+
   function findFormItemByLabel(
     label,
     scope = document,
@@ -4953,22 +5673,46 @@
       ) ||
       null;
 
-    const input =
+    /*
+     * v2.23：item 找不到时按稳定 id 兜一层 —— 编辑态与查看态的表单项
+     * 不是同一份 DOM，只按 label 找会在"刚进编辑态/刚重挂载"时扑空，
+     * 而扑空的后果是 customerApplicable=false（等于"本类型没这项"），
+     * 必填校验静默失效。
+     */
+    const idInput =
+      document.getElementById(
+        CUSTOMER_PARTY_INPUT_ID
+      );
+
+    const rawInput =
       item?.querySelector(
         "input, textarea"
       ) ||
+      idInput ||
       null;
 
     return {
-      item,
-      input,
-      value:
-        cleanText(
-          input?.value
+      item:
+        item ||
+        idInput?.closest(
+          ".ant-form-item"
         ) ||
-        readFormItemDisplayText(
-          item
-        )
+        null,
+      input: rawInput,
+      /*
+       * ⚠️ 有 input 就**只认 input.value**：空就是空。
+       * 以前是 `input.value || 控件文本`，控件里残留的“0 / 100”之外的
+       * 任何文本都会把空字段判成有值 ⇒ 直接跳过补填。
+       * 只有“压根没有 input”（查看态渲染成纯文本）时才读控件文本。
+       */
+      value:
+        rawInput
+          ? cleanText(
+              rawInput.value
+            )
+          : readFormItemDisplayText(
+              item
+            )
     };
   }
 
@@ -5431,6 +6175,38 @@
   async function resolveOrderCustomerName(
     token = null
   ) {
+    /*
+     * ⓪ 先用前面阶段留的底（v2.23）—— 合同页 DOM 重建过也能拿到。
+     */
+    const cached =
+      recallOrderCustomerName();
+
+    if (cached) {
+      log(
+        `✓ 已读取订单客户名称（本单缓存）：${cached}`
+      );
+
+      return cached;
+    }
+
+    /*
+     * ① 稳定 id 直取（v2.23 真机核对）：
+     *    基本信息页签切走后 #register 仍挂在 DOM 上（0×0），
+     *    #register_corp_name 的值一直都在 ⇒ 这一步通常就能命中，不用切页签。
+     */
+    const byId =
+      readCustomerNameById();
+
+    if (byId) {
+      log(
+        `✓ 已读取订单客户名称：${byId}`
+      );
+
+      return rememberOrderCustomerName(
+        byId
+      );
+    }
+
     const direct =
       readCustomerNameFromDocument() ||
       readCustomerNameFromDocument(
@@ -5444,7 +6220,9 @@
         `✓ 已读取订单客户名称：${direct}`
       );
 
-      return direct;
+      return rememberOrderCustomerName(
+        direct
+      );
     }
 
     if (formLooksEditable()) {
@@ -5507,9 +6285,13 @@
       log(
         `✓ 已读取订单客户名称：${found}`
       );
+
+      return rememberOrderCustomerName(
+        found
+      );
     }
 
-    return found || "";
+    return "";
   }
 
   async function fillCustomerContractParty(
@@ -5600,16 +6382,22 @@
 
     /*
      * v2.19：写入后只等 2 帧不够。
-     * 实测这类表单会“晚到一次重绘把值刷回去”，
-     * 所以每次写完全静置 400ms 再复查，最多重试 CONTRACT_CUSTOMER_FILL_RETRY 次。
+     * 实测这类表单会“晚到一次重绘把值刷回去”，所以每次写完全静置再复查。
+     *
+     * v2.23：400ms 也不一定够 —— 从别的页签跳进来时，合同详情接口可能在
+     * 1~2 秒后才回，一回来就把整张表单重置（客户主体是系统本来就不带的，
+     * 重置后又变空）。改成**递增等待 400 → 1200 → 2000ms**，
+     * 每轮重新定位、重新写，最后一次兜到约 3.6 秒。
      */
+    const fillWaits =
+      CONFIG.CONTRACT_CUSTOMER_FILL_WAITS;
+
     let filled =
       "";
 
     for (
       let attempt = 1;
-      attempt <=
-      CONFIG.CONTRACT_CUSTOMER_FILL_RETRY;
+      attempt <= fillWaits.length;
       attempt++
     ) {
       throwIfFlowCancelled(
@@ -5645,10 +6433,18 @@
         token
       );
 
-      current.input.focus();
-      current.input.blur();
+      try {
+        current.input.focus();
+        current.input.blur();
+      } catch (_) {
+        // 焦点被页面抢走时不影响 value 写入，继续。
+      }
 
-      await sleep(400);
+      await sleep(
+        fillWaits[
+          attempt - 1
+        ]
+      );
 
       throwIfFlowCancelled(
         token
@@ -11071,6 +11867,19 @@
           token
         );
 
+        /*
+         * v2.23：趁订单详情页还挂着（基本信息 DOM 即便切走也仍在 body 上），
+         * 先把客户名称留底 —— 到合同阶段就不用现场找/切页签了。
+         * 读不到就直接跳过，不影响任何阶段。
+         */
+        if (
+          !recallOrderCustomerName()
+        ) {
+          rememberOrderCustomerName(
+            readCustomerNameById()
+          );
+        }
+
         const blocker =
           getPageBlocker({
             allowApprovalModal:
@@ -11366,14 +12175,14 @@
       getCustomerContractPartyState();
 
     /*
-     * 判空只看“有没有值”，不看“有没有 input”：
-     * 查看态下该字段可能渲染成纯文本而不是 input，
-     * 若按 input 是否存在来判，这个兜底会静默失效。
+     * v2.23：判空**只看“有没有值”**。
+     * 以前还要求 item 存在（`Boolean(customerParty.item) && !value`）——
+     * 页面刚渲染 / 刚重挂载时 item 可能还查不到，那样 customerPartyEmpty
+     * 会被算成 false，整段补填逻辑被静默跳过，最后在复核时才报“为空”。
+     * 现在只要读不到值就先当成空；是否真有这个字段由
+     * fillCustomerContractParty 内部再判（找不到输入框会 skip）。
      */
     const customerPartyEmpty =
-      Boolean(
-        customerParty.item
-      ) &&
       !customerParty.value;
 
     let orderCustomerName = "";
@@ -11447,6 +12256,27 @@
         token
       );
 
+      /*
+       * v2.22：编辑态刚渲染完时，「对应发单分院 / 己方签单主体」两个远端下拉
+       * 的选项和数据还在路上。这时立刻去读/去点，就会"太快操作"而卡住 ——
+       * 先等页面静默 + 等系统把签单主体带出来，再往下走。
+       */
+      await waitForContractSelectsReady(
+        token
+      );
+
+      const branchState =
+        getContractBranchState();
+
+      if (
+        branchState.select &&
+        !branchState.value
+      ) {
+        log(
+          "提示：对应发单分院当前为空（系统未带出）。本脚本不代选该字段，如需填写请人工选择。"
+        );
+      }
+
       const before =
         getContractFormSnapshot();
 
@@ -11455,17 +12285,46 @@
       );
 
       /*
-       * 客户合同主体（甲方）为空 → 用订单客户名称补一次。
+       * 客户合同主体（甲方）：v2.23 改成按**进编辑态之后**的状态判。
+       * 查看态与编辑态不是同一份 DOM，进编辑态前读到的空/非空不能作数；
        * 已有值时不碰（人工改过的值优先）。
        */
-      if (
-        customerPartyEmpty &&
-        orderCustomerName
-      ) {
-        await fillCustomerContractParty(
-          orderCustomerName,
-          token
+      const partyNow =
+        getCustomerContractPartyState();
+
+      let customerFill =
+        null;
+
+      if (partyNow.value) {
+        log(
+          `✓ 客户合同主体（甲方）已有值：${partyNow.value}，跳过填充。`
         );
+      } else if (orderCustomerName) {
+        customerFill =
+          await fillCustomerContractParty(
+            orderCustomerName,
+            token
+          );
+      } else {
+        /*
+         * 进编辑态前没读到名字。此时不能再切页签（会弹“合同信息还未保存”
+         * 并丢掉已填内容），但隐藏的 #register 仍在，按稳定 id 再抓一次。
+         */
+        const lateName =
+          readCustomerNameById();
+
+        if (lateName) {
+          orderCustomerName =
+            rememberOrderCustomerName(
+              lateName
+            );
+
+          customerFill =
+            await fillCustomerContractParty(
+              orderCustomerName,
+              token
+            );
+        }
       }
 
       await setContractDates(
@@ -11475,6 +12334,30 @@
       await fillInspectionPeopleDay(
         token
       );
+
+      /*
+       * v2.23：填日期 / 名单时限也会触发整表重绘，客户主体可能又被刷回空。
+       * 复核前再补一次（只在其仍空、且手上已有名字时）。
+       */
+      if (
+        !getCustomerContractPartyState()
+          .value &&
+        orderCustomerName
+      ) {
+        const refill =
+          await fillCustomerContractParty(
+            orderCustomerName,
+            token
+          );
+
+        if (
+          refill &&
+          !refill.skipped
+        ) {
+          customerFill =
+            refill;
+        }
+      }
 
       const after =
         getContractFormSnapshot();
@@ -11486,16 +12369,52 @@
 
       if (afterIssues.length) {
         /*
-         * 客户主体为空基本只有一个原因：页面上读不到订单客户名称。
-         * 只说“为空”他会不知道怎么收场，这里把下一步动作写清楚，
-         * 并且不要再提“按 F5 重跑”（v2.20 已经不走刷新那条路了）。
+         * 客户主体为空有四种完全不同的原因，别都笼统说“请手动填”：
+         *   ① 页面上读不到订单客户名称；
+         *   ② 读到了也写进去了，但页面晚到的重绘把它刷回空；
+         *   ③ 字段找不到 / 不可编辑 / 超长（fillCustomerContractParty 自己 skip）；
+         *   ④ 其它兜底。
+         * 用户看到的应该是**哪一种**，否则又得回来问。
          */
-        const tip =
+        let tip = "";
+
+        if (
           afterIssues.includes(
             "客户合同主体（甲方）为空"
           )
-            ? "\n请在本页手动填入客户合同主体（甲方）后点“合同保存”，再重跑本流程（其余字段脚本已填好）。"
-            : "";
+        ) {
+          const reason =
+            customerFill?.reason ||
+            "";
+
+          if (!orderCustomerName) {
+            tip =
+              "（页面上读不到该订单的客户名称）/ 基本信息里的“单位名称”取不到，且编辑态下不能切页签去取。";
+          } else if (
+            reason === "unstable"
+          ) {
+            tip =
+              `已自动填入“${orderCustomerName}”，但页面随后把它刷回空了（表单数据晚到重绘）。`;
+          } else if (
+            reason === "field-missing"
+          ) {
+            tip =
+              "页面上找不到“客户合同主体（甲方）”输入框。";
+          } else if (
+            reason === "readonly"
+          ) {
+            tip =
+              "该字段当前不可编辑。";
+          } else if (
+            reason === "too-long"
+          ) {
+            tip =
+              `客户名称“${orderCustomerName}”超过该字段长度上限。`;
+          }
+
+          tip +=
+            "\n请在本页手动填入客户合同主体（甲方）后点“合同保存”（其余字段脚本已填好）。";
+        }
 
         throw new FlowBlockedError(
           `合同字段填写后复核未通过：${afterIssues.join("、")}${tip}`
