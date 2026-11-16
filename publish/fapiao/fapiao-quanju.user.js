@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.51
+// @version      6.52
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -1265,19 +1265,13 @@
         font-variant-numeric: tabular-nums;
         letter-spacing: 0;
       }
-      ${scope} .ant-table-body td[data-tm-amount="1"] > .tm-qty-hint.is-empty {
-        color: #c2c8d0;
-      }
-      /* 只填了数量、没填单位（业务上确有这种特殊开票）：不当成错误、也不变红，
-         只在数字下面压一条浅虚线作记号 —— 具体提示在 hover 浮层的脚注里（.tm-detail-note）。
-         ⚠️ 用 text-decoration 而不是 border-bottom：下划线不占行高，
-            上面算好的「5 + 15 + 13 + 2 = 35px」不会被这一笔画破。 */
-      ${scope} .ant-table-body td[data-tm-amount="1"] > .tm-qty-hint.is-no-unit {
-        text-decoration: underline dashed;
-        text-decoration-color: #d5dae1;
-        text-decoration-thickness: 1px;
-        text-underline-offset: 2px;
-        cursor: help;
+      /* 缺项标红（用户 2026-11-16 口径）：明细里「单位」「数量」都写了才算正常，
+         缺任意一项 —— 整张票没有明细、数量为空、有数量没单位、多行明细里有一条缺 ——
+         就把这一行小字整行标红，扫一眼就知道哪几张票的明细不全。
+         ⚠️ 不加下划线、不加边框：红字本身够显眼，多一笔会把算好的
+            「5 + 15 + 13 + 2 = 35px」行高撑破，金额列跟着抖。 */
+      ${scope} .ant-table-body td[data-tm-amount="1"] > .tm-qty-hint.is-incomplete {
+        color: #ff4d4f;
       }
 
       ${scope} tr.tm-row-refund,
@@ -3119,6 +3113,12 @@
     return text === "无商品明细" ? "" : text;
   }
 
+  // 这一行的明细全不全（缺单位 / 缺数量）—— 批量清单那行小字跟着表格一起标红
+  function isRowQtyIncomplete(applyCode) {
+    const items = getCachedDetail(applyCode);
+    return items ? isIncompleteDetail(items) : false;
+  }
+
   /* 批量清单里的「创建人 + 时间」。
      脚本已经把这一格规范成两个 div（姓名 / 时间），并且把两段文本挂到了 td 的
      data-tm-creator-name / -time 上（prepareCreatorCell）。优先读属性——那是最准的，
@@ -3196,6 +3196,7 @@
             ? getAmountText(tr.children[amountIdx])
             : "",
         qtyText: getRowQtyText(applyCode),
+        qtyIncomplete: isRowQtyIncomplete(applyCode),
         // 下面几列是 2026-11-03 加的：同客户同金额的几张票，只能靠这几列分辨
         status:
           statusIdx !== undefined
@@ -3567,6 +3568,8 @@
         font-size: 11px; line-height: 1.25; color: #a8b0bd; white-space: nowrap;
       }
       #${panelId} .tm-batch-item-qty:empty { display: none; }
+      /* 明细缺单位 / 缺数量：和表格里金额格那行同一口径，标红 */
+      #${panelId} .tm-batch-item-qty.is-incomplete { color: #ff4d4f; }
       #${panelId} .tm-batch-foot {
         display: flex; justify-content: flex-end; gap: 8px;
         padding: 12px 16px; border-top: 1px solid #f0f0f0;
@@ -3879,7 +3882,8 @@
       money.textContent = item.amount;
 
       const qty = document.createElement("span");
-      qty.className = "tm-batch-item-qty";
+      qty.className =
+        "tm-batch-item-qty" + (item.qtyIncomplete ? " is-incomplete" : "");
       qty.textContent = item.qtyText || "";
 
       amount.append(money, qty);
@@ -3958,6 +3962,7 @@
 
     const text = getRowQtyText(applyCode);
     if (node.textContent !== text) node.textContent = text;
+    node.classList.toggle("is-incomplete", isRowQtyIncomplete(applyCode));
   }
 
   /********** 悬浮提示：让人知道能点、也能右键 **********/
@@ -4464,12 +4469,13 @@
           打「不写明细」。原来叫「数量未填」，容易被读成「这里漏填了」。
        ② 有数量就把单位夹在数量和单价中间：30人×685（单位原样照抄明细里的「单位」列）。
           不加空格是为了别把金额列撑宽 —— 这行是 nowrap + 省略号，多一个字就可能被截。
-       ③ 只写了数量、没写单位 **不算错**（业务上确有这种特殊开票）：
-          照常显示「30×685」，数字下面压一条浅虚线；提示本身放进 hover 浮层底部的脚注里。
+       ③ ⚠️ 2026-11-16 用户口径（推翻 11-05 的「不算错、不变红」）：
+          **单位、数量都写了才算正常**，缺任意一项就把这行小字标红（见 .is-incomplete）：
+          有数量没单位 ⇒ 显示「30×685」并标红；数量为空 ⇒ 「不写明细」并标红。
           ⛔ 别用原生 title 提示 —— 金额格的浮层 220ms 就自己弹了，原生 tooltip 随后又压上来，
              两个框叠在一起（状态格那边就是因为同样的原因把站点 tooltip 屏蔽了）。 */
   const NO_DETAIL_LABEL = "不写明细";
-  const NO_UNIT_NOTE = "明细里只填了数量、没填单位（业务允许，不算错）";
+  const INCOMPLETE_NOTE = "明细缺单位或缺数量 —— 金额格那行已标红";
 
   function buildDetailSummary(items) {
     if (!items.length) return "无商品明细";
@@ -4485,16 +4491,21 @@
     return "多条明细";
   }
 
-  // 「只写了数量、没写单位」：单条明细 + 有数量 + 单位空。不算错，只提示。
-  function isQtyWithoutUnit(items) {
-    return items.length === 1 && items[0].qty !== null && !items[0].unit;
+  /* 「单位、数量都写了」才算正常（用户 2026-11-16 口径）—— 缺任意一项就标红：
+       · 整张票没有明细（[]）／数量为空（qty === null）⇒ 明细不全，红；
+       · 有数量、单位空 ⇒ 明细不全，红；
+       · 多行明细里只要有一条缺 ⇒ 整行小字红（缺哪一条看 hover 浮层，那格也标红）。
+     ⚠️ 2026-11-05 那版把「有数量没单位」当业务允许、只压一条浅虚线 —— 已按新口径推翻。 */
+  function isIncompleteDetail(items) {
+    if (!items.length) return true;
+    return items.some((item) => item.qty === null || !item.unit);
   }
 
   function renderDetailHint(cell, items) {
     if (!cell) return;
 
     const text = buildDetailSummary(items);
-    const noUnit = isQtyWithoutUnit(items);
+    const incomplete = isIncompleteDetail(items);
     cell.setAttribute("data-tm-amount", "1");
 
     let hint = cell.querySelector(":scope > .tm-qty-hint");
@@ -4507,9 +4518,8 @@
 
     // ⚠️ 同值不写：脚本自己盯着整张表，写回一样的值也算一次变更
     if (hint.textContent !== text) hint.textContent = text;
-    // 缺单位只加一条浅虚线作记号，提示文案在浮层脚注里（见 NO_UNIT_NOTE），不改字色、不拦截
-    hint.classList.toggle("is-no-unit", noUnit);
-    hint.classList.toggle("is-empty", text === NO_DETAIL_LABEL || text === "无商品明细");
+    // 缺单位 / 缺数量一律标红（用户 2026-11-16）；缺哪项看 hover 浮层脚注（INCOMPLETE_NOTE）
+    hint.classList.toggle("is-incomplete", incomplete);
   }
 
   // 每行处理时都会走到这里：缓存命中直接画，没命中就排队
@@ -5007,10 +5017,12 @@
         border-top: 1px solid #e8ebf0; margin-top: 3px; padding-top: 6px; font-weight: 500;
       }
       #${DETAIL_POP_ID} .tm-detail-empty { color: #97a1ae; padding: 8px 0 2px; }
-      /* 「只填了数量没填单位」的脚注：灰字、不标红 —— 业务允许，只是提醒一句 */
+      /* 缺单位 / 缺数量的脚注：灰字提示，真正标红的是「缺的那一格」和金额格那行 */
       #${DETAIL_POP_ID} .tm-detail-note {
         margin-top: 5px; font-size: 11px; line-height: 15px; color: #97a1ae;
       }
+      #${DETAIL_POP_ID} .tm-detail-unit.is-miss,
+      #${DETAIL_POP_ID} .tm-detail-qty.is-miss { color: #ff4d4f; }
     `;
     document.head.appendChild(style);
 
@@ -5020,9 +5032,9 @@
     return pop;
   }
 
-  function buildDetailCell(className, text) {
+  function buildDetailCell(className, text, extraClass) {
     const node = document.createElement("span");
-    node.className = className;
+    node.className = extraClass ? className + " " + extraClass : className;
     node.textContent = text;
     return node;
   }
@@ -5064,8 +5076,13 @@
       row.className = "tm-detail-row";
       row.append(
         buildDetailCell("tm-detail-name", item.name),
-        buildDetailCell("tm-detail-unit", item.unit || "—"),
-        buildDetailCell("tm-detail-qty", item.qty === null ? "—" : formatQty(item.qty)),
+        // 缺的那一格顺手标红（与金额格那行同一口径），多行明细里也能一眼看出缺哪条
+        buildDetailCell("tm-detail-unit", item.unit || "—", item.unit ? "" : "is-miss"),
+        buildDetailCell(
+          "tm-detail-qty",
+          item.qty === null ? "—" : formatQty(item.qty),
+          item.qty === null ? "is-miss" : ""
+        ),
         buildDetailCell(
           "tm-detail-price",
           item.unitPrice === null ? "—" : formatPrice(item.unitPrice)
@@ -5096,12 +5113,12 @@
     );
     pop.appendChild(totalRow);
 
-    /* 有数量却没单位（业务允许的特殊开票）：脚注里说一句就完事 ——
-       ⛔ 不算错、不标红、不拦操作；金额格那行只留一条浅虚线作记号（见 .is-no-unit）。 */
-    if (items.some((item) => item.qty !== null && !item.unit)) {
+    /* 缺单位 / 缺数量（含整张票没有明细）：脚注点一句 —— 金额格那行整行标红（见 .is-incomplete），
+       这里再把缺的那一格标红，省得他一行行对。⛔ 只标红，不拦任何操作。 */
+    if (isIncompleteDetail(items)) {
       const note = document.createElement("div");
       note.className = "tm-detail-note";
-      note.textContent = NO_UNIT_NOTE;
+      note.textContent = INCOMPLETE_NOTE;
       pop.appendChild(note);
     }
   }
