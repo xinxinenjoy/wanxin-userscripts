@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.23
+// @version      2.25
 // @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -21,7 +21,7 @@
  * 功能：
  * - 识别订单流程阶段并执行已支持的自动处理（报价确认、内勤复核、合同补充、发起落单、落单审核）。
  * - 报价确认阶段自动点击“提交内勤落单”，弹窗“是否独家”固定选“是”并提交，进入内勤复核。
- * - 合同模块可单独处理（面板“处理合同”按钮）：只补全字段与上传文件，不发起落单。
+ * - 合同模块可单独处理（面板“处理合同”按钮）：只补全字段与上传文件，不发起落单；任何阶段都可点。
  * - 支持审批备注、体检时间校验与报价确认阶段时间修正。
  * - 合同阶段智能补全字段，并绑定共用文件（合同 / 无合同证明文件 / 授权书）按需上传。
  * - 关键动作执行后动态验证页面真实状态；长时间未推进时显示卡点诊断，不重复提交。
@@ -161,6 +161,29 @@
  *      （整表重绘会把值刷掉）；
  *   ⑤ 阻塞文案按原因分开写（读不到名字 / 写入被刷回 / 字段不可编辑 / 超长），
  *      不再一律"请手动填"。
+ *
+ * 关于合同处理的三处调整（v2.24，2026-11-19）：
+ * ① 「处理合同」可用阶段：原白名单（报价确认 / 内勤复核 / 合同补充 / 落单审核 /
+ *    落单中 / 已落单）→ 加「报价单设计」「检中修改」、去掉「已落单」「落单中」
+ *    「授权审批（钉钉审批）」「内勤复核」⇒ 最终：报价单设计、报价确认、合同补充、
+ *    落单审核、检中修改。
+ * ② 卡顿优化：合同页“数据未就绪”的首次就绪判断预算从 8 秒降到 3 秒
+ *    （CONTRACT_DATA_READY_FAST_TIMEOUT），数据真没刷出来时更快进入切页签自愈，
+ *    消除前端干等 8 秒造成的“明显卡顿一下”；remount 后仍用 8 秒原预算。
+ * ③ 签单主体配置从“模式+单个名称”改为“简称=全称 列表 + 默认简称”
+ *    （发单分院即签单主体，同一字段，不再单独配置）。正常自动处理用默认；
+ *    单独点「处理合同」时弹窗选择门诊部/高新门诊部。全称与下拉选项一字不差才选，
+ *    找不到抛错不改选第一项。
+ *
+ * 关于「处理合同」取消阶段白名单（v2.25，2026-11-20）：
+ * ① 按钮显隐不再看阶段 —— 只要没有流程在跑就一直显示，任何阶段都能点。
+ *    理由：它只对当前订单的合同页补字段 + 上传 + 保存，不推进流程；
+ *    能不能做由页面本身决定（有没有合同页签、字段是否可编辑），
+ *    阶段白名单反而会挡住合法用法（授权审批 / 内勤复核里提前补合同、
+ *    已落单后回补合同资料）。
+ * ② ensureContractTabVisible 增加一次确定性预检：页签容器整体不存在（不在订单详情页）
+ *    ⇒ 立即报错，不再干等 FLOW_WAIT_TIMEOUT（60 秒）。
+ *    容器在、只是「合同」页签稍后渲染的情况，仍走原有响应式等待。
  */
 
 (function () {
@@ -252,6 +275,16 @@
      */
     CONTRACT_DATA_READY_TIMEOUT:
       8000,
+    /*
+     * 合同页“数据未就绪”的首次就绪判断预算（v2.24）。
+     * 之前首次判断直接复用 CONTRACT_DATA_READY_TIMEOUT（8 秒）——
+     * 数据真没刷出来时，脚本要干等满 8 秒才进入 remount 自愈，
+     * 表现出来就是“明显卡顿一下再继续”。
+     * 拆成更短的首次预算：数据确实没就绪时更快进入切页签自愈，
+     * 而不是在前端干等。remount 之后仍用 8 秒的原预算（那是真重新取数）。
+     */
+    CONTRACT_DATA_READY_FAST_TIMEOUT:
+      3000,
     CONTRACT_EDITABLE_TIMEOUT:
       15000,
     CONTRACT_REMOUNT_MAX_ATTEMPTS:
@@ -326,11 +359,7 @@
     REVIEW_REMARK:
       "套餐复核系统要求，提交到合同补充阶段。",
     ORDER_REMARK:
-      "已落单，请及时上传原版合同、授权书扫描件。",
-    SIGNING_COMPANY_MODE:
-      "first",
-    SIGNING_COMPANY_TEXT:
-      ""
+      "已落单，请及时上传原版合同、授权书扫描件。"
   };
 
   const FILE_BINDING = {
@@ -403,16 +432,14 @@
       "__soa_flow_signing_button_v118",
     SIGNING_PANEL_ID:
       "__soa_flow_signing_panel_v118",
-    SIGNING_FIRST_ID:
-      "__soa_flow_signing_first_v118",
-    SIGNING_TEXT_MODE_ID:
-      "__soa_flow_signing_text_mode_v118",
-    SIGNING_TEXT_ID:
-      "__soa_flow_signing_text_v118",
-    SIGNING_MODE_KEY:
-      "__soa_flow_signing_mode_v118",
-    SIGNING_TEXT_KEY:
-      "__soa_flow_signing_text_key_v118",
+    SIGNING_LIST_ID:
+      "__soa_flow_signing_list_v224",
+    SIGNING_DEFAULT_ID:
+      "__soa_flow_signing_default_v224",
+    SIGNING_SAVE_ID:
+      "__soa_flow_signing_save_v224",
+    SIGNING_LIST_KEY:
+      "__soa_flow_signing_list_key_v224",
 
     WEB_NOTICE_ID:
       "__soa_flow_web_notice_v14",
@@ -4035,31 +4062,6 @@
     return null;
   }
 
-  function getContractBranchState() {
-    const select =
-      getContractBranchSelect();
-
-    const input =
-      select?.querySelector(
-        "input"
-      ) ||
-      null;
-
-    return {
-      select,
-      input,
-      value:
-        cleanText(
-          select?.querySelector(
-            ".ant-select-selection-item"
-          )?.textContent
-        ) ||
-        cleanText(
-          input?.value
-        )
-    };
-  }
-
   /*
    * 进编辑态后的就绪门（v2.22）。
    *
@@ -4509,7 +4511,8 @@
   }
 
   async function selectConfiguredContractCompany(
-    token = null
+    token = null,
+    fullName = null
   ) {
     const input =
       getCurrentContractField(
@@ -4562,22 +4565,33 @@
       );
     }
 
+    /*
+     * v2.24：确定本次要选的全称。
+     *   - 单独处理合同时，由弹窗选择的简称映射出全称（fullName 覆盖）；
+     *   - 正常自动处理时，用配置里的“默认”全称；
+     *   - 都没配置时，want 为空 ⇒ 走“选第一个可用选项”兜底（与旧版一致）。
+     */
     const config =
       getSigningCompanyConfig();
 
-    if (
-      config.mode === "text" &&
-      !config.text
-    ) {
-      throw new Error(
-        "签单主体已设置为“按名称匹配”，但尚未填写主体名称"
+    const want =
+      cleanText(fullName) ||
+      (
+        config.defaultShort
+          ? (
+              config.items.find(
+                item =>
+                  item.short ===
+                  config.defaultShort
+              )?.full || ""
+            )
+          : ""
       );
-    }
 
     log(
-      config.mode === "first"
-        ? "2/5 选择己方签单主体：第一个可用选项..."
-        : `2/5 选择己方签单主体：${config.text}...`
+      want
+        ? `2/5 选择己方签单主体：${want}...`
+        : "2/5 选择己方签单主体：未配置默认，改选第一个可用选项..."
     );
 
     /*
@@ -4588,20 +4602,16 @@
     const pickedByKeyboard =
       await pickCompanyByKeyboard(
         input,
-        config.mode === "text"
-          ? config.text
-          : "",
+        want,
         token
       );
 
     if (
       pickedByKeyboard &&
       (
-        config.mode === "first" ||
+        !want ||
         pickedByKeyboard ===
-          cleanText(
-            config.text
-          )
+          cleanText(want)
       )
     ) {
       log(
@@ -4616,7 +4626,7 @@
 
     if (pickedByKeyboard) {
       throw new Error(
-        `己方签单主体选中结果异常：预期“${config.text}”，实际“${pickedByKeyboard}”`
+        `己方签单主体选中结果异常：预期“${want}”，实际“${pickedByKeyboard}”`
       );
     }
 
@@ -4672,20 +4682,14 @@
 
     let option = null;
 
-    if (
-      config.mode === "first"
-    ) {
-      option =
-        options[0] ||
-        null;
-    } else {
+    if (want) {
       option =
         options.find(item => {
           return (
             cleanText(
               item.textContent
             ) ===
-            config.text
+            want
           );
         }) ||
         null;
@@ -4702,9 +4706,13 @@
             .join("、");
 
         throw new Error(
-          `未找到配置的己方签单主体“${config.text}”。当前可选：${available || "未读取到选项"}`
+          `未找到配置的己方签单主体“${want}”。当前可选：${available || "未读取到选项"}`
         );
       }
+    } else {
+      option =
+        options[0] ||
+        null;
     }
 
     if (!option) {
@@ -4768,14 +4776,12 @@
     }
 
     if (
-      config.mode === "text" &&
+      want &&
       selected !==
-        cleanText(
-          config.text
-        )
+        cleanText(want)
     ) {
       throw new Error(
-        `己方签单主体选中结果异常：预期“${config.text}”，实际“${selected}”`
+        `己方签单主体选中结果异常：预期“${want}”，实际“${selected}”`
       );
     }
 
@@ -8486,6 +8492,8 @@
 
     /*
      * 第一步：先按“只是渲染慢”处理，给一次短等待。
+     * v2.24：用更短的快速预算（3 秒）—— 数据真没就绪时更快进入
+     * remount 自愈，避免前端干等 8 秒造成的“明显卡顿一下”。
      */
     try {
       await waitForReactiveCondition(
@@ -8497,7 +8505,7 @@
             "合同页数据加载",
           token,
           timeout:
-            CONFIG.CONTRACT_DATA_READY_TIMEOUT,
+            CONFIG.CONTRACT_DATA_READY_FAST_TIMEOUT,
           blockerCheck:
             () =>
               getVisibleErrorFeedback(),
@@ -8590,6 +8598,25 @@
       );
 
       return true;
+    }
+
+    /*
+     * v2.25：合同处理不再限阶段，“处理合同”可能在任意页面被点。
+     * 页签容器整体不存在 ⇒ 这里永远等不到「合同」页签，直接报错，
+     * 不再干等 FLOW_WAIT_TIMEOUT（60 秒）。
+     * 只判这一种确定情形；容器在、只是「合同」页签稍后渲染的，仍走正常等待。
+     */
+    const visibleOrderTabCount =
+      Array.from(
+        document.querySelectorAll(
+          ".tabs-wrap .tabs .tab"
+        )
+      ).filter(isVisible).length;
+
+    if (!visibleOrderTabCount) {
+      throw new Error(
+        "当前页面没有订单页签（可能不在订单详情页），无法打开合同页。请在订单详情页再点“处理合同”。"
+      );
     }
 
     const contractTab =
@@ -9790,6 +9817,18 @@
     );
   }
 
+  /*
+   * 「处理合同」的可用范围（v2.25，2026-11-20）：**不再有阶段白名单**。
+   *
+   * 与 AUTO_PROCESS_STAGES 的区别：后者还控制“立即处理订单”主流程按钮的显隐
+   * 与阶段拦截，而“处理合同”只补字段 + 上传 + 保存、不推进流程。
+   * 所以它不需要知道当前阶段 —— 是否真能处理交给页面判定
+   * （有没有合同页签 / 字段是否可编辑），阶段判定只会挡住合法用法
+   * （授权审批、内勤复核里提前补，已落单后回补合同资料）。
+   *
+   * v2.24 曾有 isContractOnlyStage() 白名单，v2.25 已删除（无调用者不保留死代码）。
+   */
+
   function getAutomationStageIssue(
     stage
   ) {
@@ -10163,21 +10202,6 @@
       );
     }
 
-    const mode =
-      getStoredText(
-        UI.SIGNING_MODE_KEY,
-        DEFAULTS.SIGNING_COMPANY_MODE
-      );
-
-    if (
-      mode !== "first" &&
-      mode !== "text"
-    ) {
-      saveStoredText(
-        UI.SIGNING_MODE_KEY,
-        DEFAULTS.SIGNING_COMPANY_MODE
-      );
-    }
   }
 
   function restoreDefaultRemarks() {
@@ -10219,73 +10243,166 @@
     );
   }
 
+  /*
+   * 解析签单主体配置里的每行“简称=全称”。行内也可用“简称|全称”分隔。
+   * 非法行直接跳过，不整体失败。
+   */
+  function parseSigningLines(
+    text
+  ) {
+    const items = [];
+
+    String(text || "")
+      .split(/\r?\n/)
+      .forEach(line => {
+        const match =
+          line.match(
+            /^(.+?)\s*[=|]\s*(.+)$/
+          );
+
+        if (!match) {
+          return;
+        }
+
+        const short =
+          cleanText(match[1]);
+
+        const full =
+          cleanText(match[2]);
+
+        if (short && full) {
+          items.push({
+            short,
+            full
+          });
+        }
+      });
+
+    return items;
+  }
+
+  /*
+   * 签单主体配置（v2.24 起）：由“模式+单个名称”改为“简称=全称 列表 + 默认”。
+   * 结构（JSON 存 localStorage）：
+   *   {
+   *     defaultShort: "高新门诊部",
+   *     items: [{ short: "门诊部", full: "…门诊部" }, { short: "高新门诊部", full: "…高新门诊部" }]
+   *   }
+   * 简称用于展示与选择，全称用于在下拉里精确匹配选中。
+   */
   function getSigningCompanyConfig() {
-    const storedMode =
-      getStoredText(
-        UI.SIGNING_MODE_KEY,
-        DEFAULTS.SIGNING_COMPANY_MODE
-      );
+    let raw = "";
 
-    const mode =
-      storedMode === "text"
-        ? "text"
-        : "first";
-
-    const text =
-      cleanText(
+    try {
+      raw =
         getStoredText(
-          UI.SIGNING_TEXT_KEY,
-          DEFAULTS.SIGNING_COMPANY_TEXT
-        )
-      );
+          UI.SIGNING_LIST_KEY,
+          ""
+        );
+    } catch (_) {
+      raw = "";
+    }
+
+    /*
+     * v2.24 迁移：旧“发单分院”配置（与签单主体是同一字段，独立配置已废弃）
+     * 之前存在 __soa_flow_branch_config_v224。新 key 还没配过时，把旧列表迁过来，
+     * 免得用户重填。迁移是幂等的：写入新 key 后下次直接读新 key。
+     */
+    if (!raw) {
+      try {
+        raw =
+          getStoredText(
+            "__soa_flow_branch_config_v224",
+            ""
+          );
+
+        if (raw) {
+          saveStoredText(
+            UI.SIGNING_LIST_KEY,
+            raw
+          );
+        }
+      } catch (_) {
+        raw = "";
+      }
+    }
+
+    if (raw) {
+      try {
+        const parsed =
+          JSON.parse(raw);
+
+        if (
+          parsed &&
+          Array.isArray(parsed.items)
+        ) {
+          return {
+            defaultShort:
+              cleanText(
+                parsed.defaultShort
+              ),
+            items:
+              parsed.items
+                .map(item => ({
+                  short:
+                    cleanText(item?.short),
+                  full:
+                    cleanText(item?.full)
+                }))
+                .filter(item =>
+                  item.short &&
+                  item.full
+                )
+          };
+        }
+      } catch (_) {
+        // 存的是旧格式/坏 JSON 时退回空配置，不抛错。
+      }
+    }
 
     return {
-      mode,
-      text
+      defaultShort:
+        "",
+      items: []
     };
   }
 
   function saveSigningCompanyConfig(
-    mode,
-    text = ""
+    items,
+    defaultShort
   ) {
-    const normalizedMode =
-      mode === "text"
-        ? "text"
-        : "first";
-
     saveStoredText(
-      UI.SIGNING_MODE_KEY,
-      normalizedMode
+      UI.SIGNING_LIST_KEY,
+      JSON.stringify({
+        defaultShort:
+          cleanText(defaultShort),
+        items:
+          items.map(item => ({
+            short:
+              cleanText(item.short),
+            full:
+              cleanText(item.full)
+          }))
+      })
     );
-
-    saveStoredText(
-      UI.SIGNING_TEXT_KEY,
-      cleanText(text)
-    );
-
-    updateSigningCompanyUi();
   }
 
-  function updateSigningCompanyUi() {
+  function updateSigningCompanyUi(
+    refreshInputs = true
+  ) {
     const button =
       document.getElementById(
         UI.SIGNING_BUTTON_ID
       );
 
-    const firstRadio =
+    const listInput =
       document.getElementById(
-        UI.SIGNING_FIRST_ID
+        UI.SIGNING_LIST_ID
       );
 
-    const textRadio =
+    const defaultInput =
       document.getElementById(
-        UI.SIGNING_TEXT_MODE_ID
-      );
-
-    const textInput =
-      document.getElementById(
-        UI.SIGNING_TEXT_ID
+        UI.SIGNING_DEFAULT_ID
       );
 
     const config =
@@ -10295,8 +10412,12 @@
       button.textContent =
         "签单主体";
 
+      const count =
+        config.items.length;
+
       if (
-        config.mode === "first"
+        count > 0 &&
+        config.defaultShort
       ) {
         button.style.color =
           "#389e0d";
@@ -10308,21 +10429,7 @@
           "#f6ffed";
 
         button.title =
-          "当前：按下拉顺序选择第一个可用选项";
-      } else if (
-        config.text
-      ) {
-        button.style.color =
-          "#389e0d";
-
-        button.style.borderColor =
-          "#b7eb8f";
-
-        button.style.background =
-          "#f6ffed";
-
-        button.title =
-          `当前：按名称精确匹配“${config.text}”`;
+          `当前：${count} 个签单主体，默认“${config.defaultShort}”`;
       } else {
         button.style.color =
           "#cf1322";
@@ -10334,32 +10441,99 @@
           "#fff2f0";
 
         button.title =
-          "已选择按名称匹配，但尚未填写签单主体名称";
+          count > 0
+            ? "已配置签单主体，但未指定默认"
+            : "未配置签单主体（合同页将不代选该字段）";
       }
     }
 
-    if (firstRadio) {
-      firstRadio.checked =
-        config.mode === "first";
+    if (refreshInputs && listInput) {
+      /*
+       * 只在输入框未聚焦时才回填配置值：面板已存在时，
+       * createTestPanel 会随 MutationObserver 反复调用本函数
+       * （此处传 refreshInputs=false，根本不会走到回填），
+       * 若每次都覆盖 value，用户正在输入的内容会被瞬间清空（表现为“无法填写”）。
+       * 焦点保护是第二道保险，覆盖「回填时用户恰好还在输入」的极端场景。
+       */
+      if (
+        document.activeElement !==
+        listInput
+      ) {
+        listInput.value =
+          config.items
+            .map(item =>
+              `${item.short}=${item.full}`
+            )
+            .join("\n");
+      }
     }
 
-    if (textRadio) {
-      textRadio.checked =
-        config.mode === "text";
+    if (refreshInputs && defaultInput) {
+      if (
+        document.activeElement !==
+        defaultInput
+      ) {
+        defaultInput.value =
+          config.defaultShort;
+      }
+    }
+  }
+
+  /*
+   * 面板里“保存”签单主体配置。
+   * 列表按“简称=全称”逐行解析；默认简称必须在列表里，否则不生效并提示。
+   */
+  function commitSigningConfig() {
+    const listInput =
+      document.getElementById(
+        UI.SIGNING_LIST_ID
+      );
+
+    const defaultInput =
+      document.getElementById(
+        UI.SIGNING_DEFAULT_ID
+      );
+
+    const items =
+      parseSigningLines(
+        listInput?.value || ""
+      );
+
+    const defaultShort =
+      cleanText(
+        defaultInput?.value || ""
+      );
+
+    if (
+      defaultShort &&
+      !items.some(item =>
+        item.short === defaultShort
+      )
+    ) {
+      updatePanelStatus(
+        `默认简称“${defaultShort}”不在上方列表中，未保存。`,
+        "error"
+      );
+
+      return;
     }
 
-    if (textInput) {
-      textInput.value =
-        config.text;
+    saveSigningCompanyConfig(
+      items,
+      defaultShort
+    );
 
-      textInput.disabled =
-        config.mode !== "text";
+    updateSigningCompanyUi();
 
-      textInput.style.opacity =
-        config.mode === "text"
-          ? "1"
-          : "0.55";
-    }
+    updatePanelStatus(
+      items.length
+        ? `✓ 已保存 ${items.length} 个签单主体配置` +
+          (defaultShort
+            ? `，默认“${defaultShort}”。`
+            : "。")
+        : "✓ 已清空签单主体配置（合同页将不代选该字段）。",
+      "success"
+    );
   }
 
   function toggleSigningPanel() {
@@ -12147,7 +12321,8 @@
 
   async function runContractProcess(
     {
-      token = null
+      token = null,
+      signingCompanyFullName = null
     } = {}
   ) {
     if (!contractPageVisible()) {
@@ -12265,23 +12440,12 @@
         token
       );
 
-      const branchState =
-        getContractBranchState();
-
-      if (
-        branchState.select &&
-        !branchState.value
-      ) {
-        log(
-          "提示：对应发单分院当前为空（系统未带出）。本脚本不代选该字段，如需填写请人工选择。"
-        );
-      }
-
       const before =
         getContractFormSnapshot();
 
       await selectConfiguredContractCompany(
-        token
+        token,
+        signingCompanyFullName
       );
 
       /*
@@ -12742,10 +12906,15 @@
     }
   }
 
+  /*
+   * v2.25：参数 stage 仅为兼容旧调用点保留，不再参与显隐判定，
+   * 也不再有默认值（默认值会白跑一次 getCurrentFlowStage 的 DOM 扫描）。
+   */
   function updateContractOnlyButton(
-    stage =
-      getCurrentFlowStage()
+    stage
   ) {
+    void stage;
+
     const button =
       document.getElementById(
         UI.CONTRACT_ONLY_BUTTON_ID
@@ -12768,11 +12937,11 @@
       return;
     }
 
+    /*
+     * v2.25：只看“有没有流程在跑”，不再按阶段过滤 —— 任何阶段都可用。
+     */
     const shouldShow =
-      !processRunning &&
-      isSupportedAutoProcessStage(
-        stage
-      );
+      !processRunning;
 
     button.style.display =
       shouldShow
@@ -12784,6 +12953,199 @@
 
     button.textContent =
       "处理合同";
+  }
+
+  /*
+   * ── 单独处理合同时选择签单主体（v2.24）──
+   *
+   * 弹一个轻量对话框，列出配置里的签单主体简称，让用户点选。
+   * 返回选中项对应的全称；没配置或用户点“跳过”时返回 ""。
+   * 正常自动处理订单不走这里，直接用配置的“默认”。
+   */
+  function chooseSigningCompanyFullName() {
+    return new Promise(resolve => {
+      const config =
+        getSigningCompanyConfig();
+
+      const items =
+        config.items;
+
+      if (!items.length) {
+        resolve("");
+        return;
+      }
+
+      const overlay =
+        document.createElement(
+          "div"
+        );
+
+      overlay.id =
+        "__soa_signing_choice_overlay_v224";
+
+      overlay.style.cssText = [
+        "position:fixed",
+        "inset:0",
+        "z-index:2147483000",
+        "display:flex",
+        "align-items:center",
+        "justify-content:center",
+        "background:rgba(0,0,0,0.45)"
+      ].join(";");
+
+      const box =
+        document.createElement(
+          "div"
+        );
+
+      box.style.cssText = [
+        "min-width:260px",
+        "max-width:420px",
+        "padding:14px",
+        "border-radius:8px",
+        "background:#fff",
+        "box-shadow:0 6px 24px rgba(0,0,0,0.2)",
+        "font-family:inherit"
+      ].join(";");
+
+      const title =
+        document.createElement(
+          "div"
+        );
+
+      title.textContent =
+        "选择签单主体";
+
+      title.style.cssText = [
+        "margin-bottom:10px",
+        "font-size:13px",
+        "font-weight:600",
+        "color:#262626"
+      ].join(";");
+
+      box.appendChild(title);
+
+      const done =
+        value => {
+          overlay.remove();
+          resolve(value);
+        };
+
+      const buttons =
+        document.createElement(
+          "div"
+        );
+
+      buttons.style.cssText = [
+        "display:flex",
+        "flex-direction:column",
+        "gap:6px"
+      ].join(";");
+
+      items.forEach(item => {
+        const btn =
+          document.createElement(
+            "button"
+          );
+
+        const isDefault =
+          item.short ===
+          config.defaultShort;
+
+        btn.type =
+          "button";
+
+        btn.textContent =
+          item.short +
+          (
+            isDefault
+              ? "（默认）"
+              : ""
+          );
+
+        btn.style.cssText = [
+          "width:100%",
+          "height:32px",
+          "border:1px solid " +
+            (isDefault
+              ? "#1677ff"
+              : "#d9d9d9"),
+          "border-radius:5px",
+          "background:" +
+            (isDefault
+              ? "#e6f4ff"
+              : "#fff"),
+          "color:" +
+            (isDefault
+              ? "#1677ff"
+              : "#262626"),
+          "font-size:12px",
+          "font-weight:600",
+          "cursor:pointer"
+        ].join(";");
+
+        btn.addEventListener(
+          "click",
+          () => done(item.full)
+        );
+
+        buttons.appendChild(
+          btn
+        );
+      });
+
+      const skip =
+        document.createElement(
+          "button"
+        );
+
+      skip.type =
+        "button";
+
+      skip.textContent =
+        "跳过（不代选）";
+
+      skip.style.cssText = [
+        "width:100%",
+        "height:28px",
+        "margin-top:6px",
+        "border:0",
+        "border-radius:5px",
+        "background:transparent",
+        "color:#999",
+        "font-size:11px",
+        "cursor:pointer"
+      ].join(";");
+
+      skip.addEventListener(
+        "click",
+        () => done("")
+      );
+
+      box.appendChild(
+        buttons
+      );
+
+      box.appendChild(skip);
+
+      overlay.appendChild(box);
+
+      overlay.addEventListener(
+        "click",
+        event => {
+          if (
+            event.target ===
+            overlay
+          ) {
+            done("");
+          }
+        }
+      );
+
+      document.body.appendChild(
+        overlay
+      );
+    });
   }
 
   async function runContractOnlyProcess() {
@@ -12823,6 +13185,17 @@
         token
       );
 
+      /*
+       * v2.24：单独处理合同时，先让用户选签单主体（门诊部 / 高新门诊部）。
+       * 选中的简称会映射成全称传给 runContractProcess；跳过则走默认/不代选。
+       */
+      const chosenSigningCompanyFullName =
+        await chooseSigningCompanyFullName();
+
+      throwIfFlowCancelled(
+        token
+      );
+
       updatePanelStatus(
         "合同模块：单独处理中，仅补全字段与上传文件，不会发起落单..."
       );
@@ -12836,7 +13209,9 @@
       );
 
       await runContractProcess({
-        token
+        token,
+        signingCompanyFullName:
+          chosenSigningCompanyFullName
       });
 
       updatePanelStatus(
@@ -13215,7 +13590,13 @@
     if (existing) {
       updateBoundFileDisplay();
       updateRemarkStatus();
-      updateSigningCompanyUi();
+      /*
+       * 面板已存在时只刷新签单主体按钮状态，不回填输入框：
+       * 本分支会随 MutationObserver 反复触发，若回填会清空用户正在输入的内容。
+       */
+      updateSigningCompanyUi(
+        false
+      );
       renderWebNoticeHistory();
       updateFlowStageDisplay();
       refreshExamDateInfo(
@@ -13347,7 +13728,7 @@
 
           <div style="margin-bottom:3px;">
             <strong style="color:#444;">合同：</strong>
-            “处理合同”按钮单独处理合同模块（补字段 + 上传文件 + 保存），<strong style="color:#444;">不发起落单</strong>，可在可处理阶段随时点。
+            “处理合同”按钮单独处理合同模块（补字段 + 上传文件 + 保存），<strong style="color:#444;">不发起落单</strong>，任何阶段都可点（不看流程阶段，只看页面有没有合同页签）。
           </div>
 
           <div style="margin-bottom:3px;">
@@ -13545,56 +13926,73 @@
             color:#555;
             font-weight:600;
           ">
-            己方签单主体选择方式
+            签单主体配置
           </div>
 
-          <label style="
-            display:flex;
-            align-items:center;
-            gap:5px;
-            margin-bottom:6px;
-            cursor:pointer;
-          ">
-            <input
-              id="${UI.SIGNING_FIRST_ID}"
-              type="radio"
-              name="__soa_signing_mode_v118"
-              value="first"
-            >
-            <span>第一个可用选项（当前默认）</span>
-          </label>
-
-          <label style="
-            display:flex;
-            align-items:center;
-            gap:5px;
-            margin-bottom:6px;
-            cursor:pointer;
-          ">
-            <input
-              id="${UI.SIGNING_TEXT_MODE_ID}"
-              type="radio"
-              name="__soa_signing_mode_v118"
-              value="text"
-            >
-            <span>按名称精确匹配</span>
-          </label>
-
-          <input
-            id="${UI.SIGNING_TEXT_ID}"
-            type="text"
-            placeholder="请输入下拉框中的完整主体名称"
+          <textarea
+            id="${UI.SIGNING_LIST_ID}"
+            placeholder="每行一条：简称=全称&#10;例：&#10;门诊部=新乡美年大健康管理有限公司门诊部&#10;高新门诊部=新乡美年大健康管理有限公司高新门诊部"
             style="
               width:100%;
-              height:30px;
+              height:64px;
+              max-height:120px;
               box-sizing:border-box;
-              padding:0 8px;
+              padding:6px 8px;
               border:1px solid #d9d9d9;
               border-radius:5px;
+              resize:vertical;
+              overflow:auto;
+              font-family:inherit;
               font-size:11px;
-              outline:none;
+              line-height:1.5;
             "
-          >
+          ></textarea>
+
+          <div style="
+            display:flex;
+            align-items:center;
+            gap:6px;
+            margin-top:6px;
+          ">
+            <span style="
+              color:#555;
+              white-space:nowrap;
+            ">默认简称</span>
+            <input
+              id="${UI.SIGNING_DEFAULT_ID}"
+              type="text"
+              placeholder="如：高新门诊部"
+              style="
+                flex:1 1 auto;
+                min-width:0;
+                height:28px;
+                box-sizing:border-box;
+                padding:0 8px;
+                border:1px solid #d9d9d9;
+                border-radius:5px;
+                font-size:11px;
+                outline:none;
+              "
+            >
+            <button
+              id="${UI.SIGNING_SAVE_ID}"
+              type="button"
+              style="
+                flex:0 0 auto;
+                height:28px;
+                padding:0 10px;
+                border:0;
+                border-radius:5px;
+                background:#1677ff;
+                color:#fff;
+                font-size:11px;
+                font-weight:600;
+                cursor:pointer;
+              "
+            >
+              保存
+            </button>
+          </div>
 
           <div style="
             margin-top:6px;
@@ -13602,7 +14000,7 @@
             font-size:10px;
             line-height:1.5;
           ">
-            按名称模式采用精确匹配；找不到配置主体时会停止合同处理，不会改选第一项。
+            用于合同页「己方签单主体」下拉：正常自动处理时用「默认」；单独点「处理合同」时可临时选择。全称须与下拉选项一字不差，找不到会停止代选、不会乱选第一项。
           </div>
         </div>
 
@@ -13754,7 +14152,7 @@
                 cursor:pointer;
                 white-space:nowrap;
               "
-              title="只处理合同模块：补全合同字段并上传文件，不发起落单"
+              title="任何阶段可用：只处理合同模块，补全合同字段并上传文件，不发起落单"
             >
               处理合同
             </button>
@@ -14060,80 +14458,12 @@
 
     document
       .getElementById(
-        UI.SIGNING_FIRST_ID
+        UI.SIGNING_SAVE_ID
       )
       ?.addEventListener(
-        "change",
-        event => {
-          if (
-            event.currentTarget
-              ?.checked
-          ) {
-            saveSigningCompanyConfig(
-              "first",
-              document.getElementById(
-                UI.SIGNING_TEXT_ID
-              )?.value || ""
-            );
-          }
-        }
-      );
-
-    document
-      .getElementById(
-        UI.SIGNING_TEXT_MODE_ID
-      )
-      ?.addEventListener(
-        "change",
-        event => {
-          if (
-            event.currentTarget
-              ?.checked
-          ) {
-            saveSigningCompanyConfig(
-              "text",
-              document.getElementById(
-                UI.SIGNING_TEXT_ID
-              )?.value || ""
-            );
-
-            document.getElementById(
-              UI.SIGNING_TEXT_ID
-            )?.focus();
-          }
-        }
-      );
-
-    document
-      .getElementById(
-        UI.SIGNING_TEXT_ID
-      )
-      ?.addEventListener(
-        "input",
-        event => {
-          const text =
-            event.currentTarget
-              ?.value || "";
-
-          const textRadio =
-            document.getElementById(
-              UI.SIGNING_TEXT_MODE_ID
-            );
-
-          if (
-            textRadio &&
-            textRadio.checked
-          ) {
-            saveSigningCompanyConfig(
-              "text",
-              text
-            );
-          } else {
-            saveStoredText(
-              UI.SIGNING_TEXT_KEY,
-              text
-            );
-          }
+        "click",
+        () => {
+          commitSigningConfig();
         }
       );
 
