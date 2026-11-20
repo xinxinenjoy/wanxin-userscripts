@@ -8,7 +8,7 @@
 
 GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动更新。
 
-当前正式发布 **18** 个脚本 · 最近修改 **2026-11-20 08:40**
+当前正式发布 **18** 个脚本 · 最近修改 **2026-11-20 15:25**
 
 </div>
 
@@ -61,7 +61,7 @@ GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动�
 | **扁鹊-1.2订单智能审批** | `2.25` | 2026-11-20 08:40 | SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-dingdanauto.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-dingdanauto.user.js) |
 | **扁鹊-1.3体检数据查询** | `1.11.9` | 2026-09-26 11:50 | SOA体检数据：自动读取落单数据、体检汇总与三类卡数量；卡类数量/状态左键看卡片明细（自动按制卡批次带出备注）、右键跳卡池。注意：卡类查询需要账号对应权限 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-dingdandata.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-dingdandata.user.js) |
 | **扁鹊-1.4对账报表导出** | `1.10` | 2026-09-24 17:29 | SOA对账报表：支持自定义日期区间，突破3年的时间段限制，自动分段查询、导出。并自动对比报表与订单内的数据差异。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-duizhangbaobiao.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-duizhangbaobiao.user.js) |
-| **扁鹊-1.5业绩报表辅助** | `1.1.6` | 2026-09-24 17:29 | SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-baobiaodaochu.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-baobiaodaochu.user.js) |
+| **扁鹊-1.5业绩报表辅助** | `1.1.7` | 2026-11-20 15:25 | SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-baobiaodaochu.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-baobiaodaochu.user.js) |
 | **扁鹊-1.6制卡管理查询** | `0.5.11` | 2026-11-07 09:19 | 查询并汇总本年度的贵宾、邀约、核磁、CT等制卡记录，按部门/人员统计办卡进度。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-zhikaguanli.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-zhikaguanli.user.js) |
 | **扁鹊-1.7订单特殊审批** | `2.2.2` | 2026-10-16 15:23 | SOA特殊审批开关：一键在「特殊审批 开」（业务员报价后不可修改订单=勾选 + 检中修改钉钉审批=不启用）与「特殊审批 关」（反之，已恢复正常）之间切换。直接发请求、不跳转页面、不弹确认框，切完自动回读校验。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-neiqinshenpi.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-neiqinshenpi.user.js) |
 | **扁鹊-1.8套餐批量删除** | `1.1.7` | 2026-10-26 11:28 | SOA 订单页：列出当前订单的全部套餐/加项包，勾选后批量删除；另带「改名模式」开关（独立的改名视图：隐藏已作废/已删除的套餐，每行只留一个「改名」入口，套餐名默认只改中间段、系统前后缀原样保留，可切整串，也能单独改对外展示名），支持先暂存多条、统一提交、单条撤销/撤回原名。只在「未落单」或「已落单+检中修改」时加载；已作废与绑定关系复杂的加项包/赠送包挡在删除之外，已体检的只是不能删、仍可改名。全部直接调接口，不模拟点击。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-shanchutaocan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-shanchutaocan.user.js) |
