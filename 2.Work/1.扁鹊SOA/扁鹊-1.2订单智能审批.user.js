@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.24
+// @version      2.25
 // @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -21,7 +21,7 @@
  * 功能：
  * - 识别订单流程阶段并执行已支持的自动处理（报价确认、内勤复核、合同补充、发起落单、落单审核）。
  * - 报价确认阶段自动点击“提交内勤落单”，弹窗“是否独家”固定选“是”并提交，进入内勤复核。
- * - 合同模块可单独处理（面板“处理合同”按钮）：只补全字段与上传文件，不发起落单。
+ * - 合同模块可单独处理（面板“处理合同”按钮）：只补全字段与上传文件，不发起落单；任何阶段都可点。
  * - 支持审批备注、体检时间校验与报价确认阶段时间修正。
  * - 合同阶段智能补全字段，并绑定共用文件（合同 / 无合同证明文件 / 授权书）按需上传。
  * - 关键动作执行后动态验证页面真实状态；长时间未推进时显示卡点诊断，不重复提交。
@@ -174,6 +174,16 @@
  *    （发单分院即签单主体，同一字段，不再单独配置）。正常自动处理用默认；
  *    单独点「处理合同」时弹窗选择门诊部/高新门诊部。全称与下拉选项一字不差才选，
  *    找不到抛错不改选第一项。
+ *
+ * 关于「处理合同」取消阶段白名单（v2.25，2026-11-20）：
+ * ① 按钮显隐不再看阶段 —— 只要没有流程在跑就一直显示，任何阶段都能点。
+ *    理由：它只对当前订单的合同页补字段 + 上传 + 保存，不推进流程；
+ *    能不能做由页面本身决定（有没有合同页签、字段是否可编辑），
+ *    阶段白名单反而会挡住合法用法（授权审批 / 内勤复核里提前补合同、
+ *    已落单后回补合同资料）。
+ * ② ensureContractTabVisible 增加一次确定性预检：页签容器整体不存在（不在订单详情页）
+ *    ⇒ 立即报错，不再干等 FLOW_WAIT_TIMEOUT（60 秒）。
+ *    容器在、只是「合同」页签稍后渲染的情况，仍走原有响应式等待。
  */
 
 (function () {
@@ -8590,6 +8600,25 @@
       return true;
     }
 
+    /*
+     * v2.25：合同处理不再限阶段，“处理合同”可能在任意页面被点。
+     * 页签容器整体不存在 ⇒ 这里永远等不到「合同」页签，直接报错，
+     * 不再干等 FLOW_WAIT_TIMEOUT（60 秒）。
+     * 只判这一种确定情形；容器在、只是「合同」页签稍后渲染的，仍走正常等待。
+     */
+    const visibleOrderTabCount =
+      Array.from(
+        document.querySelectorAll(
+          ".tabs-wrap .tabs .tab"
+        )
+      ).filter(isVisible).length;
+
+    if (!visibleOrderTabCount) {
+      throw new Error(
+        "当前页面没有订单页签（可能不在订单详情页），无法打开合同页。请在订单详情页再点“处理合同”。"
+      );
+    }
+
     const contractTab =
       await waitForReactiveCondition(
         () =>
@@ -9789,31 +9818,16 @@
   }
 
   /*
-   * 「处理合同」单独处理可用阶段（v2.24）。
+   * 「处理合同」的可用范围（v2.25，2026-11-20）：**不再有阶段白名单**。
    *
-   * 与 AUTO_PROCESS_STAGES 的区别：后者还控制“立即处理订单”主流程按钮
-   * 的显隐与阶段拦截，而“处理合同”只补字段 + 上传 + 保存、不推进流程。
+   * 与 AUTO_PROCESS_STAGES 的区别：后者还控制“立即处理订单”主流程按钮的显隐
+   * 与阶段拦截，而“处理合同”只补字段 + 上传 + 保存、不推进流程。
+   * 所以它不需要知道当前阶段 —— 是否真能处理交给页面判定
+   * （有没有合同页签 / 字段是否可编辑），阶段判定只会挡住合法用法
+   * （授权审批、内勤复核里提前补，已落单后回补合同资料）。
    *
-   * v2.24 口径（红领巾 2026-11-19）：
-   *   在自动处理白名单基础上，**加**「报价单设计」「检中修改」，
-   *   **去掉**「已落单」「落单中」「授权审批（钉钉审批）」「内勤复核」。
-   *   最终可用：报价单设计、报价确认、合同补充、落单审核、检中修改。
+   * v2.24 曾有 isContractOnlyStage() 白名单，v2.25 已删除（无调用者不保留死代码）。
    */
-  const CONTRACT_ONLY_STAGES = [
-    "报价单设计",
-    "报价确认",
-    "合同补充",
-    "落单审核",
-    "检中修改"
-  ];
-
-  function isContractOnlyStage(
-    stage
-  ) {
-    return CONTRACT_ONLY_STAGES.includes(
-      stage
-    );
-  }
 
   function getAutomationStageIssue(
     stage
@@ -12892,10 +12906,15 @@
     }
   }
 
+  /*
+   * v2.25：参数 stage 仅为兼容旧调用点保留，不再参与显隐判定，
+   * 也不再有默认值（默认值会白跑一次 getCurrentFlowStage 的 DOM 扫描）。
+   */
   function updateContractOnlyButton(
-    stage =
-      getCurrentFlowStage()
+    stage
   ) {
+    void stage;
+
     const button =
       document.getElementById(
         UI.CONTRACT_ONLY_BUTTON_ID
@@ -12918,11 +12937,11 @@
       return;
     }
 
+    /*
+     * v2.25：只看“有没有流程在跑”，不再按阶段过滤 —— 任何阶段都可用。
+     */
     const shouldShow =
-      !processRunning &&
-      isContractOnlyStage(
-        stage
-      );
+      !processRunning;
 
     button.style.display =
       shouldShow
@@ -13709,7 +13728,7 @@
 
           <div style="margin-bottom:3px;">
             <strong style="color:#444;">合同：</strong>
-            “处理合同”按钮单独处理合同模块（补字段 + 上传文件 + 保存），<strong style="color:#444;">不发起落单</strong>，可在可处理阶段随时点。
+            “处理合同”按钮单独处理合同模块（补字段 + 上传文件 + 保存），<strong style="color:#444;">不发起落单</strong>，任何阶段都可点（不看流程阶段，只看页面有没有合同页签）。
           </div>
 
           <div style="margin-bottom:3px;">
@@ -14133,7 +14152,7 @@
                 cursor:pointer;
                 white-space:nowrap;
               "
-              title="只处理合同模块：补全合同字段并上传文件，不发起落单"
+              title="任何阶段可用：只处理合同模块，补全合同字段并上传文件，不发起落单"
             >
               处理合同
             </button>
