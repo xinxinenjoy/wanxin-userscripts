@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.5业绩报表辅助
 // @namespace    https://tampermonkey.net/
-// @version      1.1.6
+// @version      1.1.7
 // @description  SOA报表辅助工具：一次性查询、导出多个表格，用于处理业绩、个检、加项。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -28,6 +28,8 @@
  * - 当前支持：收入确认表、体检对账报表、客户加选项目报表。
  * - 报表可勾选批量查询，也可单独查询；勾选状态自动记忆，批量查询按顺序错开请求。
  * - 支持今天 / 本月 / 本季度 / 本年 / 自定义日期区间；体检对账报表支持超 1080 天自动分段。
+ * - 导出接口单独使用长超时；仍超时则自动把该时段对半拆分后继续导出，避免大数据量直接失败。
+ * - 拆段导出的多个 xlsx 会在浏览器内合并成一份再下载（合并失败自动退回逐片下载，不丢数据）。
  * - 查询结果分别展示、独立导出；客户加选项目报表为异步生成，支持 15 秒检测、重新获取与查看下载中心状态。
  * - 支持 Fly 授权自动获取、失效刷新、网络重试，可与对账报表同时使用。
  */
@@ -149,6 +151,24 @@
 
   const REQUEST_MAX_ATTEMPTS =
     3;
+
+  /*
+   * 查询接口只返回轻量 JSON，30 秒足够。
+   * 导出接口是后端现场生成整份 xlsx：3 万行左右（如 90 天对账）在服务端就要几十秒，
+   * 沿用 30 秒必然 ontimeout，所以导出单独给长超时。
+   */
+  const REQUEST_TIMEOUT_MS =
+    30000;
+
+  const EXPORT_TIMEOUT_MS =
+    300000;
+
+  /*
+   * 长超时仍失败时的兜底：把该时段对半拆开逐段导出。
+   * 单次导出最多拆出 16 小段，防止极端情况下无限翻倍。
+   */
+  const EXPORT_SPLIT_MAX_PARTS =
+    16;
 
   const PANEL_ID =
     "__fly_income_report_panel_v020";
@@ -1125,7 +1145,9 @@
     token,
     body,
     responseType =
-      "json"
+      "json",
+    timeoutMs =
+      REQUEST_TIMEOUT_MS
   }) {
     return new Promise(
       (
@@ -1172,7 +1194,7 @@
             false,
 
           timeout:
-            30000,
+            timeoutMs,
 
           onload:
             resolve,
@@ -1197,10 +1219,20 @@
             () => {
               const err =
                 new Error(
-                  "Fly接口请求超时"
+                  `Fly接口请求超时（${Math.round(
+                    timeoutMs /
+                      1000
+                  )}秒）`
                 );
 
               err.networkError =
+                true;
+
+              /*
+               * timedOut 单独标记：导出请求靠它判断“后端还没生成完，换个更小的区间再来”，
+               * 而不是当成普通网络抖动原样重试。
+               */
+              err.timedOut =
                 true;
 
               reject(
@@ -1231,6 +1263,10 @@
     body,
     responseType =
       "json",
+    timeoutMs =
+      REQUEST_TIMEOUT_MS,
+    retryOnTimeout =
+      true,
     onRetry =
       () => {}
   }) {
@@ -1249,13 +1285,24 @@
             url,
             token,
             body,
-            responseType
+            responseType,
+            timeoutMs
           });
+
+        /*
+         * 504 是网关等后端等超时；导出场景重试只会再等一轮，
+         * 直接把它交给上层拆分区间处理。
+         */
+        const gatewayTimedOut =
+          response.status ===
+            504 &&
+          !retryOnTimeout;
 
         if (
           shouldRetryStatus(
             response.status
           ) &&
+          !gatewayTimedOut &&
           attempt <
             REQUEST_MAX_ATTEMPTS
         ) {
@@ -1277,6 +1324,13 @@
       } catch (error) {
         lastError =
           error;
+
+        if (
+          error?.timedOut &&
+          !retryOnTimeout
+        ) {
+          throw error;
+        }
 
         if (
           attempt >=
@@ -1830,13 +1884,20 @@
     );
   }
 
-  async function exportArrayBufferReport(
+  /*
+   * 只把导出文件本体取回内存，不触发下载。
+   * 拆段导出要先把各片留着合并成一份，所以把「请求」与「落盘」拆成两步。
+   */
+  async function requestArrayBufferReport(
     token,
     url,
     body,
     {
-      filename,
-      onRetry
+      onRetry,
+      timeoutMs =
+        EXPORT_TIMEOUT_MS,
+      retryOnTimeout =
+        false
     }
   ) {
     const response =
@@ -1846,6 +1907,8 @@
         body,
         responseType:
           "arraybuffer",
+        timeoutMs,
+        retryOnTimeout,
         onRetry
       });
 
@@ -1874,11 +1937,30 @@
           response
         );
 
-      throw new Error(
-        detail
-          ? `导出失败：HTTP ${response.status} · ${detail}`
-          : `导出失败：HTTP ${response.status}`
-      );
+      const error =
+        new Error(
+          detail
+            ? `导出失败：HTTP ${response.status} · ${detail}`
+            : `导出失败：HTTP ${response.status}`
+        );
+
+      /*
+       * 网关侧 502/503/504 同样是“后端没在时限内出结果”，
+       * 标记后走与客户端超时相同的拆分兜底。
+       */
+      if (
+        response.status ===
+          502 ||
+        response.status ===
+          503 ||
+        response.status ===
+          504
+      ) {
+        error.serverTimeout =
+          true;
+      }
+
+      throw error;
     }
 
     const headers =
@@ -1946,6 +2028,17 @@
       );
     }
 
+    return {
+      buffer,
+      contentType
+    };
+  }
+
+  function downloadArrayBuffer(
+    buffer,
+    contentType,
+    filename
+  ) {
     const blob =
       new Blob(
         [
@@ -1996,6 +2089,1820 @@
       size:
         blob.size
     };
+  }
+
+  // ============================================================
+  // 4.1 xlsx 合并（拆段导出后合成一份）
+  //     xlsx = zip；这里只做“搬数据行”：
+  //     首片的样式表/列宽原样保留，后续分片去表头、重映射共享字符串。
+  // ============================================================
+
+  const ZIP_LOCAL_SIG =
+    0x04034b50;
+
+  const ZIP_CENTRAL_SIG =
+    0x02014b50;
+
+  const ZIP_EOCD_SIG =
+    0x06054b50;
+
+  /*
+   * 超过这个合计体积就放弃合并、退回分片下载：
+   * 合并要把所有分片同时留在内存里，标签页撑不住比多几个文件更糟。
+   */
+  const XLSX_MERGE_MAX_BYTES =
+    80 * 1024 * 1024;
+
+  const XLSX_SHEET_MIME =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+  function crc32Of(bytes) {
+    let table =
+      crc32Of.table;
+
+    if (!table) {
+      table =
+        new Uint32Array(
+          256
+        );
+
+      for (
+        let i = 0;
+        i < 256;
+        i += 1
+      ) {
+        let c =
+          i;
+
+        for (
+          let k = 0;
+          k < 8;
+          k += 1
+        ) {
+          c =
+            c & 1
+              ? 0xedb88320 ^
+                (c >>> 1)
+              : c >>> 1;
+        }
+
+        table[i] =
+          c >>> 0;
+      }
+
+      crc32Of.table =
+        table;
+    }
+
+    let crc =
+      0xffffffff;
+
+    for (
+      let i = 0;
+      i < bytes.length;
+      i += 1
+    ) {
+      crc =
+        table[
+          (crc ^
+            bytes[i]) &
+            0xff
+        ] ^
+        (crc >>> 8);
+    }
+
+    return (crc ^
+      0xffffffff) >>>
+      0;
+  }
+
+  async function inflateRawBytes(
+    bytes
+  ) {
+    const stream =
+      new Blob([
+        bytes
+      ])
+        .stream()
+        .pipeThrough(
+          new DecompressionStream(
+            "deflate-raw"
+          )
+        );
+
+    const chunk =
+      await new Response(
+        stream
+      ).arrayBuffer();
+
+    return new Uint8Array(
+      chunk
+    );
+  }
+
+  async function deflateRawBytes(
+    bytes
+  ) {
+    const stream =
+      new Blob([
+        bytes
+      ])
+        .stream()
+        .pipeThrough(
+          new CompressionStream(
+            "deflate-raw"
+          )
+        );
+
+    const chunk =
+      await new Response(
+        stream
+      ).arrayBuffer();
+
+    return new Uint8Array(
+      chunk
+    );
+  }
+
+  /*
+   * 读 zip 目录。xlsx 里各条目多为 deflate，这里只记录原始压缩数据，
+   * 未改动的条目（样式表、主题等）原样搬回去，不必解压再压。
+   */
+  async function readZipEntries(
+    buffer
+  ) {
+    const bytes =
+      new Uint8Array(
+        buffer
+      );
+
+    const view =
+      new DataView(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength
+      );
+
+    const minEocd =
+      Math.max(
+        0,
+        bytes.length -
+          66000
+      );
+
+    let eocd =
+      -1;
+
+    for (
+      let i =
+        bytes.length - 22;
+      i >= minEocd;
+      i -= 1
+    ) {
+      if (
+        view.getUint32(
+          i,
+          true
+        ) ===
+        ZIP_EOCD_SIG
+      ) {
+        eocd =
+          i;
+
+        break;
+      }
+    }
+
+    if (eocd < 0) {
+      throw new Error(
+        "不是有效的 xlsx（缺少 zip 目录）"
+      );
+    }
+
+    const total =
+      view.getUint16(
+        eocd + 10,
+        true
+      );
+
+    let cursor =
+      view.getUint32(
+        eocd + 16,
+        true
+      );
+
+    const decoder =
+      new TextDecoder();
+
+    const entries =
+      new Map();
+
+    for (
+      let i = 0;
+      i < total;
+      i += 1
+    ) {
+      if (
+        view.getUint32(
+          cursor,
+          true
+        ) !==
+        ZIP_CENTRAL_SIG
+      ) {
+        throw new Error(
+          "xlsx 目录项损坏"
+        );
+      }
+
+      const method =
+        view.getUint16(
+          cursor + 10,
+          true
+        );
+
+      const crc =
+        view.getUint32(
+          cursor + 16,
+          true
+        );
+
+      const compressedSize =
+        view.getUint32(
+          cursor + 20,
+          true
+        );
+
+      const uncompressedSize =
+        view.getUint32(
+          cursor + 24,
+          true
+        );
+
+      const nameLength =
+        view.getUint16(
+          cursor + 28,
+          true
+        );
+
+      const extraLength =
+        view.getUint16(
+          cursor + 30,
+          true
+        );
+
+      const commentLength =
+        view.getUint16(
+          cursor + 32,
+          true
+        );
+
+      const localOffset =
+        view.getUint32(
+          cursor + 42,
+          true
+        );
+
+      const name =
+        decoder.decode(
+          bytes.subarray(
+            cursor + 46,
+            cursor +
+              46 +
+              nameLength
+          )
+        );
+
+      const localNameLength =
+        view.getUint16(
+          localOffset + 26,
+          true
+        );
+
+      const localExtraLength =
+        view.getUint16(
+          localOffset + 28,
+          true
+        );
+
+      const dataStart =
+        localOffset +
+        30 +
+        localNameLength +
+        localExtraLength;
+
+      entries.set(
+        name,
+        {
+          method,
+          crc,
+          uncompressedSize,
+          raw:
+            bytes.subarray(
+              dataStart,
+              dataStart +
+                compressedSize
+            )
+        }
+      );
+
+      cursor +=
+        46 +
+        nameLength +
+        extraLength +
+        commentLength;
+    }
+
+    return entries;
+  }
+
+  async function zipEntryBytes(
+    entry
+  ) {
+    if (entry.method === 0) {
+      return entry.raw;
+    }
+
+    if (entry.method === 8) {
+      return inflateRawBytes(
+        entry.raw
+      );
+    }
+
+    throw new Error(
+      `xlsx 内含不支持的压缩方式：${entry.method}`
+    );
+  }
+
+  function writeZip(
+    items
+  ) {
+    const encoder =
+      new TextEncoder();
+
+    const names =
+      items.map(
+        item =>
+          encoder.encode(
+            item.name
+          )
+      );
+
+    let localSize =
+      0;
+
+    let centralSize =
+      0;
+
+    items.forEach(
+      (
+        item,
+        index
+      ) => {
+        localSize +=
+          30 +
+          names[index]
+            .length +
+          item.raw.length;
+
+        centralSize +=
+          46 +
+          names[index]
+            .length;
+      }
+    );
+
+    const out =
+      new Uint8Array(
+        localSize +
+          centralSize +
+          22
+      );
+
+    const view =
+      new DataView(
+        out.buffer
+      );
+
+    let offset =
+      0;
+
+    const offsets =
+      [];
+
+    items.forEach(
+      (
+        item,
+        index
+      ) => {
+        offsets.push(
+          offset
+        );
+
+        view.setUint32(
+          offset,
+          ZIP_LOCAL_SIG,
+          true
+        );
+
+        view.setUint16(
+          offset + 4,
+          20,
+          true
+        );
+
+        view.setUint16(
+          offset + 6,
+          0,
+          true
+        );
+
+        view.setUint16(
+          offset + 8,
+          item.method,
+          true
+        );
+
+        view.setUint16(
+          offset + 10,
+          0,
+          true
+        );
+
+        // 固定 1980-01-01，时间戳对报表文件没有意义。
+        view.setUint16(
+          offset + 12,
+          0x21,
+          true
+        );
+
+        view.setUint32(
+          offset + 14,
+          item.crc,
+          true
+        );
+
+        view.setUint32(
+          offset + 18,
+          item.raw.length,
+          true
+        );
+
+        view.setUint32(
+          offset + 22,
+          item.uncompressedSize,
+          true
+        );
+
+        view.setUint16(
+          offset + 26,
+          names[index]
+            .length,
+          true
+        );
+
+        view.setUint16(
+          offset + 28,
+          0,
+          true
+        );
+
+        out.set(
+          names[index],
+          offset + 30
+        );
+
+        out.set(
+          item.raw,
+          offset +
+            30 +
+            names[index]
+              .length
+        );
+
+        offset +=
+          30 +
+          names[index]
+            .length +
+          item.raw.length;
+      }
+    );
+
+    const centralStart =
+      offset;
+
+    items.forEach(
+      (
+        item,
+        index
+      ) => {
+        view.setUint32(
+          offset,
+          ZIP_CENTRAL_SIG,
+          true
+        );
+
+        view.setUint16(
+          offset + 4,
+          20,
+          true
+        );
+
+        view.setUint16(
+          offset + 6,
+          20,
+          true
+        );
+
+        view.setUint16(
+          offset + 8,
+          0,
+          true
+        );
+
+        view.setUint16(
+          offset + 10,
+          item.method,
+          true
+        );
+
+        view.setUint16(
+          offset + 12,
+          0,
+          true
+        );
+
+        view.setUint16(
+          offset + 14,
+          0x21,
+          true
+        );
+
+        view.setUint32(
+          offset + 16,
+          item.crc,
+          true
+        );
+
+        view.setUint32(
+          offset + 20,
+          item.raw.length,
+          true
+        );
+
+        view.setUint32(
+          offset + 24,
+          item.uncompressedSize,
+          true
+        );
+
+        view.setUint16(
+          offset + 28,
+          names[index]
+            .length,
+          true
+        );
+
+        view.setUint16(
+          offset + 30,
+          0,
+          true
+        );
+
+        view.setUint16(
+          offset + 32,
+          0,
+          true
+        );
+
+        view.setUint16(
+          offset + 34,
+          0,
+          true
+        );
+
+        view.setUint16(
+          offset + 36,
+          0,
+          true
+        );
+
+        view.setUint32(
+          offset + 38,
+          0,
+          true
+        );
+
+        view.setUint32(
+          offset + 42,
+          offsets[index],
+          true
+        );
+
+        out.set(
+          names[index],
+          offset + 46
+        );
+
+        offset +=
+          46 +
+          names[index]
+            .length;
+      }
+    );
+
+    view.setUint32(
+      offset,
+      ZIP_EOCD_SIG,
+      true
+    );
+
+    view.setUint16(
+      offset + 4,
+      0,
+      true
+    );
+
+    view.setUint16(
+      offset + 6,
+      0,
+      true
+    );
+
+    view.setUint16(
+      offset + 8,
+      items.length,
+      true
+    );
+
+    view.setUint16(
+      offset + 10,
+      items.length,
+      true
+    );
+
+    view.setUint32(
+      offset + 12,
+      offset -
+        centralStart,
+      true
+    );
+
+    view.setUint32(
+      offset + 16,
+      centralStart,
+      true
+    );
+
+    view.setUint16(
+      offset + 20,
+      0,
+      true
+    );
+
+    return out;
+  }
+
+  async function makeZipItem(
+    name,
+    bytes
+  ) {
+    const crc =
+      crc32Of(
+        bytes
+      );
+
+    if (
+      typeof CompressionStream ===
+      "function"
+    ) {
+      try {
+        const raw =
+          await deflateRawBytes(
+            bytes
+          );
+
+        if (
+          raw.length <
+          bytes.length
+        ) {
+          return {
+            name,
+            method: 8,
+            crc,
+            uncompressedSize:
+              bytes.length,
+            raw
+          };
+        }
+      } catch (_) {}
+    }
+
+    return {
+      name,
+      method: 0,
+      crc,
+      uncompressedSize:
+        bytes.length,
+      raw:
+        bytes
+    };
+  }
+
+  function splitXmlRows(
+    body
+  ) {
+    const rows =
+      [];
+
+    const pattern =
+      /<row\b[^>]*\/>|<row\b[^>]*>[\s\S]*?<\/row>/g;
+
+    let match;
+
+    while (
+      (
+        match =
+          pattern.exec(
+            body
+          )
+      )
+    ) {
+      rows.push(
+        match[0]
+      );
+    }
+
+    return rows;
+  }
+
+  function readSheetParts(
+    xml
+  ) {
+    const openMatch =
+      xml.match(
+        /<sheetData\b[^>]*\/>|<sheetData\b[^>]*>/
+      );
+
+    if (!openMatch) {
+      throw new Error(
+        "xlsx 结构异常：缺少 sheetData"
+      );
+    }
+
+    if (
+      openMatch[0].endsWith(
+        "/>"
+      )
+    ) {
+      return {
+        head:
+          xml.slice(
+            0,
+            openMatch.index
+          ),
+        openTag:
+          "<sheetData>",
+        rows:
+          [],
+        tail:
+          xml.slice(
+            openMatch.index +
+              openMatch[0]
+                .length
+          )
+      };
+    }
+
+    const bodyStart =
+      openMatch.index +
+      openMatch[0].length;
+
+    const bodyEnd =
+      xml.indexOf(
+        "</sheetData>",
+        bodyStart
+      );
+
+    if (bodyEnd < 0) {
+      throw new Error(
+        "xlsx 结构异常：sheetData 未闭合"
+      );
+    }
+
+    return {
+      head:
+        xml.slice(
+          0,
+          openMatch.index
+        ),
+      openTag:
+        openMatch[0],
+      rows:
+        splitXmlRows(
+          xml.slice(
+            bodyStart,
+            bodyEnd
+          )
+        ),
+      tail:
+        xml.slice(
+          bodyEnd
+        )
+    };
+  }
+
+  function parseSharedStrings(
+    xml
+  ) {
+    if (!xml) {
+      return [];
+    }
+
+    const body =
+      xml.match(
+        /<sst\b[^>]*>([\s\S]*?)<\/sst>/
+      );
+
+    if (!body) {
+      return [];
+    }
+
+    const items =
+      [];
+
+    const pattern =
+      /<si\b[^>]*\/>|<si\b[^>]*>[\s\S]*?<\/si>/g;
+
+    let match;
+
+    while (
+      (
+        match =
+          pattern.exec(
+            body[1]
+          )
+      )
+    ) {
+      items.push(
+        match[0]
+      );
+    }
+
+    return items;
+  }
+
+  /*
+   * 表头判定不靠“第一行就是表头”这种猜测：
+   * 拿后续分片与首片逐行比对，前缀完全相同的才算重复的标题/表头行。
+   * 上限 5 行，避免把碰巧相同的数据行也吞掉。
+   */
+  function rowSignature(
+    rowXml
+  ) {
+    return rowXml
+      .replace(
+        /^<row\b[^>]*>/,
+        ""
+      )
+      .replace(
+        /<\/row>$/,
+        ""
+      )
+      .replace(
+        /\s+/g,
+        ""
+      );
+  }
+
+  function countRepeatedLeadingRows(
+    baseRows,
+    nextRows
+  ) {
+    const limit =
+      Math.min(
+        baseRows.length,
+        nextRows.length,
+        5
+      );
+
+    let count =
+      0;
+
+    for (
+      let i = 0;
+      i < limit;
+      i += 1
+    ) {
+      if (
+        rowSignature(
+          baseRows[i]
+        ) !==
+        rowSignature(
+          nextRows[i]
+        )
+      ) {
+        break;
+      }
+
+      count += 1;
+    }
+
+    return count;
+  }
+
+  function remapSharedStringRefs(
+    rowXml,
+    mapping
+  ) {
+    if (
+      mapping.size ===
+      0
+    ) {
+      return rowXml;
+    }
+
+    return rowXml.replace(
+      /<c\b[^>]*\/>|<c\b[^>]*>[\s\S]*?<\/c>/g,
+      cell => {
+        if (
+          cell.endsWith(
+            "/>"
+          )
+        ) {
+          return cell;
+        }
+
+        const openEnd =
+          cell.indexOf(
+            ">"
+          );
+
+        const openTag =
+          cell.slice(
+            0,
+            openEnd + 1
+          );
+
+        if (
+          !/\bt="s"/.test(
+            openTag
+          )
+        ) {
+          return cell;
+        }
+
+        const body =
+          cell.slice(
+            openEnd + 1,
+            -4
+          );
+
+        const value =
+          body.match(
+            /<v>\s*(\d+)\s*<\/v>/
+          );
+
+        if (!value) {
+          return cell;
+        }
+
+        const mapped =
+          mapping.get(
+            Number(
+              value[1]
+            )
+          );
+
+        if (
+          mapped ===
+          undefined
+        ) {
+          return cell;
+        }
+
+        return (
+          openTag +
+          body.replace(
+            /<v>\s*\d+\s*<\/v>/,
+            `<v>${mapped}</v>`
+          ) +
+          "</c>"
+        );
+      }
+    );
+  }
+
+  function withRowIndex(
+    rowXml,
+    index
+  ) {
+    const head =
+      rowXml.match(
+        /^<row\b[^>]*?\/?>/
+      );
+
+    if (!head) {
+      return rowXml;
+    }
+
+    const openTag =
+      head[0].replace(
+        /\br="\d+"/,
+        `r="${index}"`
+      );
+
+    /*
+     * 单元格的 r="B7" 才是 Excel 定位依据，行上的 r 只是标签。
+     * 只改行的 r 会把整段数据的落点全打乱（会互相覆盖）。
+     */
+    const body =
+      rowXml
+        .slice(
+          head[0].length
+        )
+        .replace(
+          /<c\b([^>]*)>/g,
+          (
+            tag,
+            attrs
+          ) => {
+            const ref =
+              attrs.match(
+                /\br="([A-Z]+)\d+"/
+              );
+
+            if (!ref) {
+              return tag;
+            }
+
+            return (
+              "<c" +
+              attrs.replace(
+                /\br="([A-Z]+)\d+"/,
+                `r="${ref[1]}${index}"`
+              ) +
+              ">"
+            );
+          }
+        );
+
+    return (
+      openTag +
+      body
+    );
+  }
+
+  function columnLetters(
+    index
+  ) {
+    let value =
+      index;
+
+    let letters =
+      "";
+
+    while (value > 0) {
+      const rest =
+        (value - 1) %
+        26;
+
+      letters =
+        String.fromCharCode(
+          65 + rest
+        ) + letters;
+
+      value =
+        Math.floor(
+          (value - 1) /
+            26
+        );
+    }
+
+    return letters || "A";
+  }
+
+  function buildDimensionRef(
+    rows
+  ) {
+    let maxColumn =
+      1;
+
+    rows.forEach(
+      row => {
+        const pattern =
+          /<c\b[^>]*\br="([A-Z]+)\d+"/g;
+
+        let match;
+
+        while (
+          (
+            match =
+              pattern.exec(
+                row
+              )
+          )
+        ) {
+          let column =
+            0;
+
+          for (
+            const char of match[1]
+          ) {
+            column =
+              column *
+                26 +
+              (char.charCodeAt(
+                0
+              ) -
+                64);
+          }
+
+          maxColumn =
+            Math.max(
+              maxColumn,
+              column
+            );
+        }
+      }
+    );
+
+    return `A1:${columnLetters(
+      maxColumn
+    )}${Math.max(
+      1,
+      rows.length
+    )}`;
+  }
+
+  async function readWorkbook(
+    buffer
+  ) {
+    const entries =
+      await readZipEntries(
+        buffer
+      );
+
+    let sheetPath =
+      entries.has(
+        "xl/worksheets/sheet1.xml"
+      )
+        ? "xl/worksheets/sheet1.xml"
+        : "";
+
+    if (!sheetPath) {
+      for (
+        const name of entries.keys()
+      ) {
+        if (
+          /^xl\/worksheets\/sheet\d+\.xml$/.test(
+            name
+          )
+        ) {
+          sheetPath =
+            name;
+
+          break;
+        }
+      }
+    }
+
+    if (!sheetPath) {
+      throw new Error(
+        "xlsx 结构异常：找不到工作表"
+      );
+    }
+
+    const sheetXml =
+      new TextDecoder()
+        .decode(
+          await zipEntryBytes(
+            entries.get(
+              sheetPath
+            )
+          )
+        );
+
+    const sharedStringsPath =
+      "xl/sharedStrings.xml";
+
+    const sharedStringsEntry =
+      entries.get(
+        sharedStringsPath
+      );
+
+    const sharedStrings =
+      sharedStringsEntry
+        ? parseSharedStrings(
+            new TextDecoder()
+              .decode(
+                await zipEntryBytes(
+                  sharedStringsEntry
+                )
+              )
+          )
+        : [];
+
+    const sheet =
+      readSheetParts(
+        sheetXml
+      );
+
+    return {
+      entries,
+      sheetPath,
+      sharedStringsPath,
+      hasSharedStrings:
+        Boolean(
+          sharedStringsEntry
+        ),
+      head:
+        sheet.head,
+      openTag:
+        sheet.openTag,
+      rows:
+        sheet.rows,
+      tail:
+        sheet.tail,
+      sharedStrings
+    };
+  }
+
+  /*
+   * 把多个导出分片合成一份 xlsx。
+   * 只合并数据行：样式、列宽、冻结窗格沿用首片（同一模板导出，样式索引通用）。
+   */
+  async function mergeXlsxBuffers(
+    buffers
+  ) {
+    if (
+      !Array.isArray(
+        buffers
+      ) ||
+      buffers.length < 2
+    ) {
+      throw new Error(
+        "分片不足 2 个，无需合并"
+      );
+    }
+
+    if (
+      typeof DecompressionStream !==
+      "function"
+    ) {
+      throw new Error(
+        "当前浏览器不支持 DecompressionStream，无法本地合并"
+      );
+    }
+
+    let totalBytes =
+      0;
+
+    buffers.forEach(
+      buffer => {
+        totalBytes +=
+          buffer?.byteLength ||
+          0;
+      }
+    );
+
+    if (
+      totalBytes >
+      XLSX_MERGE_MAX_BYTES
+    ) {
+      throw new Error(
+        `分片合计 ${Math.round(
+          totalBytes /
+            1048576
+        )}MB，超过本地合并上限`
+      );
+    }
+
+    const books =
+      [];
+
+    for (
+      const buffer of buffers
+    ) {
+      books.push(
+        await readWorkbook(
+          buffer
+        )
+      );
+    }
+
+    const base =
+      books[0];
+
+    const mergedRows =
+      base.rows.slice();
+
+    const mergedStrings =
+      base.sharedStrings.slice();
+
+    const stringIndex =
+      new Map();
+
+    mergedStrings.forEach(
+      (
+        item,
+        index
+      ) => {
+        if (
+          !stringIndex.has(
+            item
+          )
+        ) {
+          stringIndex.set(
+            item,
+            index
+          );
+        }
+      }
+    );
+
+    for (
+      let i = 1;
+      i < books.length;
+      i += 1
+    ) {
+      const book =
+        books[i];
+
+      /*
+       * 首片没有共享字符串表、后续却有 ⇒ 得连带补 Content_Types 与 rels，
+       * 超出“只搬数据行”的范围，交给分片下载兜底。
+       */
+      if (
+        book.hasSharedStrings &&
+        !base.hasSharedStrings
+      ) {
+        throw new Error(
+          "分片结构不一致（共享字符串表缺失），无法合并"
+        );
+      }
+
+      const skipped =
+        countRepeatedLeadingRows(
+          base.rows,
+          book.rows
+        );
+
+      const mapping =
+        new Map();
+
+      book.sharedStrings.forEach(
+        (
+          item,
+          oldIndex
+        ) => {
+          let newIndex =
+            stringIndex.get(
+              item
+            );
+
+          if (
+            newIndex ===
+            undefined
+          ) {
+            newIndex =
+              mergedStrings.length;
+
+            mergedStrings.push(
+              item
+            );
+
+            stringIndex.set(
+              item,
+              newIndex
+            );
+          }
+
+          mapping.set(
+            oldIndex,
+            newIndex
+          );
+        }
+      );
+
+      for (
+        let row = skipped;
+        row < book.rows.length;
+        row += 1
+      ) {
+        mergedRows.push(
+          remapSharedStringRefs(
+            book.rows[row],
+            mapping
+          )
+        );
+      }
+    }
+
+    const dimension =
+      buildDimensionRef(
+        mergedRows
+      );
+
+    const sheetXml =
+      (
+        base.head +
+        base.openTag +
+        mergedRows
+          .map(
+            (
+              row,
+              index
+            ) =>
+              withRowIndex(
+                row,
+                index + 1
+              )
+          )
+          .join(
+            ""
+          ) +
+        base.tail
+      ).replace(
+        /<dimension\b[^>]*\/>/,
+        `<dimension ref="${dimension}"/>`
+      );
+
+    const items =
+      [];
+
+    const encoder =
+      new TextEncoder();
+
+    for (
+      const [
+        name,
+        entry
+      ] of base.entries
+    ) {
+      if (
+        name ===
+        base.sheetPath
+      ) {
+        items.push(
+          await makeZipItem(
+            name,
+            encoder.encode(
+              sheetXml
+            )
+          )
+        );
+
+        continue;
+      }
+
+      if (
+        name ===
+          base.sharedStringsPath &&
+        base.hasSharedStrings
+      ) {
+        const sstXml =
+          `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+          `<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${mergedStrings.length}" uniqueCount="${mergedStrings.length}">` +
+          mergedStrings.join(
+            ""
+          ) +
+          "</sst>";
+
+        items.push(
+          await makeZipItem(
+            name,
+            encoder.encode(
+              sstXml
+            )
+          )
+        );
+
+        continue;
+      }
+
+      items.push({
+        name,
+        method:
+          entry.method,
+        crc:
+          entry.crc,
+        uncompressedSize:
+          entry.uncompressedSize,
+        raw:
+          entry.raw
+      });
+    }
+
+    const merged =
+      writeZip(
+        items
+      );
+
+    /*
+     * 自检：把刚打出来的包重新读一遍，行数与预期不符就不交付这个文件。
+     */
+    const check =
+      readSheetParts(
+        new TextDecoder()
+          .decode(
+            await zipEntryBytes(
+              (
+                await readZipEntries(
+                  merged.buffer
+                )
+              ).get(
+                base.sheetPath
+              )
+            )
+          )
+      );
+
+    if (
+      check.rows.length !==
+      mergedRows.length
+    ) {
+      throw new Error(
+        `合并自检失败：预期 ${mergedRows.length} 行，实际 ${check.rows.length} 行`
+      );
+    }
+
+    return merged;
+  }
+
+  /*
+   * 交付一段区间的导出结果：
+   * - 只有 1 片 ⇒ 直接下载（与未拆段时完全一样）
+   * - 多片 ⇒ 先合并成 1 个文件再下载；合并失败则退回逐片下载，绝不丢数据
+   */
+  async function deliverExportParts({
+    reportName,
+    startDate,
+    endDate,
+    parts,
+    setStatus
+  }) {
+    if (
+      !Array.isArray(parts) ||
+      parts.length === 0
+    ) {
+      throw new Error(
+        "导出结果为空"
+      );
+    }
+
+    const filename =
+      getRangeFilename(
+        reportName,
+        startDate,
+        endDate
+      );
+
+    if (
+      parts.length ===
+      1
+    ) {
+      downloadArrayBuffer(
+        parts[0].buffer,
+        parts[0].contentType ||
+          XLSX_SHEET_MIME,
+        filename
+      );
+
+      return {
+        files: 1,
+        merged: false
+      };
+    }
+
+    try {
+      setStatus(
+        `正在合并 ${parts.length} 个分片为 1 个文件（${startDate} ～ ${endDate}）...`
+      );
+
+      const merged =
+        await mergeXlsxBuffers(
+          parts.map(
+            part =>
+              part.buffer
+          )
+        );
+
+      downloadArrayBuffer(
+        merged,
+        XLSX_SHEET_MIME,
+        filename
+      );
+
+      return {
+        files: 1,
+        merged: true
+      };
+    } catch (error) {
+      console.warn(
+        "[导出-合并失败，退回逐片下载]",
+        error
+      );
+
+      setStatus(
+        `分片合并失败（${error?.message || error}），改为逐个下载 ${parts.length} 个文件...`
+      );
+
+      parts.forEach(
+        part => {
+          downloadArrayBuffer(
+            part.buffer,
+            part.contentType ||
+              XLSX_SHEET_MIME,
+            getRangeFilename(
+              reportName,
+              part.startDate ||
+                startDate,
+              part.endDate ||
+                endDate
+            )
+          );
+        }
+      );
+
+      return {
+        files:
+          parts.length,
+        merged: false
+      };
+    }
+  }
+
+  /*
+   * 导出“已等待 N 秒”提示。
+   * 长超时后单次请求可能跑几十秒，按钮只显示“导出中”会像卡死。
+   * 返回停止函数，调用方在 finally 里收掉，避免计时器泄漏。
+   */
+  function createExportTicker(
+    setStatus,
+    label
+  ) {
+    const startedAt =
+      Date.now();
+
+    const timer =
+      setInterval(
+        () => {
+          const seconds =
+            Math.max(
+              1,
+              Math.round(
+                (
+                  Date.now() -
+                  startedAt
+                ) /
+                  1000
+              )
+            );
+
+          setStatus(
+            `${label}，已等待 ${seconds} 秒（数据量较大时后端生成较慢）`
+          );
+        },
+        5000
+      );
+
+    return () =>
+      clearInterval(
+        timer
+      );
+  }
+
+  /*
+   * 超大区间导出的兜底：
+   * 先按原区间导一次；若因超时失败，就把区间对半拆开依次再导，
+   * 直到每一段都能在超时内出结果为止。
+   *
+   * 正常数据量仍只产出 1 个文件，只有真的导不动才会多出分段文件。
+   */
+  async function exportRangeResilient({
+    token,
+    startDate,
+    endDate,
+    exportRange,
+    onSplit,
+    setStatus
+  }) {
+    const queue = [
+      {
+        startDate,
+        endDate
+      }
+    ];
+
+    const files = [];
+    let splitCount = 0;
+
+    while (
+      queue.length >
+      0
+    ) {
+      const range =
+        queue.shift();
+
+      try {
+        const file =
+          await exportRange(
+            range
+          );
+
+        files.push(
+          file
+        );
+
+        continue;
+      } catch (error) {
+        const days =
+          diffDays(
+            range.startDate,
+            range.endDate
+          );
+
+        /*
+         * 只剩单天还拆 → 说明不是“数据量大”能解释的，
+         * 原样抛出去让用户看到真实错误。
+         */
+        const midpoint =
+          days >= 2
+            ? addDays(
+                range.startDate,
+                Math.floor(
+                  days /
+                    2
+                )
+              )
+            : "";
+
+        const splittable =
+          Boolean(
+            error?.timedOut ||
+            error?.serverTimeout
+          ) &&
+          Boolean(
+            midpoint
+          ) &&
+          splitCount +
+            2 <=
+            EXPORT_SPLIT_MAX_PARTS;
+
+        if (!splittable) {
+          throw error;
+        }
+
+        const halves = [
+          {
+            startDate:
+              range.startDate,
+            endDate:
+              midpoint
+          },
+          {
+            startDate:
+              addDays(
+                midpoint,
+                1
+              ),
+            endDate:
+              range.endDate
+          }
+        ];
+
+        splitCount +=
+          halves.length;
+
+        queue.unshift(
+          ...halves
+        );
+
+        console.warn(
+          "[导出-超时拆分]",
+          range,
+          halves,
+          error?.message ||
+            ""
+        );
+
+        if (
+          typeof onSplit ===
+          "function"
+        ) {
+          onSplit(
+            range,
+            halves
+          );
+        } else {
+          setStatus(
+            `导出超时，已拆分为 ${halves[0].startDate} ～ ${halves[0].endDate}、${halves[1].startDate} ～ ${halves[1].endDate} 继续导出...`
+          );
+        }
+      }
+    }
+
+    return files;
   }
 
   // -------------------- 收入确认表 --------------------
@@ -2070,28 +3977,19 @@
     };
   }
 
-  async function exportIncomeReport(
+  /*
+   * 只取回文件本体，交给交付环节决定「直接下载」还是「先合并」。
+   */
+  async function fetchIncomeReport(
     token,
     body,
-    {
-      startDate,
-      endDate,
-      onRetry
-    }
+    { onRetry }
   ) {
-    return exportArrayBufferReport(
+    return requestArrayBufferReport(
       token,
       API.INCOME_EXPORT,
       body,
-      {
-        filename:
-          getRangeFilename(
-            REPORT_MODULES.income.name,
-            startDate,
-            endDate
-          ),
-        onRetry
-      }
+      { onRetry }
     );
   }
 
@@ -2186,28 +4084,16 @@
     };
   }
 
-  async function exportReconPeriod(
+  async function fetchReconPeriod(
     token,
     body,
-    {
-      startDate,
-      endDate,
-      onRetry
-    }
+    { onRetry }
   ) {
-    return exportArrayBufferReport(
+    return requestArrayBufferReport(
       token,
       API.RECON_EXPORT,
       body,
-      {
-        filename:
-          getRangeFilename(
-            REPORT_MODULES.recon.name,
-            startDate,
-            endDate
-          ),
-        onRetry
-      }
+      { onRetry }
     );
   }
 
@@ -4720,38 +6606,145 @@
       button.textContent =
         "导出中...";
 
+      let fileCount =
+        0;
+
+      let partCount =
+        0;
+
+      let mergedCount =
+        0;
+
+      let splitUsed =
+        false;
+
       try {
         await withFlyTokenRetry(
           async token => {
-            const body =
-              buildIncomeBody(
-                token,
-                state.startDate,
-                state.endDate
+            /*
+             * withFlyTokenRetry 遇到授权失效会整段重跑，
+             * 计数必须在这里归零，否则同一次导出会累加两遍。
+             */
+            fileCount =
+              0;
+
+            partCount =
+              0;
+
+            mergedCount =
+              0;
+
+            splitUsed =
+              false;
+
+            const stopTicker =
+              createExportTicker(
+                setStatus,
+                `收入确认表 ${state.startDate} ～ ${state.endDate} 导出中`
               );
 
-            return exportIncomeReport(
-              token,
-              body,
-              {
-                startDate:
-                  state.startDate,
-                endDate:
-                  state.endDate,
-                onRetry:
-                  createRetryHandler(
-                    setStatus
-                  )
-              }
-            );
+            try {
+              const parts =
+                await exportRangeResilient({
+                  token,
+
+                  startDate:
+                    state.startDate,
+
+                  endDate:
+                    state.endDate,
+
+                  setStatus,
+
+                  onSplit: (
+                    range,
+                    halves
+                  ) => {
+                    splitUsed =
+                      true;
+
+                    setStatus(
+                      `数据量过大导致导出超时，正在拆分为 ${halves[0].startDate} ～ ${halves[0].endDate}、${halves[1].startDate} ～ ${halves[1].endDate} 继续导出...`
+                    );
+                  },
+
+                  exportRange:
+                    async range => {
+                      const part =
+                        await fetchIncomeReport(
+                          token,
+                          buildIncomeBody(
+                            token,
+                            range.startDate,
+                            range.endDate
+                          ),
+                          {
+                            onRetry:
+                              createRetryHandler(
+                                setStatus
+                              )
+                          }
+                        );
+
+                      return {
+                        ...part,
+                        startDate:
+                          range.startDate,
+                        endDate:
+                          range.endDate
+                      };
+                    }
+                });
+
+              partCount =
+                parts.length;
+
+              const delivered =
+                await deliverExportParts({
+                  reportName:
+                    REPORT_MODULES.income
+                      .name,
+
+                  startDate:
+                    state.startDate,
+
+                  endDate:
+                    state.endDate,
+
+                  parts,
+                  setStatus
+                });
+
+              fileCount =
+                delivered.files;
+
+              mergedCount =
+                delivered.merged
+                  ? 1
+                  : 0;
+            } finally {
+              stopTicker();
+            }
           },
           setStatus
         );
 
         setStatus(
-          "✓ 收入确认表已触发下载。",
+          mergedCount > 0
+            ? `✓ 收入确认表已触发下载 1 个文件（由 ${partCount} 个分片合并而成）。`
+            : "✓ 收入确认表已触发下载。",
           "success"
         );
+
+        if (
+          splitUsed &&
+          mergedCount > 0
+        ) {
+          console.info(
+            "[收入确认表-自动分段]",
+            `请求 ${partCount} 片，合并为 1 个文件`
+          );
+        }
       } catch (error) {
         console.error(
           "[收入确认表-导出]",
@@ -4787,21 +6780,48 @@
         return;
       }
 
+      const totalSegments =
+        state.segments.length;
+
       button.disabled =
         true;
 
       button.textContent =
-        state.segments.length > 1
-          ? `导出中 0/${state.segments.length}`
+        totalSegments > 1
+          ? `导出中 0/${totalSegments}`
           : "导出中...";
+
+      let fileCount =
+        0;
+
+      let partCount =
+        0;
+
+      let mergedCount =
+        0;
+
+      let splitUsed =
+        false;
 
       try {
         await withFlyTokenRetry(
           async token => {
+            fileCount =
+              0;
+
+            partCount =
+              0;
+
+            mergedCount =
+              0;
+
+            splitUsed =
+              false;
+
             for (
               let index = 0;
               index <
-                state.segments.length;
+                totalSegments;
               index += 1
             ) {
               const segment =
@@ -4810,34 +6830,107 @@
                 ];
 
               button.textContent =
-                state.segments.length > 1
-                  ? `导出中 ${index + 1}/${state.segments.length}`
+                totalSegments > 1
+                  ? `导出中 ${index + 1}/${totalSegments}`
                   : "导出中...";
 
-              const body =
-                buildReconBody(
-                  segment.startDate,
-                  segment.endDate
+              const stopTicker =
+                createExportTicker(
+                  setStatus,
+                  `体检对账报表 ${segment.startDate} ～ ${segment.endDate}${
+                    segment.total > 0
+                      ? `（${segment.total} 条）`
+                      : ""
+                  } 导出中`
                 );
 
-              await exportReconPeriod(
-                token,
-                body,
-                {
-                  startDate:
-                    segment.startDate,
-                  endDate:
-                    segment.endDate,
-                  onRetry:
-                    createRetryHandler(
-                      setStatus
-                    )
+              try {
+                const parts =
+                  await exportRangeResilient({
+                    token,
+
+                    startDate:
+                      segment.startDate,
+
+                    endDate:
+                      segment.endDate,
+
+                    setStatus,
+
+                    onSplit: (
+                      range,
+                      halves
+                    ) => {
+                      splitUsed =
+                        true;
+
+                      setStatus(
+                        `数据量过大导致导出超时（${range.startDate} ～ ${range.endDate}），正在拆分为 ${halves[0].startDate} ～ ${halves[0].endDate}、${halves[1].startDate} ～ ${halves[1].endDate} 继续导出...`
+                      );
+                    },
+
+                    exportRange:
+                      async range => {
+                        const part =
+                          await fetchReconPeriod(
+                            token,
+                            buildReconBody(
+                              range.startDate,
+                              range.endDate
+                            ),
+                            {
+                              onRetry:
+                                createRetryHandler(
+                                  setStatus
+                                )
+                            }
+                          );
+
+                        return {
+                          ...part,
+                          startDate:
+                            range.startDate,
+                          endDate:
+                            range.endDate
+                        };
+                      }
+                  });
+
+                partCount +=
+                  parts.length;
+
+                const delivered =
+                  await deliverExportParts({
+                    reportName:
+                      REPORT_MODULES.recon
+                        .name,
+
+                    startDate:
+                      segment.startDate,
+
+                    endDate:
+                      segment.endDate,
+
+                    parts,
+                    setStatus
+                  });
+
+                fileCount +=
+                  delivered.files;
+
+                if (
+                  delivered.merged
+                ) {
+                  mergedCount +=
+                    1;
                 }
-              );
+              } finally {
+                stopTicker();
+              }
 
               if (
                 index <
-                state.segments.length - 1
+                totalSegments - 1
               ) {
                 await sleep(
                   250
@@ -4849,11 +6942,20 @@
         );
 
         setStatus(
-          state.segments.length > 1
-            ? `✓ 体检对账报表已触发 ${state.segments.length} 个分段下载。`
-            : "✓ 体检对账报表已触发下载。",
+          mergedCount > 0
+            ? `✓ 体检对账报表已触发下载 ${fileCount} 个文件（其中 ${mergedCount} 份由 ${partCount} 个分片合并而成）。`
+            : fileCount > 1
+              ? `✓ 体检对账报表已触发 ${fileCount} 个分段下载。`
+              : "✓ 体检对账报表已触发下载。",
           "success"
         );
+
+        if (splitUsed) {
+          console.info(
+            "[体检对账报表-自动分段]",
+            `请求 ${partCount} 片，交付 ${fileCount} 个文件，合并 ${mergedCount} 份`
+          );
+        }
       } catch (error) {
         console.error(
           "[体检对账报表-导出]",
