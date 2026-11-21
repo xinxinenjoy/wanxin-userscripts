@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         发票-1.1全局页面
 // @namespace    https://tampermonkey.net/
-// @version      6.52
+// @version      6.54
 // @description  发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -224,11 +224,23 @@
      每项 = { taxableName 商品名称, unit 单位, taxableCustCount 数量, amount 本行价税合计 }。
      ⚠️ 数量留空 = 这个键**根本不存在**（undefined），不是 0 —— 别拿 0 当「没填」。
      商品名称几乎恒为「医疗服务（体检费）」，所以明细的差异只在「数量 ↔ 金额」的配对。 */
-  /* 明细缓存直接落 localStorage：已开票的商品明细是**不会变**的（真要改只能红冲重开，
-     那时申请单号也会变），所以没必要每次刷新页面都重新拉一遍 50 次详情接口。
+  /* 明细缓存直接落 localStorage：大部分行的明细不会变，没必要每次刷新页面都重拉 50 次详情接口。
+     ⚠️ 但「重新编辑」这条路上申请单号不变、明细会变（2026-11-21 用户实况），
+        所以命中缓存不等于可信 —— 还要过一道 detailStaleReasons()。
      ⚠️ 1.1 和 1.2 共用这一个 key，在全局页拉过的行，进订单页直接命中。 */
   const DETAIL_STORE_KEY = "tm-fapiao-detail-store";
-  const DETAIL_STORE_VERSION = 2;
+  /* v3（2026-11-21）：条目里多存一份「拉取当时那行的发票金额」当指纹。
+     起因：发票被重新编辑（检中修改 / 同票改明细）后 applyCode 不变、明细却变了，
+     只靠 30 天 TTL 命中缓存就会一直显示旧小字。列表金额是当场唯一能对上的真值。 */
+  const DETAIL_STORE_VERSION = 3;
+  /* 失效判定（2026-11-21 用户口径）：下面四种都算「可能变过」，都要重拉 ——
+       amount  金额变了（当场能对上的硬信号）
+       sum     单条明细的合计 ≠ 列表金额（金额没变、明细被改）
+       empty   上次拉回来是「不写明细」（重新编辑可能补上了）
+       multi   多条明细（合计与金额天然不是一个口径，验不了，只能定期重验）
+     empty / multi 没有服务端版本号可比，只能按时间窗定期重验 —— 不设时间窗的话，
+     每行每次渲染都会判一次失效 = 接口风暴。 */
+  const DETAIL_RECHECK_MS = 3 * 60 * 1000; // 多明细 / 不写明细的行：隔这么久才重验一次
   const DETAIL_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 天
   const DETAIL_CACHE_MAX = 800;
   const DETAIL_FETCH_GAP = 70; // 两次详情请求的间隔，别把接口打满
@@ -275,8 +287,12 @@
   let soaRegionCode = "XX";
   let lastTruthRefreshAt = 0;
 
-  /* 商品明细：applyCode → { items, at }；items = [{ name, unit, qty, unitPrice, amount }] */
+  /* 商品明细：applyCode → { items, at, amount }；items = [{ name, unit, qty, unitPrice, amount }]
+     amount = 拉取那次列表上显示的「发票金额」，用来发现「同一张票被改过」。 */
   const detailCache = new Map();
+  const detailStaleRetry = new Map(); // applyCode → Set(已因哪些原因重拉过)；一个原因只放行一次
+  const detailForce = new Set(); // 已入队且必须绕过缓存重新请求的行（手动刷新 / 金额失效）
+  let detailRefreshState = null; // { total, queued }：「刷新明细」按钮的进度
   /* 发票 → 订单：applyCode → [{ code, name }]。详情接口 orderItemDTOS 给的是裸单号，
      点「来源」跳转时再拿它去查最新快照版本（-数字 后缀）。 */
   const orderCodesByApply = new Map();
@@ -315,7 +331,7 @@
       // 我们自己挂的东西、站点的控件，一律不算列名
       if (
         node.matches(
-          ".tm-col-resizer, .tm-batch-head-btn, .ant-checkbox-wrapper, svg, .anticon"
+          ".tm-col-resizer, .tm-batch-head-btn, .tm-detail-refresh-btn, .ant-checkbox-wrapper, svg, .anticon"
         )
       ) {
         break;
@@ -612,6 +628,103 @@
     }
 
     syncBatchHeadButton(button);
+
+    // 2026-11-21：旁边再挂一个「刷新明细」——发票被重新编辑后，缓存的小字不会自己更新
+    let detailBtn = th.querySelector(":scope > ." + DETAIL_REFRESH_BTN_CLASS);
+    if (!detailBtn) {
+      detailBtn = document.createElement("button");
+      detailBtn.type = "button";
+      detailBtn.className = DETAIL_REFRESH_BTN_CLASS;
+      detailBtn.addEventListener("mousedown", (event) => event.stopPropagation());
+      detailBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        refreshPageDetails();
+      });
+      th.appendChild(detailBtn);
+    }
+    syncDetailRefreshButton(detailBtn);
+  }
+
+  /********** 「刷新明细」：丢本页缓存、重新拉一遍（2026-11-21） **********/
+  const DETAIL_REFRESH_BTN_CLASS = "tm-detail-refresh-btn";
+
+  function syncDetailRefreshButton(button) {
+    if (!button) return;
+
+    const busy = !!detailRefreshState;
+    const text = busy
+      ? "刷新中 " + detailRefreshState.queued + "/" + detailRefreshState.total
+      : "刷新明细";
+    const title = busy
+      ? "正在重新拉取本页明细，再点一下不会重复发请求"
+      : "发票被重新编辑后点这里：丢弃本页明细缓存并重新拉取";
+
+    // 同值不写 —— 脚本自己盯着整张表，写回一样的值也算一次变更
+    if (button.textContent !== text) button.textContent = text;
+    if (button.title !== title) button.title = title;
+
+    const hasFlag = button.classList.contains("is-busy");
+    if (hasFlag !== busy) button.classList.toggle("is-busy", busy);
+  }
+
+  function refreshDetailHeadButtons() {
+    document
+      .querySelectorAll("." + DETAIL_REFRESH_BTN_CLASS)
+      .forEach((button) => syncDetailRefreshButton(button));
+  }
+
+  /* 口径与批量下载一致：表格里勾了行就只刷这些，没勾就刷本页全部。
+     ⚠️ 只清「本页这些 applyCode」的缓存，不清整库 —— 别的页拉过的还能接着用。 */
+  async function refreshPageDetails() {
+    if (detailRefreshState) return; // 已经在刷：不重复发
+
+    const tableRoot = observedTableRoot;
+    if (!tableRoot) return;
+
+    // 口径与批量下载一致：表格里勾了行就只刷这些，没勾就刷本页全部
+    const allRows = getBodyRows(tableRoot);
+    const selected = allRows.filter((tr) =>
+      tr.classList.contains("ant-table-row-selected")
+    );
+    const pool = selected.length ? selected : allRows;
+
+    const codes = [];
+    pool.forEach((tr) => {
+      // 不按 .ant-table-row 过滤：站点换 skin / 虚拟滚动时这层 class 不一定还在，
+      // 而 getRowApplyCode 拿不到申请单号的行本来就会在下面被跳过。
+      const code = getRowApplyCode(tr);
+      if (code && !codes.includes(code)) codes.push(code);
+    });
+
+    if (!codes.length) {
+      showDownloadTip("这一页没有可刷新的发票行", false);
+      return;
+    }
+
+    detailRefreshState = { total: codes.length, queued: 0 };
+    refreshDetailHeadButtons();
+
+    try {
+      codes.forEach((code) => {
+        detailStaleRetry.delete(code);
+        detailFailed.delete(code);
+        detailRequested.delete(code);
+        detailForce.add(code); // 绕过缓存，重新请求
+        queueDetailFetch(code);
+        detailRefreshState.queued += 1;
+        refreshDetailHeadButtons();
+      });
+
+      // 队列本来就是串行 + DETAIL_FETCH_GAP 间隔，这里只等它跑完，不另起并发
+      while (detailQueue.length || detailRunning) await sleep(150);
+
+      showDownloadTip(`已刷新 ${codes.length} 行的发票明细`, true);
+    } finally {
+      detailRefreshState = null;
+      detailForce.clear(); // 队列被熔断清空时可能有残留
+      refreshDetailHeadButtons();
+    }
   }
 
   function finishColumnResize(commit) {
@@ -1506,6 +1619,33 @@
       ${scope} .tm-batch-head-btn.is-busy:hover {
         background: #d9363e;
       }
+
+      /* 「刷新明细」（2026-11-21）：和批量下载并排，弱化成描边按钮，别两个蓝块抢眼 */
+      ${scope} .tm-detail-refresh-btn {
+        margin-left: 6px;
+        height: 20px;
+        padding: 0 8px;
+        border: 1px solid #237ffe;
+        border-radius: 4px;
+        background: #fff;
+        color: #237ffe;
+        font-size: 11px;
+        font-weight: 500;
+        line-height: 18px;
+        letter-spacing: 0;
+        cursor: pointer;
+        vertical-align: middle;
+        white-space: nowrap;
+      }
+      ${scope} .tm-detail-refresh-btn:hover {
+        background: #f0f6ff;
+        color: #1a6fe0;
+      }
+      ${scope} .tm-detail-refresh-btn.is-busy {
+        border-color: #ff4d4f;
+        color: #ff4d4f;
+        background: #fff;
+      }
     `;
 
     return css;
@@ -2361,7 +2501,7 @@
     const detailTip = document.createElement("p");
     detailTip.className = "tm-set-tip";
     detailTip.textContent =
-      "已开票的明细不会变，脚本会把它们存在本机（30 天），刷新页面不再重复请求接口。怀疑某张票数据不对时可以清空重取。";
+      "明细存在本机（30 天），刷新页面不再重复请求接口。发票被重新编辑后会自动认出来重拉：金额变了立刻刷；不写明细 / 多条明细 / 单条明细合计对不上金额的，隔几分钟重验一次。也可以点表格「操作」列头的「刷新明细」强制重刷本页。";
 
     const clearDetailBtn = document.createElement("button");
     clearDetailBtn.type = "button";
@@ -3100,6 +3240,37 @@
     const clone = cell.cloneNode(true);
     clone.querySelectorAll(".tm-qty-hint").forEach((node) => node.remove());
     return normText(clone.innerText);
+  }
+
+  /* 金额格 → 数值，明细指纹就靠它：
+     · 合并开票那几行带「合」标签，getAmountText 会把字带出来 ⇒ 统一「只留数字字符」
+     · 解析不出来（空行 / 还没渲染完）返回 null —— 调用方一律当「没有指纹」，不判失效、不记指纹 */
+  function parseAmountNumber(text) {
+    const raw = normText(text).replace(/[^\d.\-]/g, "");
+    if (!raw || raw === "-" || raw === ".") return null;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  function findRowByApplyCode(applyCode) {
+    if (!applyCode || !observedTableRoot) return null;
+    return (
+      getBodyRows(observedTableRoot).find((tr) => getRowApplyCode(tr) === applyCode) || null
+    );
+  }
+
+  /* 这一行「现在」显示的发票金额；拿不到就 null（不当作 0，免得把每行都判成被改过） */
+  function readAmountNumberByCode(applyCode) {
+    const tableRoot = observedTableRoot;
+    if (!tableRoot) return null;
+
+    const amountIdx = getHeaderIndexMap(tableRoot).get(AMOUNT_COLUMN_HEADER);
+    if (amountIdx === undefined) return null;
+
+    const row = findRowByApplyCode(applyCode);
+    if (!row || !row.children[amountIdx]) return null;
+
+    return parseAmountNumber(getAmountText(row.children[amountIdx]));
   }
 
   /* 批量清单里那行「数量 × 单价」小字（和列表金额格下面那行一模一样）。
@@ -4340,14 +4511,19 @@
     });
   }
 
-  function getCachedDetail(applyCode) {
+  function getCachedDetailEntry(applyCode) {
     const entry = detailCache.get(applyCode);
     if (!entry) return null;
     if (Date.now() - entry.at > DETAIL_CACHE_TTL) {
       detailCache.delete(applyCode);
       return null;
     }
-    return entry.items;
+    return entry;
+  }
+
+  function getCachedDetail(applyCode) {
+    const entry = getCachedDetailEntry(applyCode);
+    return entry ? entry.items : null;
   }
 
   let detailPersistTimer = 0;
@@ -4359,6 +4535,8 @@
     detailCache.forEach((entry, code) => {
       items[code] = {
         at: entry.at,
+        // 指纹单独存：v2 老数据没有这个字段，读的时候按 null 处理
+        a: Number.isFinite(entry.amount) ? entry.amount : null,
         i: entry.items.map((item) => [
           item.name,
           item.unit,
@@ -4407,6 +4585,9 @@
       const raw = localStorage.getItem(DETAIL_STORE_KEY);
       if (!raw) return;
       const data = JSON.parse(raw);
+      // ⚠️ 只认 v3：v2 条目没有金额指纹，没法判断里面的旧明细还可不可信 ——
+      //    要是「补记当前金额 + 继续用旧明细」，反而会把错的值永久固化（升级第一屏必踩）。
+      //    所以 v2 整份作废，升级后首屏按正常队列重拉一遍（50 行 × 70ms ≈ 3.5s，一次性）。
       if (!data || data.v !== DETAIL_STORE_VERSION || !data.items) return;
 
       const now = Date.now();
@@ -4422,7 +4603,12 @@
           amount: Number.isFinite(row[4]) ? row[4] : 0,
         }));
 
-        detailCache.set(code, { items, at: entry.at });
+        detailCache.set(code, {
+          items,
+          at: entry.at,
+          // v2 老条目没有 a ⇒ 留 null，渲染时从金额格补记（不触发重拉）
+          amount: Number.isFinite(entry.a) ? entry.a : null,
+        });
       });
     } catch (error) {}
   }
@@ -4436,11 +4622,15 @@
     } catch (error) {}
   }
 
-  function setDetailCache(applyCode, items) {
+  function setDetailCache(applyCode, items, amount) {
     if (detailCache.size >= DETAIL_CACHE_MAX) {
       detailCache.delete(detailCache.keys().next().value);
     }
-    detailCache.set(applyCode, { items, at: Date.now() });
+    detailCache.set(applyCode, {
+      items,
+      at: Date.now(),
+      amount: Number.isFinite(amount) ? amount : null,
+    });
     detailFailed.delete(applyCode);
     scheduleDetailPersist();
   }
@@ -4522,7 +4712,64 @@
     hint.classList.toggle("is-incomplete", incomplete);
   }
 
-  // 每行处理时都会走到这里：缓存命中直接画，没命中就排队
+  /* 缓存里的明细还可不可信？返回命中的失效原因数组，空数组 = 可信。
+     用户 2026-11-21 口径：不写明细、多条明细、明细变化、金额变化 —— 四种都当「变过」处理。
+     ⚠️ 只有 ① 是当场能对上的硬信号；②③④ 都没有服务端版本号可比，只能靠时间窗限流，
+        否则每行每次渲染都判一次失效。
+     ⚠️ 返回数组而不是单个原因：某个原因这一轮已经重拉过（配额用完）时，
+        不能把它顺带的其他原因也一起挡掉。 */
+  function detailStaleReasons(entry, amountNow) {
+    const items = Array.isArray(entry.items) ? entry.items : [];
+    const aged = Date.now() - (entry.at || 0) > DETAIL_RECHECK_MS;
+    const reasons = [];
+
+    // ① 金额变了 —— 不看时间窗：改完就该刷
+    const amountChanged =
+      amountNow !== null &&
+      Number.isFinite(entry.amount) &&
+      Math.abs(amountNow - entry.amount) > 0.005;
+    if (amountChanged) {
+      reasons.push("amount");
+    } else if (items.length === 1 && amountNow !== null) {
+      // ② 明细变化：单条明细的价税合计必须等于列表金额，对不上 ⇒ 明细被改过。
+      //    只在上面的金额没变时才判 —— 金额自己变了的话，合计当然也对不上，那是同一件事，别重复刷。
+      //    ⛔ 多条不比合计：合并开票 / 拆分那几行的两个口径本来就不等，比了会整表乱刷
+      const only = items[0];
+      if (only.qty !== null && Math.abs(only.amount - amountNow) > 0.01) reasons.push("sum");
+    }
+
+    // ③ 不写明细（没有明细行 / 数量全空）：重新编辑时可能把数量和单位补上了
+    if (!items.length || items.every((item) => item.qty === null)) {
+      if (aged) reasons.push("empty");
+    } else if (items.length > 1 && aged) {
+      // ④ 多条明细：合计验不了、条数也看不到，只能定期整条重拉一遍
+      reasons.push("multi");
+    }
+
+    return reasons;
+  }
+
+  /* 判定失效 ⇒ 放开这张票的缓存并重新排队。
+     同一行同一个原因只重拉一次（detailStaleRetry 存 Set）：
+     「金额永远对不上」「多明细拉回来还是多明细」这类情况重拉也没用，不能无限刷接口。
+     返回 true = 已排队重拉（本轮先留着旧小字，等新数据覆盖，不闪空）。 */
+  function markDetailStale(applyCode, reason) {
+    let used = detailStaleRetry.get(applyCode);
+    if (!used) {
+      used = new Set();
+      detailStaleRetry.set(applyCode, used);
+    }
+    if (used.has(reason)) return false;
+    used.add(reason);
+
+    detailFailed.delete(applyCode);
+    detailRequested.delete(applyCode); // 会话内本来只拉一次，这里要放开
+    detailForce.add(applyCode);
+    queueDetailFetch(applyCode);
+    return true;
+  }
+
+  // 每行处理时都会走到这里：缓存命中先过失效判定，该重拉就重拉；没命中就排队
   function ensureDetailHint(tr, amountIdx) {
     const cell = tr && tr.children[amountIdx];
     if (!cell) return;
@@ -4530,9 +4777,25 @@
     const applyCode = getRowApplyCode(tr);
     if (!applyCode) return;
 
-    const items = getCachedDetail(applyCode);
-    if (items) {
-      renderDetailHint(cell, items);
+    const entry = getCachedDetailEntry(applyCode);
+    if (entry) {
+      const amountNow = parseAmountNumber(getAmountText(cell));
+
+      // 指纹缺失（旁听页面「详情」写进来的）：就地把当前金额记上，但判定照走 ——
+      // 「不写明细 / 多条明细」这两种形态该重验还是要重验。
+      if (entry.amount === null || entry.amount === undefined) {
+        if (amountNow !== null) {
+          entry.amount = amountNow;
+          scheduleDetailPersist();
+        }
+      }
+
+      // 命中多个原因时逐个尝试：配额按原因分桶，第一个还能放行的就重拉
+      for (const reason of detailStaleReasons(entry, amountNow)) {
+        if (markDetailStale(applyCode, reason)) return;
+      }
+
+      renderDetailHint(cell, entry.items);
       return;
     }
     if (detailFailed.has(applyCode)) return;
@@ -4609,7 +4872,8 @@
 
         const applyCode = detailQueue.shift();
 
-        if (getCachedDetail(applyCode)) {
+        const forced = detailForce.delete(applyCode);
+        if (!forced && getCachedDetail(applyCode)) {
           refreshRowHint(applyCode);
           continue;
         }
@@ -4618,7 +4882,9 @@
 
         if (data) {
           detailFailStreak = 0;
-          absorbDetailData(data);
+          // 指纹记「这次拉取时列表上显示的金额」，不是明细合计 ——
+          // 合并开票那几行两者本来就不等，记合计会自己判自己过期。
+          absorbDetailData(data, readAmountNumberByCode(applyCode));
           refreshRowHint(applyCode);
         } else {
           detailFailStreak += 1;
@@ -4633,13 +4899,13 @@
   }
 
   /* 详情响应既能拿明细，也带着 contractCompanyName —— 顺手把销方公司真值也记上，一次请求两用。 */
-  function absorbDetailData(data) {
+  function absorbDetailData(data, amountAtFetch) {
     if (!data || typeof data !== "object") return false;
 
     const applyCode = typeof data.applyCode === "string" ? data.applyCode : "";
     if (!applyCode) return false;
 
-    setDetailCache(applyCode, normalizeDetailItems(data.taxableList));
+    setDetailCache(applyCode, normalizeDetailItems(data.taxableList), amountAtFetch);
 
     // 详情响应里还带着这张发票对应的订单（orderItemDTOS）—— 裸单号，留给「来源」格点击用
     const orderItems = Array.isArray(data.orderItemDTOS) ? data.orderItemDTOS : [];
@@ -4670,7 +4936,8 @@
     if (text.indexOf("taxableList") === -1) return false;
 
     try {
-      return absorbDetailData(JSON.parse(text).data);
+      // 旁听到的详情没有行上下文，指纹留空；随后渲染那一步会从金额格补记
+      return absorbDetailData(JSON.parse(text).data, null);
     } catch (error) {
       return false;
     }
