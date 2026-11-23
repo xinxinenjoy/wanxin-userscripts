@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.2订单智能审批
 // @namespace    https://tampermonkey.net/
-// @version      2.25
+// @version      2.26
 // @description  SOA订单智能审批：自动推进审批流程（报价确认 / 内勤复核 / 合同 / 落单审核），合同阶段自动导入提前选择好的文件，合同模块也可单独处理；落单数据在浏览器失焦时也能自动复制。
 
 // @match        https://checkup-soa3.health-100.cn/*
@@ -184,6 +184,29 @@
  * ② ensureContractTabVisible 增加一次确定性预检：页签容器整体不存在（不在订单详情页）
  *    ⇒ 立即报错，不再干等 FLOW_WAIT_TIMEOUT（60 秒）。
  *    容器在、只是「合同」页签稍后渲染的情况，仍走原有响应式等待。
+ *
+ * 关于「点立即处理订单完全没反应」（v2.26，2026-11-23）：
+ * - 现象（红领巾）：订单 SOA37951428699140525 停在「内勤复核」，面板主按钮是蓝色
+ *   「立即处理订单」且未禁用，但点下去按钮文字不变、面板提示也不变、网页提示不新增
+ *   —— 不是报错，是**一点反应都没有**。
+ * - 排查口径（实测）：v2.25 已加载（面板「处理合同」title 是新文案）；同一面板的
+ *   「查看说明」「关闭智能审批」点击有效 ⇒ 面板事件绑定本身是通的；
+ *   webNotice 观察器活着（能记录页面弹窗）⇒ 脚本主上下文没崩。
+ *   ⇒ 问题只可能在**点击处理函数进入之后、runFullFlow 启动之前**那一段静默退出：
+ *     ① `if (processRunning) { requestFlowStop(); return; }` —— 若 processRunning
+ *        被上一轮异常留在 true 而 activeFlowToken 已置空，requestFlowStop 会直接
+ *        return false，**按钮与提示都不动**，表现就是“点了没用”；
+ *     ② `await refreshBoundFileContentCache()` —— File System Access 的
+ *        queryPermission() 在句柄失效/扩展世界下可能长时间不落定，await 挂住，
+ *        后面的 createFlowToken / runFullFlow 全都不执行，同样毫无反馈。
+ * - 处理（只加反馈与兜底，不改任何审批判定口径）：
+ *   ① 点击第一行就写面板状态“已收到点击，正在检查运行状态…”——
+ *      以后有没有反应一眼可分（没这句 = 监听器没绑上，有这句 = 卡在后续某步）；
+ *   ② 僵尸态自愈：processRunning 为真但 activeFlowToken 为空 ⇒ 就地复位后继续，
+ *      不再静默 return；
+ *   ③ 共用文件权限查询加 3 秒超时，超时就跳过、直接进流程（上传阶段另有缓存兜底），
+ *      不允许启动前检查把整个流程卡死；
+ *   ④ 整段点击处理包进 try/catch，任何启动前异常都落到面板红字，不再只进 console。
  */
 
 (function () {
@@ -7763,6 +7786,38 @@
    * 现方案：权限还在就刷新缓存（内容保持最新）；不在就什么都不做，
    *         运行时一律用内容缓存 ⇒ 彻底不弹窗。
    */
+  /*
+   * v2.26：给“启动前检查”里的异步调用加超时。
+   *
+   * 起因：refreshBoundFileContentCache 直接 await handle.queryPermission()，
+   * 而 File System Access 的句柄在文件被移走 / 扩展世界隔离 / 授权状态异常时，
+   * 这个 Promise 可能长时间不落定。它挂在**主流程启动之前**（点“立即处理订单”
+   * 后的第一步），一旦挂住，后面 createFlowToken / runFullFlow 全都不执行，
+   * 界面上就是“点了完全没反应”。
+   * 超时后按失败处理（走缓存兜底），绝不阻塞启动。
+   */
+  function withTimeout(
+    promise,
+    timeoutMs,
+    label
+  ) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                label ||
+                `操作超过 ${timeoutMs}ms 未返回`
+              )
+            ),
+          timeoutMs
+        );
+      })
+    ]);
+  }
+
   async function refreshBoundFileContentCache() {
     if (!boundFileHandle) {
       return false;
@@ -7772,11 +7827,15 @@
       const permission =
         typeof boundFileHandle
           .queryPermission ===
-        "function"
-          ? await boundFileHandle
-              .queryPermission({
-                mode: "read"
-              })
+          "function"
+          ? await withTimeout(
+              boundFileHandle
+                .queryPermission({
+                  mode: "read"
+                }),
+              3000,
+              "查询共用文件读取权限超时"
+            )
           : "prompt";
 
       if (
@@ -7787,8 +7846,12 @@
       }
 
       const file =
-        await boundFileHandle
-          .getFile();
+        await withTimeout(
+          boundFileHandle
+            .getFile(),
+          5000,
+          "读取共用文件超时"
+        );
 
       await saveBoundFileContent(
         file
@@ -14638,34 +14701,63 @@
       ?.addEventListener(
         "click",
         async () => {
-          if (processRunning) {
-            requestFlowStop();
-            return;
-          }
-
-          const stage =
-            getCurrentFlowStage();
-
-          const stageIssue =
-            getAutomationStageIssue(
-              stage
-            );
-
-          if (stageIssue) {
-            updatePanelStatus(
-              stageIssue +
-              "。请先在网页中将流程推进到报价确认或后续支持阶段。",
-              "error"
-            );
-
-            updateFlowRunButtonState(
-              stage
-            );
-
-            return;
-          }
+          /*
+           * v2.26：进入处理函数的第一行就给可见反馈。
+           * 这样“点了没反应”以后能直接分辨：看不到这句 = 监听器没执行；
+           * 看到这句但后面不动 = 卡在下面某个 await（由后续步骤自己的状态说明）。
+           */
+          updatePanelStatus(
+            "已收到点击，正在检查运行状态..."
+          );
 
           try {
+            if (processRunning) {
+              /*
+               * v2.26 僵尸态自愈：processRunning 为真但已无活动令牌，
+               * 说明上一轮异常退出时没复位干净。此时 requestFlowStop()
+               * 会直接 return false —— 按钮和提示都不动，正是“点击无效”的表象。
+               * 就地清理后继续启动，而不是静默返回。
+               */
+              if (!activeFlowToken) {
+                processRunning =
+                  false;
+
+                updateFlowRunButtonState(
+                  getCurrentFlowStage()
+                );
+
+                log(
+                  "检测到上一轮运行状态未复位，已自动清理，继续启动。"
+                );
+              } else {
+                requestFlowStop();
+
+                return;
+              }
+            }
+
+            const stage =
+              getCurrentFlowStage();
+
+            const stageIssue =
+              getAutomationStageIssue(
+                stage
+              );
+
+            if (stageIssue) {
+              updatePanelStatus(
+                stageIssue +
+                "。请先在网页中将流程推进到报价确认或后续支持阶段。",
+                "error"
+              );
+
+              updateFlowRunButtonState(
+                stage
+              );
+
+              return;
+            }
+
             /*
              * 内勤复核继续执行后通常会进入合同补充；
              * 合同补充则会立即使用绑定文件。
