@@ -1,8 +1,9 @@
 // ==UserScript==
-// @name         前台-1.2网络报告批量修改
+// @name         前台-1.2基础信息修改
 // @namespace    https://tampermonkey.net/
 // @version      2.0.0
 // @description  前台登记页批量修改基础信息：①网络报告获取方式 ②从订单刷新体检类型。支持三种数据来源：名单（证件号/预约单号）、订单号、单位代码+创建时间区间（自动按 84 天分段绕过 90 天限制）。整单重建提交、写后回读校验、金额字段快照比对，绝不改金额。
+
 // @match        *://checkup-register.health-100.cn/*
 // @grant        none
 // @run-at       document-idle
