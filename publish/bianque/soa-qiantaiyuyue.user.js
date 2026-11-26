@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         扁鹊-1.10前台预约查询
 // @namespace    https://tampermonkey.net/
-// @version      1.9.3
+// @version      1.9.4
 // @description  在 SOA 顶部工具组加一个「前台预约查询」入口：一个输入框，自动识别填的是预约单号还是身份证号；未到检一次查全部分院，已到检/已取消再按玫瑰园 → 宝龙 → 长垣 逐院查，结果按表格汇总；每行「详情」可看订单名称、本地单/全国单、健康顾问、金额与套餐项目。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_xmlhttpRequest
@@ -163,6 +163,21 @@
  *   ⇒ 「人员」组回到信息段最前面，只带 姓名 + 手机号（有 notSecretPhone 明文就用明文）；
  *   同一个值两套字段名（name/customerName、phone/customerPhone）不再重复成两行。
  *   该段标题也按系统口径改回「人员与预约信息」。浮层顺序不变（v1.9.2 ④ 的定稿）。
+ *
+ * v1.9.4（2026-11-26，红领巾「这个位置当前显示的应该是原价，把成交价也显示出来」）：
+ *   v1.8.0 其实已经两价都画了，但**主行光秃秃一个数字**，看不出上面那行是原价还是成交价，
+ *   成交那行还是 10px 灰字，扫表时基本看不见。现在两行都带标签、都加粗着色：
+ *     原价 ¥870.00   ← 灰，常规
+ *     成交 ¥500.00   ← 橙，加粗（重点看这个）
+ *   取值口径（回答他「是不是按登记页原价合计 / 成交价合计来的」）：
+ *     原价 = Σ orderDetail.packages[].checkPrice
+ *     成交 = Σ orderDetail.packages[].settlementPrice（receviceSettlePrice 同值）
+ *   登记页那张「套餐和加项信息」表的原价合计 / 成交价合计就是同样两个求和
+ *   （对得上：图里 1292.00 + 739.80 + 500.00 = 2531.80，成交 1000.00 + 0 + 0 = 1000.00），
+ *   所以两边是同一份数据、同一种算法 ⇒ 同口径。两价相等时两行都照写（不再只留一个），
+ *   省得看到「只有一个数」又要怀疑是漏了成交价。
+ *   鼠标悬停金额格能看到这行数字怎么来的（几个套餐/加项包、各自求和），
+ *   另外控制台暴露 window.__hlj_qt_debug，想核对可直接调一次接口看明细。
  */
 
 (function () {
@@ -194,7 +209,7 @@
   const REPORT_TEXT = '报表工具';
   const HOST_SOA = 'checkup-soa3.health-100.cn';
 
-  const SCRIPT_VERSION = '1.9.3';
+  const SCRIPT_VERSION = '1.9.4';
 
   // 前台（登记）站点
   const QT_ORIGIN = 'https://checkup-register.health-100.cn';
@@ -619,6 +634,8 @@
       customerName: String(data.customerName || ''),
       settle: hasSettle ? settle : null,
       standard: hasStandard ? standard : null,
+      // v1.9.4：这两个合计到底加了几个包，悬停提示里要报出来，方便跟登记页逐行对账
+      pkgCount: packages.length,
       payStatus: [...payStatus].join(' / '),
       packageName: packages.map((p) => String(p?.packageName || '')).filter(Boolean).join('、'),
       // 同上：详情浮层要摊全字段 + 每个套餐的字段
@@ -987,23 +1004,44 @@
   }
 
   /*
-   * 金额单元格（v1.8.0）：先原价（标准），后成交（结算），跟前台登记页一致。
-   * settle / standard 都可能拿不到（未到检的收费接口返回空）⇒ 谁有显示谁。
+   * 金额单元格（v1.9.4）：两行都带标签，一眼能分清哪行是原价、哪行是成交价。
+   *
+   *   原价 ¥870.00      ← Σ packages[].checkPrice
+   *   成交 ¥500.00      ← Σ packages[].settlementPrice
+   *
+   * 这两个求和就是登记页「套餐和加项信息」表底下那对「原价合计 / 成交价合计」——
+   * 前台那张表也是把每行的原价、实际成交价各自加总，行来源同样是本单的套餐 + 加项包，
+   * 所以两边同口径（图里 1292.00 + 739.80 + 500.00 = 2531.80 就是这么加出来的）。
+   *
+   * settle / standard 都可能拿不到（未到检的收费接口返回空）⇒ 谁有显示谁，都没有写「—」。
    */
-  function moneyCellHtml(settle, standard) {
+  function moneyCellHtml(settle, standard, pkgCount) {
     const hasStd = Number.isFinite(standard);
     const hasSet = Number.isFinite(settle);
-    if (!hasStd && !hasSet) return { text: '—', sub: '' };
-    const main = hasStd ? moneyText(standard) : moneyText(settle);
-    const sub = hasStd && hasSet && standard !== settle ? `<i>成交 ${moneyText(settle)}</i>` : '';
-    return { text: main, sub };
+    if (!hasStd && !hasSet) return { html: '—', tip: '这条记录查不到收费明细，金额未知' };
+
+    const parts = [];
+    if (hasStd) parts.push(`<span class="qt-mm-std">原价 ${moneyText(standard)}</span>`);
+    if (hasSet) parts.push(`<span class="qt-mm-set">成交 ${moneyText(settle)}</span>`);
+
+    const n = Number.isFinite(pkgCount) ? `本单 ${pkgCount} 个套餐/加项包` : '本单套餐/加项包';
+    const tipParts = [];
+    if (hasStd) tipParts.push(`原价合计 ${moneyText(standard)}`);
+    if (hasSet) tipParts.push(`成交价合计 ${moneyText(settle)}`);
+    const tip = `${n}逐条加总：${tipParts.join('，')}（与前台登记页「原价合计 / 成交价合计」同口径）`;
+
+    return { html: parts.join(''), tip };
   }
 
   // 分院表的一行（已到检 / 已取消）
   function renderBranchRow(rec, branch, key) {
     const detail = rec.detail || null;
     const certText = rec.certFull || rec.certMasked || '—';
-    const money = moneyCellHtml(detail ? detail.settle : null, detail ? detail.standard : null);
+    const money = moneyCellHtml(
+      detail ? detail.settle : null,
+      detail ? detail.standard : null,
+      detail ? detail.pkgCount : null
+    );
     const statusText = rec.statusText || rec.statusCode || '—';
     const statusShort = STATUS_SHORT[rec.statusCode] || statusText;
     const branchLabel = branch.short || rec.branchShort || '—';
@@ -1014,7 +1052,7 @@
         <td class="qt-c-name" title="${escapeHtml(rec.name || '')}">${escapeHtml(rec.name || '—')}</td>
         <td class="qt-c-cert" title="${escapeHtml(certText)}">${escapeHtml(certText || '—')}</td>
         <td class="qt-c-date">${escapeHtml(rec.apptDate || '—')}</td>
-        <td class="qt-c-money" title="原价 / 成交价">${money.text}${money.sub}</td>${statusCell(detail, statusText, statusShort)}
+        <td class="qt-c-money" title="${escapeHtml(money.tip)}">${money.html}</td>${statusCell(detail, statusText, statusShort)}
         <td class="qt-c-vid">${escapeHtml(rec.vid || '—')}</td>${detailCell(key)}
       </tr>
     `;
@@ -1024,7 +1062,11 @@
   function renderNotYetRow(rec, key) {
     const detail = rec.detail || null;
     const certText = rec.certFull || rec.certMasked || '—';
-    const money = moneyCellHtml(detail ? detail.settle : null, detail ? detail.standard : null);
+    const money = moneyCellHtml(
+      detail ? detail.settle : null,
+      detail ? detail.standard : null,
+      detail ? detail.pkgCount : null
+    );
     const statusText = rec.statusText || rec.statusCode || '—';
     const statusShort = STATUS_SHORT[rec.statusCode] || statusText;
     const docText = rec.vid || rec.soaOrderNo || '—';
@@ -1037,7 +1079,7 @@
         <td class="qt-c-name" title="${escapeHtml(rec.name || '')}">${escapeHtml(rec.name || '—')}</td>
         <td class="qt-c-cert" title="${escapeHtml(certText)}">${escapeHtml(certText || '—')}</td>
         <td class="qt-c-date">${escapeHtml(rec.apptDate || '—')}</td>
-        <td class="qt-c-money" title="原价 / 成交价">${money.text}${money.sub}</td>${statusCell(detail, statusText, statusShort, branchNote)}
+        <td class="qt-c-money" title="${escapeHtml(money.tip)}">${money.html}</td>${statusCell(detail, statusText, statusShort, branchNote)}
         <td class="qt-c-vid" title="${escapeHtml(docTitle)}">${escapeHtml(docText)}</td>${detailCell(key)}
       </tr>
     `;
@@ -1107,7 +1149,7 @@
           <thead>
             <tr>
               <th scope="col">姓名</th><th scope="col">证件号</th><th scope="col">体检日期</th>
-              <th scope="col">金额</th><th scope="col">状态</th><th scope="col">预约单号 / 订单号</th><th scope="col"></th>
+              <th scope="col" title="上行 = 原价合计，下行 = 成交价合计（与前台登记页同口径）">金额</th><th scope="col">状态</th><th scope="col">预约单号 / 订单号</th><th scope="col"></th>
             </tr>
           </thead>
           <tbody>${rows}</tbody>
@@ -1172,7 +1214,8 @@
           <thead>
             <tr>
               <th scope="col">分院</th><th scope="col">姓名</th><th scope="col">证件号</th>
-              <th scope="col">体检日期</th><th scope="col">金额</th><th scope="col">状态</th>
+              <th scope="col">体检日期</th>
+              <th scope="col" title="上行 = 原价合计，下行 = 成交价合计（与前台登记页同口径）">金额</th><th scope="col">状态</th>
               <th scope="col">预约单号</th><th scope="col"></th>
             </tr>
           </thead>
@@ -1524,9 +1567,9 @@
           <tbody>${rows}</tbody>
           <tfoot>
             <tr>
-              <td class="qt-fee-name">合计 ${list.length} 项</td>
-              <td class="qt-fee-num">${Number.isFinite(sumStd) ? moneyText(sumStd) : '—'}</td>
-              <td class="qt-fee-num is-settle">${Number.isFinite(sumSet) ? moneyText(sumSet) : '—'}</td>
+              <td class="qt-fee-name" title="本单套餐 + 加项包逐行加总，即前台登记页那对合计">合计 ${list.length} 项</td>
+              <td class="qt-fee-num" title="= 登记页「原价合计」">${Number.isFinite(sumStd) ? moneyText(sumStd) : '—'}</td>
+              <td class="qt-fee-num is-settle" title="= 登记页「成交价合计」">${Number.isFinite(sumSet) ? moneyText(sumSet) : '—'}</td>
               <td class="qt-fee-pay"></td>
             </tr>
           </tfoot>
@@ -2183,11 +2226,15 @@
       #${IDS.panel} .qt-row .qt-c-date {
         font-variant-numeric:tabular-nums; color:#3d4a5c; white-space:nowrap;
       }
+      /* 金额两行（v1.9.4）：上行「原价」灰、下行「成交」橙加粗，扫表时先看到成交价 */
       #${IDS.panel} .qt-row .qt-c-money {
-        font-variant-numeric:tabular-nums; color:#b45309; font-weight:700; white-space:nowrap;
+        font-variant-numeric:tabular-nums; white-space:nowrap; line-height:1.35;
       }
-      #${IDS.panel} .qt-row .qt-c-money i {
-        display:block; font-style:normal; font-weight:500; font-size:10px; color:#94a3b8; margin-top:1px;
+      #${IDS.panel} .qt-row .qt-mm-std {
+        display:block; font-size:11.5px; font-weight:600; color:#475569;
+      }
+      #${IDS.panel} .qt-row .qt-mm-set {
+        display:block; font-size:11.5px; font-weight:800; color:#b45309; margin-top:1px;
       }
       /* 未预约的记录没有预约单号，第二行给 SOA 订单号（长，超宽截断，全量在 title 里） */
       #${IDS.panel} .qt-row .qt-c-vid i {
@@ -2285,17 +2332,17 @@
       /* 列宽：分院表 8 列 / 未到检表 6 列 */
       #${IDS.panel} .qt-w-branch { width:8%; }
       #${IDS.panel} .qt-w-name   { width:9%; }
-      #${IDS.panel} .qt-w-cert   { width:19%; }
+      #${IDS.panel} .qt-w-cert   { width:18%; }
       #${IDS.panel} .qt-w-date   { width:11%; }
-      #${IDS.panel} .qt-w-money  { width:15%; }
+      #${IDS.panel} .qt-w-money  { width:16%; }
       #${IDS.panel} .qt-w-status { width:11%; }
       #${IDS.panel} .qt-w-vid    { width:18%; }
       #${IDS.panel} .qt-w-act    { width:9%; }
       #${IDS.panel} table.qt-table-notyet { min-width:620px; }
       #${IDS.panel} .qt-wy-name   { width:9%; }
-      #${IDS.panel} .qt-wy-cert   { width:23%; }
+      #${IDS.panel} .qt-wy-cert   { width:22%; }
       #${IDS.panel} .qt-wy-date   { width:11%; }
-      #${IDS.panel} .qt-wy-money  { width:14%; }
+      #${IDS.panel} .qt-wy-money  { width:15%; }
       #${IDS.panel} .qt-wy-status { width:11%; }
       #${IDS.panel} .qt-wy-doc    { width:23%; }
       #${IDS.panel} .qt-wy-act    { width:9%; }
@@ -2920,4 +2967,19 @@
   }
 
   boot();
+
+  /*
+   * v1.9.4：核对金额口径用的出口（只读，不写任何数据）。
+   * 用法（F12 控制台，在 SOA 页面上）：
+   *   await __hlj_qt_debug.fetchDetail('X7', '71183513165646')
+   *   → { standard: 870, settle: 500, pkgCount: 2, raw: { packages: [...] } }
+   *   raw.packages 里每一行的 packageName / checkPrice / settlementPrice 就是登记页那张表的行。
+   * 拿它跟登记页「原价合计 / 成交价合计」对一遍，就能确认两边是不是同一份数据。
+   */
+  window.__hlj_qt_debug = {
+    version: SCRIPT_VERSION,
+    fetchDetail,
+    fetchOrderFull,
+    moneyCellHtml,
+  };
 })();
