@@ -8,7 +8,7 @@
 
 GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动更新。
 
-当前正式发布 **18** 个脚本 · 最近修改 **2026-11-24 08:46**
+当前正式发布 **19** 个脚本 · 最近修改 **2026-11-26 12:01**
 
 </div>
 
@@ -49,11 +49,12 @@ GitHub 作为唯一开发源，Cloudflare Pages 提供展示、安装与自动�
 | **GOW底下尖塔** | `4.2.30` | 2026-09-24 17:29 | GOW底下尖塔火把管理与节点同步工具 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-gowdxjt.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/hljdyxjb/game-gowdxjt.user.js) |
 | **片源挑选助手** | `1.13.0` | 2026-10-27 21:01 | 影视资源列表页自动打分（按电视/电脑/手机口径可调），挑出前 3 个版本，一键推送到 115 网盘离线。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/hljdyxjb/game-pianyuan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/hljdyxjb/game-pianyuan.user.js) |
 
-### 2.Work · 15 个
+### 2.Work · 16 个
 
 | 脚本 | 版本 | 修改时间 | 功能说明 | 安装 |
 |---|---:|---|---|---|
 | **前台-1.1批量预约工具** | `1.19` | 2026-09-24 17:29 | 前台批量预约工具：在前台批量登记页面增加工具窗口，自动识别粘贴的14位预约单号并自动进行登记填写。同时在“已到检”页签中自动勾选“仅当日”，并在请求层强制将首次列表查询改为仅当日。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/qiantai/qiantai-piliangyuyue.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/qiantai/qiantai-piliangyuyue.user.js) |
+| **前台-1.2网络报告批量修改** | `2.0.0` | 2026-11-26 12:01 | 前台登记页批量修改基础信息：①网络报告获取方式 ②从订单刷新体检类型。支持三种数据来源：名单（证件号/预约单号）、订单号、单位代码+创建时间区间（自动按 84 天分段绕过 90 天限制）。整单重建提交、写后回读校验、金额字段快照比对，绝不改金额。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/2-work/1-2-e6cc145c.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/2-work/1-2-e6cc145c.user.js) |
 | **发票-1.1全局页面** | `6.54` | 2026-11-21 17:33 | 发票全局页面：优化SOA发票页面的表格布局，全局指的是通过左上角订单中心-订单开票进入的开票页面，需要自行手动维护对应的单位名称才可以正常显示。请在代码内搜索“文案替换表”自行配置。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/fapiao/fapiao-quanju.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/fapiao/fapiao-quanju.user.js) |
 | **发票-1.2订单页面** | `1.40` | 2026-11-21 17:33 | 发票订单页面：优化SOA发票页面的表格布局，此脚本处理的是通过某个订单进入的开票页面。与全局开票脚本互不影响。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/fapiao/fapiao-dingdan.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/fapiao/fapiao-dingdan.user.js) |
 | **扁鹊-1.10前台预约查询** | `1.9.3` | 2026-11-09 15:33 | 在 SOA 顶部工具组加一个「前台预约查询」入口：一个输入框，自动识别填的是预约单号还是身份证号；未到检一次查全部分院，已到检/已取消再按玫瑰园 → 宝龙 → 长垣 逐院查，结果按表格汇总；每行「详情」可看订单名称、本地单/全国单、健康顾问、金额与套餐项目。 | [⚡ 推荐安装](https://scripts.wanxinxin.dpdns.org/bianque/soa-qiantaiyuyue.user.js) · [GitHub 备用](https://raw.githubusercontent.com/xinxinenjoy/wanxin-userscripts/main/publish/bianque/soa-qiantaiyuyue.user.js) |
