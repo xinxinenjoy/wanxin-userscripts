@@ -6,7 +6,12 @@
 // @match        *://checkup-register.health-100.cn/*
 // @grant        none
 // @run-at       document-idle
+
 // @author       WanXin
+// @publishGroup 2-work
+// @publishID    1-2-e6cc145c
+// @updateURL    https://scripts.wanxinxin.dpdns.org/2-work/1-2-e6cc145c.user.js
+// @downloadURL  https://scripts.wanxinxin.dpdns.org/2-work/1-2-e6cc145c.user.js
 // ==/UserScript==
 
 (function () {
