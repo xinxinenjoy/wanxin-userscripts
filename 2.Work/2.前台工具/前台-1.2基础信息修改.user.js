@@ -11,8 +11,8 @@
 // @author       WanXin
 // @publishGroup qiantai
 // @publishID    qiantai-jichuxinxi
-// @updateURL    https://scripts.wanxinxin.dpdns.org/2-work/1-2-e6cc145c.user.js
-// @downloadURL  https://scripts.wanxinxin.dpdns.org/2-work/1-2-e6cc145c.user.js
+// @updateURL    https://scripts.wanxinxin.dpdns.org/qiantai/qiantai-jichuxinxi.user.js
+// @downloadURL  https://scripts.wanxinxin.dpdns.org/qiantai/qiantai-jichuxinxi.user.js
 // ==/UserScript==
 
 (function () {
