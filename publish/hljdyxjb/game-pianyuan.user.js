@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         片源挑选助手
 // @namespace    local.wanxin.pick-source
-// @version      1.13.0
-// @description  影视资源列表页自动打分（按电视/电脑/手机口径可调），挑出前 3 个版本，一键推送到 115 网盘离线。
+// @version      1.14.1
+// @description  影视资源列表页自动打分（按电视/电脑/手机口径可调），挑出前 3 个版本，一键推送到 115 网盘离线（电影 / 剧集分开配目录）。
 
 // @match        *://xn--wcv59z.com/*
 // @match        *://*.xn--wcv59z.com/*
@@ -84,12 +84,20 @@
  *     ⚠️ 类型码每部片都不一样（末世行者 i18=中字1080P，不存在的罪人 i2=中字1080P）
  *     ⇒ 只能靠接口自带的 `type.a`/`type.b` 下标映射，写死码值必错。
  *     标签上会区分来源：文件名写的显示「中字」，只有站点标的显示「中字·站」，悬停可看分类名。
+ * 12) **电影与剧集分开配目录（v1.14.0）**：设置 →「115 推送」分成「电影目录」「剧集目录」两行，各自配。
+ *     详情页按路径自动判定：`/mv/` → 电影，`/tv/` 与 `/ac/`（动漫）→ 剧集；列表页 / 搜索页没有这个标记，
+ *     就看页面上哪类详情链接多来估。
+ *     ⚠️ 旧版（v1.13.0 及之前）配过的那个单目录，升级后会**同时**落到两档上 ——
+ *     他之前只配过一个目录，分开后不该有任何一档突然回落到根目录。
+ * 13) **资源表原有链接也能推（v1.14.0）**：每行「磁力 / 种子」链接后面多一个 `⇪115` 小按钮，
+ *     点它直接把这一行推 115（有磁力用磁力，只有种子链接时推 `.torrent` 的 URL），目标目录同上。
+ *     不替换、不拦截站点原有链接 —— 原有的「磁力 / 种子 / 离线」照旧能点、能复制。
  */
 (function () {
   'use strict';
   if (window.__PSB__ && window.__PSB__.version) return;
 
-  var VERSION = '1.13.0';
+  var VERSION = '1.14.1';
 
   // 是否跑在 iframe 里（资源表格被站点塞进 iframe 的情况要能覆盖到）
   var IN_FRAME = (function () {
@@ -101,11 +109,12 @@
   var CONF = {
     topN: 3,                          // 卡片里保留几条
     headerSlot: true,                 // 详情页优先把卡片放进影片信息区的空白处（标题下方）；false = 始终插在资源表上方
+    inlinePush: true,                 // v1.14.0：资源表每行「磁力/种子」旁插一个「⇪115」按钮；false = 只在卡片里推
     allowHosts: ['xn--wcv59z.com'],   // 已知资源站（换域名后 @match 与这里各加一行；域内留空也能靠磁力链接自动识别）
     blockHosts: []                    // 明确不跑的站点，如 ['taobao.com']
   };
 
-  // 115 离线保存目录（v1.8.0）：cid=0 就是根目录，也就是 115 默认的离线下载位置。
+  // 115 离线保存目录（v1.8.0 直连；v1.14.0 起电影 / 剧集分开配）。
   // 不再有 base/token —— 直连 115，鉴权靠浏览器里已登录的 cookie，脚本不落任何凭据。
   var DIR_DEFAULT = {
     cid: '0',
@@ -374,29 +383,110 @@
     }
   };
 
-  // 只存「推到哪个目录」，不存任何凭据 —— 登录态始终由浏览器保管
-  function loadDir() {
-    var raw = store.get('psb_115dir', '');
-    var d = { cid: DIR_DEFAULT.cid, name: DIR_DEFAULT.name, path: [] };
-    if (raw) {
-      try {
-        var o = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        if (o && typeof o === 'object' && o.cid) {
-          d.cid = String(o.cid);
-          d.name = o.name || d.name;
-          d.path = Array.isArray(o.path) ? o.path : [];
-        }
-      } catch (e) { /* 坏数据用默认 */ }
+  // 只存「推到哪个目录」，不存任何凭据 —— 登录态始终由浏览器保管。
+  /* ---- 离线目录：电影 / 剧集分开（v1.14.0）----
+   * 他的原话（2026-11-28）：「需要优化功能，要支持电影与剧集分开配置对应的目录」。
+   * 存储升级成 { v:2, mv:{cid,name,path}, tv:{cid,name,path} }。
+   * ⚠️ 旧格式是单个 {cid,name,path}，迁移时**两档都用它** —— 他之前只配过一个目录，
+   *    分开后如果某一档回落成「离线下载根目录」，他会以为配置丢了。
+   */
+  var DIR_SLOTS = [
+    { k: 'mv', label: '电影目录', short: '电影' },
+    { k: 'tv', label: '剧集目录', short: '剧集' }
+  ];
+
+  function slotLabel(k) {
+    for (var i = 0; i < DIR_SLOTS.length; i++) if (DIR_SLOTS[i].k === k) return DIR_SLOTS[i].short;
+    return '离线';
+  }
+
+  function blankDir() {
+    return { cid: DIR_DEFAULT.cid, name: DIR_DEFAULT.name, path: [] };
+  }
+
+  function packDir(o) {
+    var d = blankDir();
+    if (o && typeof o === 'object') {
+      if (o.cid !== null && typeof o.cid !== 'undefined' && o.cid !== '') d.cid = String(o.cid);
+      if (o.name) d.name = String(o.name);
+      if (Array.isArray(o.path)) {
+        d.path = o.path.filter(function (p) { return p && p.cid !== null && typeof p.cid !== 'undefined'; })
+          .map(function (p) { return { cid: String(p.cid), name: String(p.name || '') }; });
+      }
     }
     return d;
   }
 
-  function saveDir(d) {
+  function loadDirs() {
+    var out = { mv: blankDir(), tv: blankDir() };
+    var raw = store.get('psb_115dir', '');
+    if (!raw) return out;
+    var o = null;
+    try { o = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { return out; }
+    if (!o || typeof o !== 'object') return out;
+    if (!o.mv && !o.tv) {
+      // v1.13.0 及之前的单目录 → 两档共用同一份
+      var one = packDir(o);
+      out.mv = packDir(one);
+      out.tv = packDir(one);
+      return out;
+    }
+    out.mv = packDir(o.mv);
+    out.tv = packDir(o.tv);
+    return out;
+  }
+
+  function saveDirs(dirs) {
     store.set('psb_115dir', JSON.stringify({
-      cid: String(d.cid || '0'),
-      name: d.name || DIR_DEFAULT.name,
-      path: Array.isArray(d.path) ? d.path : []
+      v: 2,
+      mv: packDir(dirs && dirs.mv),
+      tv: packDir(dirs && dirs.tv)
     }));
+  }
+
+  // 本页该用哪一档：/mv/ → 电影；/tv/ 与 /ac/（动漫按剧集形态）→ 剧集。
+  // 列表页 / 搜索页没有这个标记，退一步看页面上哪类详情链接多 —— 只做一次 querySelectorAll，开销可忽略。
+  // 缓存 2 秒：scan() 会对每一行调 mountInline()，100 行的列表页不做缓存就是 200 次全文档查询。
+  var DK_CACHE = { k: '', at: 0 };
+
+  function dirKeyOfPage() {
+    var m = /^\/(mv|tv|ac)\//.exec(String(location.pathname || ''));
+    if (m) return m[1] === 'mv' ? 'mv' : 'tv';
+    var now = Date.now();
+    if (DK_CACHE.k && now - DK_CACHE.at < 2000) return DK_CACHE.k;
+    var mvN = 0, tvN = 0;
+    try {
+      mvN = document.querySelectorAll('a[href*="/mv/"]').length;
+      tvN = document.querySelectorAll('a[href*="/tv/"],a[href*="/ac/"]').length;
+    } catch (e) { /* DOM 还不全，按电影兜底 */ }
+    var k = tvN > mvN ? 'tv' : 'mv';
+    DK_CACHE.k = k; DK_CACHE.at = now;
+    return k;
+  }
+
+  // 不传 key = 按当前页类型取（卡片、行内按钮、诊断面板都走这条）
+  function loadDir(key) {
+    var k = key === 'mv' || key === 'tv' ? key : dirKeyOfPage();
+    return loadDirs()[k];
+  }
+
+  function saveDirAt(key, d) {
+    var k = key === 'tv' ? 'tv' : 'mv';
+    var all = loadDirs();
+    all[k] = packDir(d);
+    saveDirs(all);
+    return all[k];
+  }
+
+  // 旧接口（单目录）保留，写当前页对应的那一档 —— 外部脚本 / 老测试还在用 saveDir()
+  function saveDir(d) { return saveDirAt(dirKeyOfPage(), d); }
+
+  function dirPathText(d) {
+    if (!d) return '';
+    var p = Array.isArray(d.path) && d.path.length
+      ? d.path.map(function (x) { return x.name || x.cid; }).join(' / ')
+      : '';
+    return p || d.name || '';
   }
 
   /* ---- 115 Cookie（选填，v1.8.0）----
@@ -634,12 +724,17 @@
     });
   }
 
-  function pushTo115(magnet) {
+  // slot 不传 = 按当前页类型（电影 / 剧集）选目录，卡片与行内按钮共用这一条链路
+  function pushTo115(magnet, slot) {
     if (!magnet) return Promise.resolve({ ok: false, error: '这一行没抓到磁力链接' });
-    var dir = loadDir();
+    var key = slot === 'mv' || slot === 'tv' ? slot : dirKeyOfPage();
+    var dir = loadDir(key);
     return add115Task(magnet, dir.cid).then(function (r) {
       if (!r.ok) return r;
-      return { ok: true, dup: !!r.dup, dir: dir.name, message: r.message || '' };
+      return {
+        ok: true, dup: !!r.dup, dir: dir.name, slot: key,
+        slotLabel: slotLabel(key), message: r.message || ''
+      };
     });
   }
 
@@ -1252,7 +1347,7 @@
     var as = row.querySelectorAll ? row.querySelectorAll('a[href], [title]') : [];
     for (var i = 0; i < as.length; i++) {
       var a = as[i];
-      if (a.hasAttribute('data-psb-badge')) continue;
+      if (a.hasAttribute('data-psb-badge') || a.hasAttribute(INLINE_ATTR)) continue;
       var tx = (a.textContent || '').replace(/\s+/g, ' ').trim();
       if (tx.length > best.length && /(2160p|1080p|720p|4k|uhd|hdr|web|blu|remux)/i.test(tx)) best = tx;
       var ti = (a.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
@@ -1322,6 +1417,145 @@
       }
     }
     return '';
+  }
+
+  /* ======================= 资源行原链接 · 一键推 115（v1.14.0）=======================
+   * 起因（2026-11-28 他贴「磁力下载」表格截图）：「除了在工具UI面板里可以推送115以外，
+   *   下方这些原有链接也要支持推送」。
+   *
+   * 做法：在资源行里加一个 `⇪115` 小按钮，**不动原有链接的任何行为**
+   *   （不改 href、不抢点击、不替换文字）—— 他要的是「多一个入口」，不是「把站点自己的离线功能改掉」。
+   *   · 位置（v1.14.1）：挂在**评分徽章左侧**。第一版挂在「磁力 · 种子」后面，
+   *     结果「下载」列从两行变三行，整张表被撑高，他要求挪走。
+   *   · 有磁力用磁力；只有 `.torrent` 链接时推种子 URL（115 的 add_task_url 同样收）。
+   *   · 目标目录按当前页类型（电影 / 剧集）自动选，与卡片里的推送同一条链路。
+   *   · 按钮自带三态（推送中 / ✓ 已推 / 重试），不依赖卡片里的 .err 元素 —— 它在卡片外面。
+   */
+  var INLINE_ATTR = 'data-psb-inline';
+
+  function torrentOf(row) {
+    var els = row && row.querySelectorAll ? row.querySelectorAll('a[href], [data-clipboard-text], [data-clipboard]') : [];
+    for (var i = 0; i < els.length; i++) {
+      var h = els[i].getAttribute('href') || '';
+      var c = els[i].getAttribute('data-clipboard-text') || els[i].getAttribute('data-clipboard') || '';
+      var pick = /\.torrent/i.test(h) ? h : (/\.torrent/i.test(c) ? c : '');
+      if (pick) {
+        if (!/^https?:\/\//i.test(pick)) continue;
+        try { return new URL(pick, location.href).href; } catch (e) { return pick; }
+      }
+    }
+    return '';
+  }
+
+  // 取「磁力 / 种子 / 离线」这一组里最靠后的元素。
+  // ⚠️ 不能只认 href：这类站点的「磁力」常常是 `<a href="javascript:;" data-clipboard-text="magnet:…">`，
+  //    href 里什么都没有；只按 href 找会导致整张表一个按钮都插不上。
+  //    所以三级判定：① href 是磁力/种子 ② 剪贴板属性里带磁力/种子 ③ 兜底文本正好是「磁力/种子/离线」。
+  // v1.14.1 起**不再用它定位按钮**（按钮挪到评分左侧了），留着给诊断面板 / live-check 报「这行有几组下载入口」。
+  function inlineAnchorOf(row) {
+    var els = row && row.querySelectorAll ? row.querySelectorAll('a, button') : [];
+    var found = null;
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      var h = el.getAttribute('href') || '';
+      var c = el.getAttribute('data-clipboard-text') || el.getAttribute('data-clipboard') ||
+        el.getAttribute('data-url') || '';
+      var tx = (el.textContent || '').replace(/\s+/g, '');
+      if (/^magnet:/i.test(h) || (/^https?:\/\//i.test(h) && /\.torrent($|[?#])/i.test(h)) ||
+        /magnet:/i.test(c) || /\.torrent/i.test(c) ||
+        (el.tagName === 'A' && /^(磁力|磁力下载|种子)$/.test(tx))) {
+        found = el;
+      }
+    }
+    return found;
+  }
+
+  function inlineCss(phase) {
+    var base = 'display:inline-flex;align-items:center;justify-content:center;margin-right:6px;' +
+      'padding:0 6px;height:19px;border-radius:4px;' +
+      'font:500 11px/18px system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;' +
+      'cursor:pointer;vertical-align:middle;white-space:nowrap;user-select:none;text-decoration:none;' +
+      'border:1px solid #5DCAA5;background:#E1F5EE;color:#0A5540;';
+    if (phase === 'ok') return base + 'border-color:#0F6E56;background:#0F6E56;color:#FFFFFF;';
+    if (phase === 'bad') return base + 'border-color:#F09595;background:#FCEBEB;color:#A32D2D;';
+    if (phase === 'busy') return base + 'opacity:.6;cursor:default;';
+    return base;
+  }
+
+  function paintInlineTitle(btn, key, dir) {
+    btn.title = '推送到 115 离线 · 目标：' + slotLabel(key) + '目录「' +
+      ((dir && dir.name) || DIR_DEFAULT.name) + '」\n' +
+      (key === 'mv' ? '本页按电影目录（/mv/）' : '本页按剧集目录（/tv/、/ac/）') +
+      '\n不想看到这个按钮：CONF.inlinePush = false';
+  }
+
+  function mountInline(row, badge) {
+    if (!CONF.inlinePush || !row) return;
+    var mag = magnetOf(row);
+    if (!mag && !torrentOf(row)) return;   // 整行没有任何可推的链接，不占地方
+
+    var key = dirKeyOfPage();
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute(INLINE_ATTR, '1');
+    btn.textContent = '⇪115';
+    btn.style.cssText = inlineCss('');
+    paintInlineTitle(btn, key, loadDir(key));
+    btn.addEventListener('click', function (e) {
+      // 行本身或祖先可能是链接/有点击事件，两层都掐断，别顺带把站点行为触发了
+      e.preventDefault();
+      e.stopPropagation();
+      doInlinePush(btn, row);
+    });
+    // 位置：评分徽章左侧（badge 是 scan() 刚插好的那个）。
+    //   徽章没插上（站点结构怪 / 单独调用）时退化到「本行第一个格子的最前面」——
+    //   仍然是评分那一侧，而且不会把 <button> 塞到 <tr> 直接子级（那样是非法结构）。
+    try {
+      if (badge && badge.parentNode) {
+        badge.parentNode.insertBefore(btn, badge);
+      } else {
+        var cell = row.firstElementChild || (row.children && row.children[0]) || row;
+        cell.insertBefore(btn, cell.firstChild);
+      }
+    } catch (e) { /* 站点结构怪，跳过 */ }
+  }
+
+  function doInlinePush(btn, row) {
+    var url = magnetOf(row) || torrentOf(row);
+    if (!url) {
+      btn.textContent = '无链接';
+      btn.style.cssText = inlineCss('bad');
+      setTimeout(function () { btn.textContent = '⇪115'; btn.style.cssText = inlineCss(''); }, 1600);
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = '推送中';
+    btn.style.cssText = inlineCss('busy');
+    pushTo115(url).then(function (r) {
+      btn.disabled = false;
+      if (r.ok) {
+        btn.textContent = r.dup ? '已在库' : '✓ 已推';
+        btn.style.cssText = inlineCss('ok');
+        btn.title = (r.dup ? '这条之前已经加过了' : '已推送到「' + (r.dir || DIR_DEFAULT.name) + '」') +
+          '（' + slotLabel(r.slot) + '目录）';
+        setTimeout(function () {
+          btn.textContent = '⇪115';
+          btn.style.cssText = inlineCss('');
+          var k = dirKeyOfPage();
+          paintInlineTitle(btn, k, loadDir(k));
+        }, 2600);
+      } else {
+        btn.textContent = r.needLogin ? '去登录 115' : '重试';
+        btn.style.cssText = inlineCss('bad');
+        btn.title = (r.error || '推送失败') +
+          (r.needLogin ? '\n已顺手帮你打开 115 登录页，登录后回来再点一次' : '');
+        if (r.needLogin) { try { window.open('https://115.com/?mode=login', '_blank'); } catch (e) {} }
+        setTimeout(function () {
+          btn.textContent = '⇪115';
+          btn.style.cssText = inlineCss('');
+        }, 4200);
+      }
+    });
   }
 
   /* ======================= 行内徽章 ======================= */
@@ -1435,6 +1669,17 @@
     '.kv{display:flex;align-items:center;gap:8px;margin-top:2px}' +
     '.kv .vv{flex:1 1 auto;min-width:0;font-size:12px;color:#2C2C2A;' +
     'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    // 电影 / 剧集两档目录（v1.14.0）：一行一档，当前页判定成哪档就加粗并挂「本页」标
+    '.drow{display:flex;align-items:center;gap:6px;padding:3px 0}' +
+    '.drow + .drow{border-top:.5px dashed rgba(0,0,0,.07)}' +
+    '.drow .dlab{flex:0 0 52px;font-size:11.5px;color:#5F5E5A}' +
+    '.drow .vv{flex:1 1 auto;min-width:0;font-size:12px;color:#2C2C2A;' +
+    'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.drow.on .vv{font-weight:600;color:#0A5540}' +
+    '.drow .cancel{padding:3px 9px;font-size:11.5px}' +
+    '.dnow{flex:none;font-size:10px;line-height:1.6;color:#0F6E56;background:#E1F5EE;' +
+    'border:.5px solid #5DCAA5;border-radius:999px;padding:0 5px}' +
+    '.pkhead{font-size:11px;color:#0F6E56;margin:5px 0 1px}' +
     '.wsum{font-size:11px;color:#888780;margin:4px 0 0}' +
     '.wsum b{color:#0F6E56}' +
     '.wsec{display:flex;align-items:baseline;font-size:11px;color:#0F6E56;font-weight:600;' +
@@ -1527,6 +1772,12 @@
     '.sz{background:#2C2C2A;border-color:rgba(255,255,255,.18);color:#D3D1C7}' +
     '.sz.on{background:#0F6E56;border-color:#5DCAA5;color:#EAF7F1}' +
     '.kv .vv{color:#EDEDEA}' +
+    '.drow .dlab{color:#B4B2A9}' +
+    '.drow .vv{color:#EDEDEA}' +
+    '.drow.on .vv{color:#9FE1CB}' +
+    '.drow + .drow{border-top-color:rgba(255,255,255,.1)}' +
+    '.dnow{background:#0F3D32;color:#9FE1CB;border-color:#5DCAA5}' +
+    '.pkhead{color:#9FE1CB}' +
     '.wi span{color:#B4B2A9}' +
     '.pr .pl,.wi .wl{color:#B4B2A9}' +
     '.pr.chg .pl,.pr.chg .pv2,.wi.chg .wl,.wi.chg .wv,.wsum b{color:#9FE1CB}' +
@@ -1867,19 +2118,33 @@
       list += '</div>';
     }
 
-    return '<div class="crumb">' + crumb + '</div>' + list +
+    return '<div class="pkhead">正在修改：' + slotLabel(pk.slot) + '目录</div>' +
+      '<div class="crumb">' + crumb + '</div>' + list +
       '<div class="row">' +
       (path.length > 1 ? '<button class="cancel" data-act="up">上一层</button>' : '') +
       '<button class="cp" data-act="pick">存到「' + esc(cur.name) + '」</button></div>';
   }
 
   function tabPush() {
-    var d = loadDir(), mode = loadCkMode(), h = '';
+    var dirs = loadDirs(), mode = loadCkMode(), h = '';
+    var cur = dirKeyOfPage();
 
-    // ① 离线目录 —— 不点「修改目录」就不发请求
-    h += '<label>离线保存目录</label><div class="kv"><span class="vv">' + esc(d.name) + '</span>' +
-      '<button class="cancel" data-act="dir">' + (state.picker ? '收起' : '修改目录') + '</button></div>';
-    if (state.picker) h += pickerBody();
+    // ① 离线目录：电影 / 剧集分开（v1.14.0）—— 不点「修改」就不发请求
+    h += '<label>离线保存目录（电影与剧集分开配）</label>';
+    for (var si = 0; si < DIR_SLOTS.length; si++) {
+      var s = DIR_SLOTS[si], dd = dirs[s.k];
+      var open = !!state.picker && state.picker.slot === s.k;
+      h += '<div class="drow' + (cur === s.k ? ' on' : '') + '">' +
+        '<span class="dlab">' + s.label + '</span>' +
+        '<span class="vv" title="' + esc(dirPathText(dd)) + '">' + esc(dd.name) + '</span>' +
+        (cur === s.k ? '<span class="dnow">本页</span>' : '') +
+        '<button class="cancel" data-act="dir" data-slot="' + s.k + '">' +
+        (open ? '收起' : '修改') + '</button></div>';
+      if (open) h += pickerBody();
+    }
+    h += '<div class="note">详情页自动判定：<code>/mv/</code> 用电影目录，<code>/tv/</code>、<code>/ac/</code>（动漫）' +
+      '用剧集目录；列表页 / 搜索页按页面上哪类链接多来估。<br>' +
+      '资源表每行「磁力 / 种子」后面也会多一个 <b>⇪115</b> 按钮，点它推到这个页面类型对应的目录。</div>';
 
     // ② 账号名
     h += '<label class="mt">115 账号</label><div class="kv"><span class="vv">' + esc(accText()) + '</span>' +
@@ -2107,17 +2372,19 @@
     });
   }
 
-  // 只在用户点了「修改目录」时才走这里
-  function openPicker() {
-    if (state.picker) { state.picker = null; render(); return; }
-    var d = loadDir();
+  // 只在用户点了某一档的「修改」时才走这里
+  function openPicker(slot) {
+    var k = slot === 'tv' ? 'tv' : 'mv';
+    // 点的是已经打开的那一档 → 收起；点另一档 → 直接切过去，别让人先关再开
+    if (state.picker && state.picker.slot === k) { state.picker = null; render(); return; }
+    var d = loadDir(k);
     var path = Array.isArray(d.path) ? d.path.slice() : [];
     // 记录的路径和当前 cid 对不上（比如在别处改过）就从根重来，别把人卡在错的位置
     if (!path.length || String(path[0].cid) !== '0' ||
       String(path[path.length - 1].cid) !== String(d.cid)) {
       path = [{ cid: '0', name: '根目录' }];
     }
-    state.picker = { loading: true, folders: [], err: '', needLogin: false, path: path };
+    state.picker = { slot: k, loading: true, folders: [], err: '', needLogin: false, path: path };
     state.tab = 'push';
     render();
     loadPickerAt(path[path.length - 1].cid);
@@ -2312,7 +2579,9 @@
           '<div class="ln">' +
           '<span class="rk">' + (i + 1) + '</span>' +
           '<button class="cp" data-act="push"' + (mag ? '' : ' disabled') +
-          ' title="' + (mag ? '推送到 115 离线（直连）' : '这一行没抓到磁力链接') + '">' +
+          ' title="' + (mag
+            ? '推送到 115 离线（直连）· 存到' + slotLabel(dirKeyOfPage()) + '目录'
+            : '这一行没抓到磁力链接') + '">' +
           (mag ? '推到 115' : '无磁力') + '</button>' +
           '<button class="cc" data-act="copy" title="复制磁力链接">⧉</button>' +
           '<span class="sz">' + (info.gb ? info.gb + ' GB' : '体积未知') + '</span>' +
@@ -2431,9 +2700,13 @@
       })(szs[si]);
     }
 
-    // ---- 设置：「修改目录」—— 只有点这里才去 115 拉目录 ----
-    var dirBtn = root.querySelector('[data-act="dir"]');
-    if (dirBtn) dirBtn.addEventListener('click', function () { openPicker(); });
+    // ---- 设置：「修改」某一档目录 —— 只有点这里才去 115 拉目录（v1.14.0 电影 / 剧集各一个）----
+    var dirBtns = root.querySelectorAll('[data-act="dir"]');
+    for (var dbi = 0; dbi < dirBtns.length; dbi++) {
+      (function (b) {
+        b.addEventListener('click', function () { openPicker(b.getAttribute('data-slot')); });
+      })(dirBtns[dbi]);
+    }
 
     // ---- 设置：刷新账号名 ----
     var accBtn = root.querySelector('[data-act="acc"]');
@@ -2587,9 +2860,10 @@
     if (pickBtn) pickBtn.addEventListener('click', function () {
       if (!state.picker) return;
       var p = state.picker.path, cur = p[p.length - 1];
-      saveDir({ cid: cur.cid, name: cur.name, path: p });
+      var slot = state.picker.slot === 'tv' ? 'tv' : 'mv';
+      saveDirAt(slot, { cid: cur.cid, name: cur.name, path: p });
       state.picker = null;
-      state.status = '离线目录已设为「' + cur.name + '」';
+      state.status = slotLabel(slot) + '目录已设为「' + cur.name + '」';
       render();
     });
 
@@ -2633,29 +2907,44 @@
           return;
         }
 
-        // 登录通了 → 顺手取账号名 + 试读当前目录，给一个完整结论
+        // 登录通了 → 顺手取账号名 + 把电影 / 剧集两档目录都试读一遍
+        // （v1.14.0：两档分开配之后，「电影能读、剧集配错了」是最容易踩的坑，测试就得一起报）
         return fetch115Account().then(function (a) {
           state.acc = {
             loading: false, name: a.name || '', uid: a.uid || '',
             err: a.ok ? '' : (a.error || ''), needLogin: !!a.needLogin
           };
-          var dir = loadDir();
-          return list115Folders(dir.cid).then(function (f) {
+          var dirs = loadDirs();
+          var keys = ['mv', 'tv'], uniq = [], groups = {};
+          keys.forEach(function (k) {
+            var cid = String((dirs[k] || {}).cid || '0');
+            if (!groups[cid]) { groups[cid] = []; uniq.push(cid); }
+            groups[cid].push(k);
+          });
+          return Promise.all(uniq.map(function (cid) { return list115Folders(cid); })).then(function (rs) {
+            var byCid = {};
+            uniq.forEach(function (cid, i) { byCid[cid] = rs[i]; });
             var who = a.ok
               ? '账号「' + (a.name || (a.uid ? 'UID ' + a.uid : '已登录')) + '」'
               : '账号昵称没取到（但登录态有效）';
             var lines = ['✅ 登录有效 · ' + who + ' · 用的是' + modeText];
             var allOk = true;
-            if (f.ok) {
-              lines.push('✅ 目录「' + dir.name + '」可访问（' + (f.folders || []).length + ' 个子文件夹）');
-            } else if (f.needLogin) {
-              allOk = false;
-              lines.push('⚠️ 登录刚说有效，但读目录被拒：' + (f.error || '') + '\n下一步：刷新 115.com 页面后重试。');
-            } else {
-              allOk = false;
-              lines.push('⚠️ 目录「' + dir.name + '」读不出来：' + (f.error || '未知原因') +
-                '\n下一步：换个目录试试（点「修改目录」），或稍后重试。');
-            }
+            keys.forEach(function (k) {
+              var d = dirs[k] || blankDir();
+              var f = byCid[String(d.cid || '0')] || {};
+              var tag = slotLabel(k) + '目录「' + d.name + '」';
+              if (f.ok) {
+                lines.push('✅ ' + tag + ' 可访问（' + (f.folders || []).length + ' 个子文件夹）');
+              } else if (f.needLogin) {
+                allOk = false;
+                lines.push('⚠️ ' + tag + '：登录刚说有效，但读目录被拒 —— ' + (f.error || '') +
+                  '\n下一步：刷新 115.com 页面后重试。');
+              } else {
+                allOk = false;
+                lines.push('⚠️ ' + tag + ' 读不出来：' + (f.error || '未知原因') +
+                  '\n下一步：点这一行的「修改」换个目录，或稍后重试。');
+              }
+            });
             state.status = allOk ? '115 连接正常 · ' + (a.name || '已登录') : '115 能连上，但目录读不出来';
             state.test = { loading: false, ok: allOk, text: lines.join('\n') };
             render();
@@ -2810,8 +3099,13 @@
     L.push('油猴权限：GM_xmlhttpRequest=' + (typeof GM_xmlhttpRequest === 'function' ? '有' : '无') +
       ' · GM_getValue=' + (typeof GM_getValue === 'function' ? '有' : '无'));
     // 115 推送状态：只报「填没填、多长」，绝不回显 cookie 内容
-    var dd = loadDir(), ck = loadCookie(), cm = loadCkMode();
-    L.push('115 推送：目录=' + dd.name + '（cid=' + dd.cid + '）');
+    var ds = loadDirs(), dk = dirKeyOfPage(), ck = loadCookie(), cm = loadCkMode();
+    L.push('115 推送：本页判定=' + slotLabel(dk) +
+      ' · 电影目录=' + ds.mv.name + '（cid=' + ds.mv.cid + '）' +
+      ' · 剧集目录=' + ds.tv.name + '（cid=' + ds.tv.cid + '）');
+    L.push('行内推送按钮：' + (CONF.inlinePush
+      ? '开（每行「磁力/种子」后一个 ⇪115）'
+      : '关（CONF.inlinePush=false）'));
     L.push('Cookie 来源：' + (cm === 'manual'
       ? '自己填（' + (ck ? ck.length + ' 字符 · ' + ck.replace(/=[^;]+/g, '=***') : '还没填') + '）'
       : '浏览器登录态（withCredentials 自动带，脚本不存）'));
@@ -2907,6 +3201,8 @@
   function scan() {
     // v1.13.0：首次进详情页时拉一次站点「中字」分类；同一路径只问一次，失败静默
     loadSiteMeta();
+    // 页面内容变了，列表页的「哪类链接多」要重新数
+    DK_CACHE.k = ''; DK_CACHE.at = 0;
     var rows = candidates();
     state.rows = rows;
     if (!rows.length) return 0;
@@ -2925,6 +3221,9 @@
     // 徽章重画（分页 / 排序后仍然对得上）
     var old = document.querySelectorAll('[data-psb-badge]');
     for (var k = 0; k < old.length; k++) if (old[k].parentNode) old[k].parentNode.removeChild(old[k]);
+    // v1.14.0：行内「⇪115」按钮同样每次重建 —— 站点翻页/重排后旧按钮会错行
+    var oldIn = document.querySelectorAll('[' + INLINE_ATTR + ']');
+    for (var oi = 0; oi < oldIn.length; oi++) if (oldIn[oi].parentNode) oldIn[oi].parentNode.removeChild(oldIn[oi]);
     var done = document.querySelectorAll('[data-psb-done]');
     for (var d = 0; d < done.length; d++) {
       done[d].removeAttribute('data-psb-done');
@@ -2945,6 +3244,8 @@
         if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(badge, anchor);
         else row.insertBefore(badge, row.firstChild);
       } catch (e) {}
+      // v1.14.1：推送入口插在评分徽章左侧（v1.14.0 挂在下载列后面会把行撑高）
+      try { mountInline(row, badge); } catch (e) {}
       if (rank >= 0) {
         try {
           row.style.boxShadow = 'inset 3px 0 0 ' + RANK[rank].bd;
@@ -2975,7 +3276,8 @@
         for (var j = 0; j < added.length; j++) {
           var n = added[j];
           if (n.nodeType !== 1) continue;
-          if (n.hasAttribute && (n.hasAttribute('data-psb-badge') || n.hasAttribute('data-psb-card'))) continue;
+          if (n.hasAttribute && (n.hasAttribute('data-psb-badge') || n.hasAttribute('data-psb-card') ||
+            n.hasAttribute(INLINE_ATTR))) continue;
           var t = n.textContent || '';
           if (/(2160p|1080p|4k|uhd)/i.test(t) || (n.querySelector && n.querySelector('a[href^="magnet:"]'))) {
             relevant = true; break;
@@ -3054,6 +3356,11 @@
     list115Folders: list115Folders,
     fetch115Account: fetch115Account,
     loadDir: loadDir,
+    loadDirs: loadDirs,
+    saveDirs: saveDirs,
+    saveDirAt: saveDirAt,
+    dirKeyOfPage: dirKeyOfPage,
+    slotLabel: slotLabel,
     loadCookie: loadCookie,
     loadCkMode: loadCkMode,
     saveCkMode: saveCkMode,
@@ -3080,10 +3387,14 @@
     _internals: {
       candidates: candidates, nameOf: nameOf, magnetOf: magnetOf, summaryOf: summaryOf,
       tokensOf: tokensOf,
+      torrentOf: torrentOf, inlineAnchorOf: inlineAnchorOf, mountInline: mountInline,
+      doInlinePush: doInlinePush, INLINE_ATTR: INLINE_ATTR,
+      dirPathText: dirPathText, packDir: packDir, DIR_SLOTS: DIR_SLOTS,
       readyState: readyState, describe: describe, wantHere: wantHere, loadDir: loadDir,
       renderSettings: renderSettings, normalizeCookie: normalizeCookie, saveCookie: saveCookie,
       sanitizeCfg: sanitizeCfg, cfgDefaults: cfgDefaults, sizeFactor: sizeFactor,
       state: state, setTab: function (t) { state.tab = t; },
+      scan: function () { return safeScan(); },
       pill: function () { return pill; }, card: function () { return cardHost; }
     }
   };
