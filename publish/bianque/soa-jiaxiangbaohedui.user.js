@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         扁鹊-1.9套餐加项核对
 // @namespace    https://tampermonkey.net/
-// @version      1.9.0
-// @description  SOA 订单页：核对「套餐 ↔ 绑定的赠送包 ↔ 包内项目」。只看赠送包(GIVEPKG)、不看加项包；按组展示、组头标注该组「几选几」（最少选N个/最多选N个）；每条套餐 = 一张独立卡片（序号 + 套餐信息头 + 赠送区），长套餐名/包名的共同前缀提到顶部只说一次；包内项目**一列**竖排、**包与包之间两列并排**；面板支持 **ESC 关闭**。纯只读，不发起任何写请求。
+// @version      1.10.0
+// @description  SOA 订单页：核对「套餐 ↔ 绑定的包 ↔ 包内项目」。面板顶部两个页签 —— **赠送包**（默认）与**加项包**；按组展示、组头标注该组「几选几」（最少选N个/最多选N个）；加项包页签把成交价拆成「套餐价 + 加项价 = 合计」，并按最少/最多选个数给出金额区间；每条套餐 = 一张独立卡片（序号 + 套餐信息头 + 包区），长套餐名/包名的共同前缀提到顶部只说一次；包内项目**一列**竖排、**包与包之间两列并排**；面板支持 **ESC 关闭**。纯只读，不发起任何写请求。
 // @match        https://checkup-soa3.health-100.cn/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -25,8 +25,10 @@
  *
  * ── 口径（红领巾 2026-09-29 明确，别自作主张改）──
  *   ① 没绑定任何包的套餐 → 不列（列表里根本看不到）。
- *   ② 绑了包的 → **只看赠送包（GIVEPKG）**，加项包（ADDPKG）/智略加项包（AIADDPKG）**不看**。
- *   ③ 只绑了加项包、没绑赠送包的套餐 → 整行不出现（没有赠送内容可看）。
+ *   ② 绑了包的 → **赠送包（GIVEPKG）与加项包（ADDPKG / AIADDPKG）分两个页签展示**，
+ *      默认「赠送包」页签（v1.9.0 及以前只看赠送包；v1.10.0 起加项包单独一页，见文末）。
+ *   ③ 只绑了加项包、没绑赠送包的套餐 → 在**赠送包页签**里不出现（没有赠送内容可看）；
+ *      反过来只绑赠送包的套餐，在**加项包页签**里也不出现 —— 两个页签各自独立成表。
  *   ④ 每行以**主套餐**为主体：套餐名称 / 原价 / 成交价 都取主套餐自己的；
  *      「赠送项目」取它绑定的赠送包里的项目明细。
  *   ⑤ 纯只读 → **不设订单状态门槛**（不像 1.8 那样只在未落单/检中修改时出现）。
@@ -153,6 +155,40 @@
  *     ④ 用**计算后的 display** 判可见（`getComputedStyle`），别用 `style.display`：
  *        面板首次创建时 inline style 是空的、可见性来自 CSS，拿 inline 判会误判成「已关」。
  *   ⚠️ 面板里没有输入控件（开关在页面上，面板内只有按钮）⇒ 不用避让「输入框内 ESC」。
+ *
+ * ── v1.10.0：加项包单独一页 + 成交价拆成「套餐价 + 加项价」（红领巾 2026-11-28）──
+ *   需求原话：「增加一个『加项包』的显示，将功能分开，默认展示赠送包，可通过按钮点击切换；
+ *   展示的内容与当前方式相同，成交价需要显示成 原价+加项包的价格（699+119，分开显示颜色也差别开）；
+ *   如果绑定了多个包，最好能判断一下加项包最少与最多的个数，例如绑定了5个加项包、最少选1个，
+ *   就按照 699+（最高价位包的总金额），如果选了多个，就从最高金额的包开始计算加项包价格。」
+ *   ⇒ 四个决定（都是他选的，⛔ 别按自己的偏好改回）：
+ *     ① 页签：标题右侧「赠送包 / 加项包」，默认赠送包；**两个页签各自独立成表**
+ *        （哪一页只列绑了那一类包的套餐），底部提示文案跟着页签变。
+ *     ② 成交价写法：`699 + 306 = 1,005` —— 基础价黑字、**加项部分单独一色（紫 #722ed1）**、合计加粗；
+ *        最多档另起一段 `最多 699 + 1,206 = 1,905`。
+ *     ③ 区间口径：**最少档 ~ 最多档**都给（他选的是「给区间」，不是只给一头）。
+ *     ④ 取哪份价：**行头价格用包自己的成交价 `price`**（与主套餐 699 同口径，实测这单 260~399）；
+ *        **加项包列表里原价 `sale_price` 与成交价 `price` 都显示**（实测原价 523~1558.8，两价差很大）。
+ *
+ *   🔴 「最少/最多档」怎么算（核心，别改成按包序或按项目数）：
+ *        组内包**按成交价降序**排序 → 取最贵的 minSize 个相加 = 最少档；
+ *        取最贵的 maxSize 个相加 = 最多档（**从最高金额的包开始累加**，正是他说的那句）。
+ *      · 多个组各自算，再逐组相加得到这一行的两个总额；
+ *      · `minSize = 0`（实测常态：这单 7 个主机全是 0~3 / 0~4 / 0~7 / 0~8）⇒ 最少档 = 0，
+ *        行头就只显示基础成交价，不再写「+0」；最多档照常给。
+ *      · 约束读不到（`selectionSizeList` 缺项 / `{}`）⇒ 按 0 ~ 全部包 兜底，
+ *        组头本来就标着橙字「无约束数据」，不给用户一个假精确的数字。
+ *      · `maxSize > 绑定包数` 时按绑定包数封顶（只可能选到手上有的那几个）。
+ *
+ *   ⚠️ 数据只拉一次：query 已经把两类包都挂在 `add_packages` 上、detail 也已逐个查过
+ *      （`detailCache` 里两类包都在）⇒ **切页签不重新请求**，纯重渲染。
+ *      ⛔ 别再为加项包加一轮接口 —— 那是白等 300ms×N。
+ *   ⚠️ 类型判据照旧以 **detail 的 `package_type`** 为准（列表里那份不一定含被绑的包）。
+ *   🔴 计数改**按包去重**：同一个包会同时绑在「男 / 女未婚 / 女已婚」几条套餐上，
+ *      按行累加会得出「本订单共绑定 16 个包，其中 32 个是加项包」这种自相矛盾的数字
+ *      （实测这单：15 个加项包 × 6 个套餐 = 32 处绑定）。赠送包侧原来也有这个隐患，一并改。
+ *   ⚠️ 内部结构沿用 `rows[].groups[].gives[]`（`gives` 键两个页签共用，别再起新名字）——
+ *      归档验证套件的选择器与断言都按它写的。
  */
 
 (function () {
@@ -170,12 +206,14 @@
     panel: `${NS}_panel`,
     head: `${NS}_head`,
     title: `${NS}_title`,
+    tabs: `${NS}_tabs`,
     close: `${NS}_close`,
     meta: `${NS}_meta`,
     body: `${NS}_body`,
     footer: `${NS}_footer`,
+    tip: `${NS}_tip`,
   };
-  const VERSION = '1.9.0';
+  const VERSION = '1.10.0';
   const SWITCH_LABEL = '加项包核对';
   const POS_KEY = `${NS}_pos`;
 
@@ -186,8 +224,27 @@
     pkgDetail: '/soa/api/v1/package/detail',
   };
 
-  // 只看赠送包。加项包(ADDPKG) / 智略加项包(AIADDPKG) 不看 —— 红领巾 2026-09-29 定的口径
+  // ---- 两个页签（v1.10.0）----
+  // give = 赠送包（默认，v1.9.0 及以前就是这个口径）；add = 加项包 + 智略加项包
+  const TAB_GIVE = 'give';
+  const TAB_ADD = 'add';
+  const TAB_WORD = { give: '赠送包', add: '加项包' };
+  const TAB_TIP = {
+    give: '只读工具 · 只看赠送包(GIVEPKG)，加项包不展示',
+    add: '只读工具 · 只看加项包(ADDPKG / AIADDPKG)，赠送包不展示',
+  };
+
   const GIVE_TYPE = 'GIVEPKG';
+  // 加项包两类都算（智略加项包 AIADDPKG 也是加收钱的包，页面上归在同一个「加项包」概念里）
+  const ADD_TYPES = ['ADDPKG', 'AIADDPKG'];
+
+  /** 这个包属于哪个页签；两类都不是（赠送套餐 GIVEPACKAGE / 主套餐）返回 '' */
+  function tabOfType(t) {
+    const ty = String(t || '').toUpperCase();
+    if (ty === GIVE_TYPE) return TAB_GIVE;
+    if (ADD_TYPES.indexOf(ty) >= 0) return TAB_ADD;
+    return '';
+  }
 
   // ---- 组（「几选几」的容器）----
   // group 是 **1 基**、selectionSizeList 是 **0 基**：group N 的约束 = selectionSizeList[N-1]。
@@ -305,23 +362,42 @@
   const state = {
     orderCode: null,
     loading: false,
+    // 当前页签：give = 赠送包（默认）｜add = 加项包
+    tab: TAB_GIVE,
     // 渲染用：{code,name,type,custType,salePrice,price,voided,
-    //          groups:[{no,name,min,max,gives:[{code,name,group,items:[{name,price,salePrice}]}]}]}
-    rows: [],
+    //          groups:[{no,name,min,max,minN,maxN,minSum,maxSum,
+    //                  gives:[{code,name,group,price,salePrice,items:[{name,price,salePrice}]}]}]}
+    // ⚠️ 两个页签同一套结构，`gives` 键共用（别再起第二个名字）。
+    rows: [], // 赠送包页签的行
+    addRows: [], // 加项包页签的行（v1.10.0）
     bindTotal: 0, // 本订单绑定的包总数（去重后）
     giveTotal: 0, // 其中赠送包数
     itemTotal: 0, // 赠送包内项目总数
+    addTotal: 0, // 其中加项包数
+    addItemTotal: 0, // 加项包内项目总数
     commonPrefix: '', // v1.7.0：所有套餐名的**共同前缀** —— 提到顶部只显示一次，行内不再重复
+    addPrefix: '', // 同上的「加项包页签版」（两页的套餐集合不同，前缀要各算一份）
     detailCache: new Map(), // package_code -> detail.data（null = 查询失败）
     err: '',
   };
 
+  /** 当前页签对应的那份数据 —— 渲染全走它，别在别处再判一次 tab */
+  function view() {
+    return state.tab === TAB_ADD
+      ? { rows: state.addRows, pkgTotal: state.addTotal, itemTotal: state.addItemTotal, prefix: state.addPrefix }
+      : { rows: state.rows, pkgTotal: state.giveTotal, itemTotal: state.itemTotal, prefix: state.commonPrefix };
+  }
+
   function resetAll() {
     state.rows = [];
+    state.addRows = [];
     state.bindTotal = 0;
     state.giveTotal = 0;
     state.itemTotal = 0;
+    state.addTotal = 0;
+    state.addItemTotal = 0;
     state.commonPrefix = '';
+    state.addPrefix = '';
     state.detailCache = new Map();
     state.err = '';
   }
@@ -430,6 +506,31 @@
         user-select: none;
       }
       #${IDS.title} { font-weight: 600; font-size: 14px; }
+
+      /* ---------- 页签：赠送包 / 加项包（v1.10.0）----------
+       * 几何照截图（红领巾 2026-11-28 贴的稿）：纯文字页签，选中**紫色 + 下划线**，
+       * 未选中灰色。⛔ 别做成 antd 的方块 Tab —— 头部只有 32px 高，方块会把标题挤掉一行。
+       * ⚠️ 下划线用 border-bottom，不占额外高度；不写 margin-bottom 负值（会与头部边框重叠出双线）。 */
+      #${IDS.tabs} { display: flex; align-items: center; gap: 18px; margin-left: 6px; }
+      #${IDS.tabs} .hlj-gc-tab {
+        height: 26px;
+        padding: 0 2px;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        background: none;
+        color: #8c8c8c;
+        font-size: 14px;
+        font-weight: 400;
+        line-height: 24px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      #${IDS.tabs} .hlj-gc-tab:hover { color: #722ed1; }
+      #${IDS.tabs} .hlj-gc-tab.is-on {
+        color: #722ed1;
+        font-weight: 600;
+        border-bottom-color: #722ed1;
+      }
       #${IDS.head} .hlj-gc-spacer { flex: 1; }
       #${IDS.close} {
         width: 26px; height: 26px; line-height: 24px; text-align: center;
@@ -518,6 +619,25 @@
       .hlj-gc-prices b { font-weight: 600; font-variant-numeric: tabular-nums; }
       .hlj-gc-p1 b { color: #595959; }
       .hlj-gc-p2 b { color: #d46b08; }
+      /* ---------- 加项包页签的价目（v1.10.0）----------
+       * 一行三色，红领巾 2026-11-28 要求「699+119 分开显示、颜色也差别开」：
+       *   套餐成交价 #d46b08（沿用原色）· 加项价 #722ed1（紫，专门给「加收的钱」用）
+       *   · 等号 #bfbfbf（分隔符不该抢眼）· 合计 #262626 加粗（要能一眼读总数）
+       * ⚠️ 紫不是随便挑的：与页签选中色同一个（#722ed1），页签一亮就知道这行加项是紫色的那截。 */
+      .hlj-gc-plus {
+        color: #722ed1; font-weight: 600; font-style: normal;
+        font-variant-numeric: tabular-nums; margin: 0 2px;
+      }
+      .hlj-gc-eq { color: #bfbfbf; margin: 0 3px; }
+      .hlj-gc-tot { color: #262626; }
+      .hlj-gc-p3 { color: #8c8c8c; }
+      .hlj-gc-p3 b { color: #595959; }
+      /* 组头的加项金额区间（只在加项包页签出现） */
+      .hlj-gc-group-money { color: #722ed1; font-size: 11.5px; }
+      /* 加项包内每行：成交价 / 原价 都写出来（他明确要求两个都显示） */
+      .hlj-gc-pack-p { color: #8c8c8c; font-size: 11px; margin-left: 6px; white-space: nowrap; }
+      .hlj-gc-pack-p b { color: #722ed1; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .hlj-gc-pack-p i { font-style: normal; color: #8c8c8c; font-variant-numeric: tabular-nums; }
       .hlj-gc-sub { color: #8c8c8c; font-size: 11.5px; }
       .hlj-gc-gives { margin-top: 8px; }
       .hlj-gc-tag {
@@ -562,6 +682,11 @@
         font-size: 11.5px;
         margin-bottom: 2px;
       }
+      /* v1.10.0：加项包块改用**橙色竖线**（赠送包是绿色 #c0dd97）—— 一眼分出这页是加收钱的包。
+       * ⚠️ 只改颜色，别另起一套 .hlj-gc-add 类：包与包并排（is-pack2）的相邻选择器是按
+       *    .hlj-gc-give 写的，换类名会让并排的右边那个包凭空低 8px。 */
+      .hlj-gc-give.is-add { border-left-color: #ffd591; }
+      .hlj-gc-give.is-add .hlj-gc-give-name { color: #ad4e00; }
 
       /* v1.8.0：**包与包并排** —— 一个组里有 ≥2 个赠送包时列成 2 列（4 个包 → 2×2）。
        * 为什么：包内改成一列后高度 ↑，包间并排把宽度用满、高度又降回来（原来右侧空一截）。
@@ -654,7 +779,7 @@
     btn.id = IDS.switch;
     btn.type = 'button';
     btn.textContent = SWITCH_LABEL;
-    btn.title = '列出当前订单里「绑定了赠送包的套餐」，以及这些赠送包内的全部项目（只读，不改任何数据）';
+    btn.title = '列出当前订单里「绑定了赠送包 / 加项包的套餐」以及包内的全部项目，两个页签切换（只读，不改任何数据）';
 
     // 别让点击冒泡到页面自己的逻辑里
     ['pointerdown', 'mousedown', 'mouseup', 'pointerup'].forEach((evt) => {
@@ -681,19 +806,32 @@
     p.innerHTML = `
       <div id="${IDS.head}">
         <span id="${IDS.title}">套餐加项包核对</span>
+        <span id="${IDS.tabs}">
+          <button type="button" class="hlj-gc-tab is-on" data-tab="${TAB_GIVE}">赠送包</button>
+          <button type="button" class="hlj-gc-tab" data-tab="${TAB_ADD}">加项包</button>
+        </span>
         <span class="hlj-gc-spacer"></span>
         <button id="${IDS.close}" type="button" title="关闭（ESC）">×</button>
       </div>
       <div id="${IDS.meta}">正在读取…</div>
       <div id="${IDS.body}"></div>
       <div id="${IDS.footer}">
-        <span class="hlj-gc-tip">只读工具 · 只看赠送包(GIVEPKG)，加项包不展示</span>
+        <span class="hlj-gc-tip" id="${IDS.tip}">${TAB_TIP[TAB_GIVE]}</span>
         <button type="button" data-act="reload">重新读取</button>
       </div>
     `;
     document.body.appendChild(p);
 
     $(IDS.close).addEventListener('click', closePanel);
+    // 页签切换：只重渲染，**不重发请求**（两页的数据在 load() 里已经一次拉全）
+    // ⚠️ 页签是 button，头部拖拽处理器里 `e.target.closest('button')` 会跳过它们，拖拽不受影响。
+    $(IDS.tabs).addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-tab]');
+      if (!b) return;
+      e.preventDefault();
+      e.stopPropagation();
+      switchTab(b.getAttribute('data-tab'));
+    });
     bindEscClose();
     p.querySelector(`#${IDS.footer}`).addEventListener('click', (e) => {
       const btn = e.target.closest('button');
@@ -788,6 +926,24 @@
     return !!p && getComputedStyle(p).display !== 'none';
   }
 
+  /** v1.10.0：切页签。只换 state.tab + 重渲染，**不发请求**（数据 load() 时已一次拉全）。 */
+  function switchTab(tab) {
+    if (tab !== TAB_GIVE && tab !== TAB_ADD) return;
+    if (state.tab === tab) return;
+    state.tab = tab;
+    paint();
+  }
+
+  /** 页签的选中态（紫色 + 下划线）—— 每次 paint 都对一遍，别只在点击时改 */
+  function paintTabs() {
+    const box = $(IDS.tabs);
+    if (!box) return;
+    const btns = box.querySelectorAll('button[data-tab]');
+    for (let i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle('is-on', btns[i].getAttribute('data-tab') === state.tab);
+    }
+  }
+
   function togglePanel() {
     if (isPanelOpen()) closePanel();
     else openPanel();
@@ -860,6 +1016,46 @@
     return out;
   }
 
+  /**
+   * v1.10.0：给**加项包**的每个组算「加项金额区间」。
+   *
+   * 算法（红领巾 2026-11-28 亲口定的，⛔ 别改成按包序 / 按项目数 / 取最便宜）：
+   *   ① 组内包按**成交价 price 降序**排；
+   *   ② 最少档 = 最贵的 minSize 个相加（「最少选1个 ⇒ 就按最高价位那个算」）；
+   *   ③ 最多档 = 最贵的 maxSize 个相加（「如果选了多个，就从最高金额的包开始累加」）；
+   *   ④ 多个组各算各的，调用方再把每组的 minSum / maxSum 逐组相加。
+   *
+   * 三处兜底（都是实测会遇到的，别当边界忽略）：
+   *   · `min/max` 为 null（约束缺失 / `{}`）⇒ 按 **0 ~ 全部包** 算，组头本来就标着「无约束数据」，
+   *     不给用户一个假精确的数；
+   *   · `maxSize` 比绑定的包数还大 ⇒ **按包数封顶**（手上没有的包选不到）；
+   *   · `maxSize < minSize`（脏数据）⇒ max 抬到 min，至少不低于最少档。
+   * ⚠️ 包自己的 price 拿不到时按 0 计 —— 宁可少算也不编一个数出来。
+   */
+  function attachPriceRange(groups) {
+    let minSum = 0;
+    let maxSum = 0;
+    groups.forEach((gr) => {
+      const prices = gr.gives
+        .map((g) => {
+          const n = Number(g.price);
+          return isFinite(n) ? n : 0;
+        })
+        .sort((a, b) => b - a);
+      const n = prices.length;
+      const minN = gr.min === null ? 0 : Math.max(0, Math.min(Number(gr.min) || 0, n));
+      const maxN = gr.max === null ? n : Math.max(minN, Math.min(Number(gr.max) || 0, n));
+      const sumTop = (k) => prices.slice(0, k).reduce((s, v) => s + v, 0);
+      gr.minN = minN;
+      gr.maxN = maxN;
+      gr.minSum = sumTop(minN);
+      gr.maxSum = sumTop(maxN);
+      minSum += gr.minSum;
+      maxSum += gr.maxSum;
+    });
+    return { minSum: minSum, maxSum: maxSum };
+  }
+
   // ============================================================
   // 8.1 长文本去重（v1.7.0）
   // ============================================================
@@ -900,16 +1096,22 @@
     return name.length > 40 ? '…' + name.slice(-38) : name;
   }
 
-  /** 行内显示的赠送包名：与套餐名**共有的那截不再重复**，只留差异 + 项目数 */
-  function giveLabel(gName, pkgName, n) {
-    const g = gName || '';
+  /** 行内显示的包名：与套餐名**共有的那截不再重复**，只留差异 + 项目数
+   *  v1.10.0：`kind` 决定前缀词（赠送包 / 加项包），其余去重逻辑两个页签共用。 */
+  function packLabel(kind, gName, pkgName, n) {
+    const word = TAB_WORD[kind] || '包';
+    const raw = gName || '';
+    // 包名尾巴上的「-加项包 / -赠送包」是类型后缀，行首已经写了类型 ⇒ 去掉，别读成
+    // 「加项包 · 1+X心脑血管专项筛查-加项包」（真机上就是这么重复的）。
+    // ⚠️ 去完是空串（名字本身就叫「加项包」）就退回原名，别把包名整没了。
+    const stripped = raw.replace(/[\s\-—–·/、,，:：]*【?(?:智略)?(?:加项包|赠送包)】?$/, '').trim();
+    const g = stripped || raw;
     const p = pkgName ? lcp(g, pkgName) : 0;
     let label;
     if (p >= 8) {
       let extra = g.slice(p).replace(/^[\s\-—–·/、,，:：]+/, '').trim();
-      extra = extra.replace(/^【?赠送包】?/, '').trim(); // 只剩「赠送包」三字 = 没有差异信息
       if (extra.length > 16) extra = extra.slice(0, 15) + '…';
-      label = extra ? '赠送包 · ' + extra : '赠送包';
+      label = extra ? word + ' · ' + extra : word;
     } else {
       // 与套餐名无关的包名 ⇒ 原样显示（太长才截，且**保头**：无关包名通常从头就不一样）
       label = g.length > 24 ? g.slice(0, 22) + '…' : g;
@@ -924,10 +1126,13 @@
       el.innerHTML = '没认出订单号。请先打开某个订单的「<b>套餐与加项包</b>」页面。';
       return;
     }
-    const stat = state.rows.length
-      ? '共 <b>' + state.rows.length + '</b> 个套餐绑定了赠送包' +
-        '（涉及 <b>' + state.giveTotal + '</b> 个赠送包、<b>' + state.itemTotal + '</b> 个项目）'
-      : (state.loading ? '正在读取…' : '本订单没有「绑定了赠送包的套餐」');
+    const v = view();
+    const word = TAB_WORD[state.tab] || '包';
+    const other = TAB_WORD[state.tab === TAB_ADD ? TAB_GIVE : TAB_ADD];
+    const stat = v.rows.length
+      ? '共 <b>' + v.rows.length + '</b> 个套餐绑定了' + word +
+        '（涉及 <b>' + v.pkgTotal + '</b> 个' + word + '、<b>' + v.itemTotal + '</b> 个项目）'
+      : (state.loading ? '正在读取…' : '本订单没有「绑定了' + word + '的套餐」');
     el.innerHTML =
       '订单 <b>' + esc(state.orderCode) + '</b>' +
       '<span class="hlj-gc-st">只读</span>' +
@@ -935,22 +1140,26 @@
       // v1.7.0：套餐名的共同前缀提到这里说一次（行内只留差异段）。
       // ⚠️ 必须写成**内联** span —— 试过 <details>（块级），在 #meta 的行内流里会多撑出
       //    约 40px 的空行盒（实测 192.8→213.2 上下各多一条行盒），面板白白长高。
-      (state.commonPrefix
+      (v.prefix
         ? '<br><span class="hlj-gc-common"' +
-          (state.commonPrefix.length > 60 ? ' title="' + esc(state.commonPrefix) + '"' : '') +
+          (v.prefix.length > 60 ? ' title="' + esc(v.prefix) + '"' : '') +
           '>套餐名共同部分：' +
-          esc(state.commonPrefix.length > 60 ? state.commonPrefix.slice(0, 60) + '…' : state.commonPrefix) +
+          esc(v.prefix.length > 60 ? v.prefix.slice(0, 60) + '…' : v.prefix) +
           '（行内已省略）</span>'
         : '') +
       (state.bindTotal ? '<br><span style="color:#8c8c8c">本订单共绑定 ' + state.bindTotal + ' 个包，其中 ' +
-        state.giveTotal + ' 个是赠送包（加项包不展示）</span>' : '') +
+        v.pkgTotal + ' 个是' + word + '（' + other + '在另一个页签，点上方切换）</span>' : '') +
       (state.err ? '<br><span style="color:#cf1322">' + esc(state.err) + '</span>' : '');
   }
 
-  /** 一个赠送包：包名 + 包内项目（每项一行，带原价）
+  /** 一个包：包名 + 包内项目（每项一行，带原价）
    *  v1.7.0：包名不再照抄 48 字 —— 与套餐名共有的那截在顶部说过一次了，
-   *  行内只显示「赠送包 · N 个项目」（有差异信息时才追加）。全名放 title 里备查。 */
-  function giveHtml(g, pkgName) {
+   *  行内只显示「赠送包 / 加项包 · N 个项目」（有差异信息时才追加）。全名放 title 里备查。
+   *  v1.10.0：加项包在包名行尾补「成交价 / 原价」两个数（他要求加项包里两个价都显示），
+   *  块用橙色竖线（`is-add`）区分于赠送包的绿色竖线。 */
+  function packHtml(g, pkgName, kind) {
+    const isAdd = kind === TAB_ADD;
+    const word = TAB_WORD[kind] || '包';
     const items = g.items.length
       ? '<ol class="hlj-gc-items">' +
         g.items
@@ -964,22 +1173,28 @@
           )
           .join('') +
         '</ol>'
-      : '<div style="color:#8c8c8c">（该赠送包里没有项目）</div>';
+      : '<div style="color:#8c8c8c">（该' + word + '里没有项目）</div>';
     const full = g.name || g.code;
+    const priceTag = isAdd
+      ? '<span class="hlj-gc-pack-p">成交价 <b>' + esc(fmtMoney(g.price)) + '</b>' +
+        ' 原价 <i>' + esc(fmtMoney(g.salePrice)) + '</i></span>'
+      : '';
     return (
-      '<div class="hlj-gc-give">' +
+      '<div class="hlj-gc-give' + (isAdd ? ' is-add' : '') + '">' +
       '<span class="hlj-gc-give-name" title="' + esc(full) + '">' +
-      esc(giveLabel(full, pkgName, g.items.length)) +
+      esc(packLabel(kind, full, pkgName, g.items.length)) +
+      priceTag +
       '</span>' +
       items +
       '</div>'
     );
   }
 
-  /** 一组：组头（组名 + 几选几）+ 该组下的赠送包
+  /** 一组：组头（组名 + 几选几）+ 该组下的包
    *  v1.8.0：组内 **≥2 个包**时给 `is-pack2`，CSS 把包列成两列（4 个包 → 2×2）。
-   *  ⚠️ 1 个包不加 —— 并排会让它只占半宽、右半空着，比不排更乱。 */
-  function groupHtml(gr, pkgName) {
+   *  ⚠️ 1 个包不加 —— 并排会让它只占半宽、右半空着，比不排更乱。
+   *  v1.10.0：加项包页签的组头再补一段「加项 306 ~ 1,206」，说明这组的加项金额怎么来的。 */
+  function groupHtml(gr, pkgName, kind) {
     // 「未分组」不写约束 —— 它本来就不属于任何组，写「无约束数据」是噪音
     const limit = gr.no === 0
       ? ''
@@ -987,26 +1202,75 @@
         ? '<span class="hlj-gc-group-limit is-unknown">无约束数据</span>'
         : '<span class="hlj-gc-group-limit">最少选' + esc(gr.min) + '个 最多选' + esc(gr.max) + '个</span>');
     const warn = gr.no === 0 ? '<span class="hlj-gc-group-warn">页面不归此组</span>' : '';
+    const money = kind === TAB_ADD && gr.maxSum > 0
+      ? '<span class="hlj-gc-group-money" title="加项金额：最少档取最贵的 ' + esc(gr.minN) +
+        ' 个、最多档取最贵的 ' + esc(gr.maxN) + ' 个">加项 ' + esc(fmtMoney(gr.minSum)) +
+        (gr.maxSum > gr.minSum ? ' ~ ' + esc(fmtMoney(gr.maxSum)) : '') + '</span>'
+      : '';
     const pack2 = gr.gives.length >= 2 ? ' is-pack2' : '';
     return (
       '<div class="hlj-gc-group' + pack2 + '">' +
       '<div class="hlj-gc-group-head">' +
       '<span class="hlj-gc-group-name">' + esc(gr.name) + '</span>' +
       limit +
+      money +
       warn +
       '</div>' +
-      gr.gives.map((g) => giveHtml(g, pkgName)).join('') +
+      gr.gives.map((g) => packHtml(g, pkgName, kind)).join('') +
       '</div>'
     );
   }
 
-  function rowHtml(r, idx) {
+  /** 赠送包页签的价目（v1.9.0 原样，一行两个数） */
+  function givePrices(r) {
+    return '<span class="hlj-gc-prices">' +
+      '<span class="hlj-gc-p1">原价 <b>' + esc(fmtMoney(r.salePrice)) + '</b></span>' +
+      '<span class="hlj-gc-p2">成交价 <b>' + esc(fmtMoney(r.price)) + '</b></span>' +
+      '</span>';
+  }
+
+  /**
+   * v1.10.0：加项包页签的价目 —— 「套餐价 + 加项价 = 合计」，并按最少/最多档给区间。
+   * 三种形态（都由实测数据决定，别拍脑袋加第四种）：
+   *   · 最少档 = 0（`minSize = 0`，实测这单 7 个主机全这样）⇒ 只写基础成交价，**不写「+0」**；
+   *   · 最少档 = 最多档 ⇒ 一行：`699 + 306 = 1,005`；
+   *   · 最少档 < 最多档 ⇒ 两行：`成交价 699+306=1,005` / `最多 699+1,206=1,905`。
+   * 颜色：套餐价琥珀 #d46b08、加项价紫 #722ed1、合计 #262626 加粗 —— 见 CSS 那段的注释。
+   */
+  function addonPrices(r) {
+    const base = Number(r.price);
+    const baseN = isFinite(base) ? base : 0;
+    const minSum = Number(r.addMinSum) || 0;
+    const maxSum = Number(r.addMaxSum) || 0;
+    const minN = r.addMinN || 0;
+    const maxN = r.addMaxN || 0;
+    let s = '<span class="hlj-gc-prices">' +
+      '<span class="hlj-gc-p1">原价 <b>' + esc(fmtMoney(r.salePrice)) + '</b></span>';
+    s += '<span class="hlj-gc-p2"' +
+      (minSum > 0 ? ' title="最少选 ' + esc(minN) + ' 个：加项按最贵的 ' + esc(minN) + ' 个算"' : '') +
+      '>成交价 <b>' + esc(fmtMoney(baseN)) + '</b>';
+    if (minSum > 0) {
+      s += '<i class="hlj-gc-plus">+' + esc(fmtMoney(minSum)) + '</i>' +
+        '<span class="hlj-gc-eq">=</span><b class="hlj-gc-tot">' + esc(fmtMoney(baseN + minSum)) + '</b>';
+    }
+    s += '</span>';
+    if (maxSum > minSum) {
+      s += '<span class="hlj-gc-p3"' +
+        ' title="最多选 ' + esc(maxN) + ' 个：加项按最贵的 ' + esc(maxN) + ' 个累加"' +
+        '>最多 <b>' + esc(fmtMoney(baseN)) + '</b>' +
+        '<i class="hlj-gc-plus">+' + esc(fmtMoney(maxSum)) + '</i>' +
+        '<span class="hlj-gc-eq">=</span><b class="hlj-gc-tot">' + esc(fmtMoney(baseN + maxSum)) + '</b></span>';
+    }
+    return s + '</span>';
+  }
+
+  function rowHtml(r, idx, kind, prefix) {
     const tags =
       '<span class="hlj-gc-tag t-' + esc(r.type) + '">' + esc(TYPE_CN[r.type] || r.type || '套餐') + '</span>' +
       (r.voided ? '<span class="hlj-gc-tag t-void">' + esc(voidCn(r)) + '</span>' : '');
 
-    // v1.7.0：行内只显示差异段（共同前缀在顶部）
-    const shownName = shortPkgName(r.name, state.commonPrefix);
+    // v1.7.0：行内只显示差异段（共同前缀在顶部）；v1.10.0：前缀按当前页签的那份传进来
+    const shownName = shortPkgName(r.name, prefix);
 
     // 客户类型/编码：差异段已经把客户类型说出来了（如「男」「女已婚」）就不再重复一遍
     const sub = [];
@@ -1014,13 +1278,9 @@
     if (cust && shownName.indexOf(cust) < 0) sub.push(cust);
     if (r.code) sub.push(r.code);
 
-    const prices =
-      '<span class="hlj-gc-prices">' +
-      '<span class="hlj-gc-p1">原价 <b>' + esc(fmtMoney(r.salePrice)) + '</b></span>' +
-      '<span class="hlj-gc-p2">成交价 <b>' + esc(fmtMoney(r.price)) + '</b></span>' +
-      '</span>';
+    const prices = kind === TAB_ADD ? addonPrices(r) : givePrices(r);
 
-    const givesHtml = r.groups.map((gr) => groupHtml(gr, r.name)).join('');
+    const givesHtml = r.groups.map((gr) => groupHtml(gr, r.name, kind)).join('');
 
     return `
       <tr class="${r.voided ? 'is-voided' : ''}">
@@ -1040,12 +1300,16 @@
   function paintBody() {
     const box = $(IDS.body);
     if (!box) return;
-    if (!state.rows.length) {
+    const v = view();
+    const word = TAB_WORD[state.tab] || '包';
+    if (!v.rows.length) {
       box.innerHTML = state.loading
         ? '<div class="hlj-gc-empty">正在读取…</div>'
         : '<div class="hlj-gc-empty">' +
-          (state.err ? '读取失败，请点底部「重新读取」再试' : '本订单没有「绑定了赠送包的套餐」') +
-          '<br><span style="font-size:12px;color:#bfbfbf">只列表绑了赠送包(GIVEPKG)的套餐；未绑包的、只绑加项包的都不列。</span>' +
+          (state.err ? '读取失败，请点底部「重新读取」再试' : '本订单没有「绑定了' + word + '的套餐」') +
+          '<br><span style="font-size:12px;color:#bfbfbf">本页只列绑了' + word + '(' +
+          (state.tab === TAB_ADD ? 'ADDPKG / AIADDPKG' : 'GIVEPKG') +
+          ')的套餐；没绑包的、只绑另一类包的都不列。</span>' +
           '</div>';
       return;
     }
@@ -1053,13 +1317,16 @@
     //    表头还存在的话反而会让人以为下面是两列对齐的。
     box.innerHTML =
       '<table class="hlj-gc-table">' +
-      '<tbody>' + state.rows.map(rowHtml).join('') + '</tbody>' +
+      '<tbody>' + v.rows.map((r, i) => rowHtml(r, i, state.tab, v.prefix)).join('') + '</tbody>' +
       '</table>';
   }
 
   function paint() {
+    paintTabs();
     paintMeta();
     paintBody();
+    const tip = $(IDS.tip);
+    if (tip) tip.textContent = TAB_TIP[state.tab] || TAB_TIP[TAB_GIVE];
     const btn = $(IDS.footer) && $(IDS.footer).querySelector('button[data-act="reload"]');
     if (btn) btn.disabled = state.loading;
   }
@@ -1083,11 +1350,12 @@
    * 拉一遍并组装。
    *
    * 流程：package/query（1 次） → 收集所有被绑的包 → package/detail（每个包 1 次，并发 4）
-   *       → 只留 package_type=GIVEPKG 的 → 按宿主套餐归组。
+   *       → 按 package_type 分两桶（赠送包 / 加项包）→ 各自按宿主套餐归组。
    *
    * ⚠️ 判断「这包是赠送包还是加项包」**以 detail 的 package_type 为准**，
    *    不用列表里的那份 —— 列表不一定包含被绑的包（实测有的订单里不在），
    *    而 detail 是包自己的属性，稳。
+   * ⚠️ v1.10.0：这一趟就把两类包都备齐 ⇒ **切页签不再发任何请求**（纯重渲染）。
    */
   async function load() {
     if (state.loading) return;
@@ -1099,6 +1367,7 @@
     }
     if (!state.orderCode) {
       state.rows = [];
+      state.addRows = [];
       state.err = '';
       paint();
       return;
@@ -1143,19 +1412,31 @@
       );
       if (state.orderCode !== orderCode) return;
 
-      // 组装：一行 = 一个主套餐（只留绑了赠送包的）
+      // 组装：一行 = 一个主套餐。v1.10.0 起**一趟分两桶** —— 赠送包进 rows、加项包进 addRows，
+      // 两个页签各自成表（同一张卡片可能在两页都出现：两类包可以绑在不同组上）。
       const rows = [];
+      const addRows = [];
       let giveTotal = 0;
       let itemTotal = 0;
+      let addTotal = 0;
+      let addItemTotal = 0;
+      // v1.10.0：计数**按包去重**。同一个包可以同时绑在「男 / 女未婚 / 女已婚」几条套餐上，
+      // 按「每行加一次」会算成 32 个加项包、而订单里实际只绑了 16 个包 —— 数字自相矛盾。
+      // 实测这单：15 个加项包被 6 个套餐绑 → 按行算 32 个，按包算才是 15 个（正确）。
+      const seenGive = new Set();
+      const seenAdd = new Set();
       list.forEach((host) => {
         const ap = host.add_packages || [];
         if (!ap.length) return; // 没绑包的套餐不考虑
 
         const gives = [];
+        const adds = [];
         ap.forEach((a) => {
           const d = state.detailCache.get(a && a.package_code);
           if (!d) return;
-          if (String(d.package_type || '').toUpperCase() !== GIVE_TYPE) return; // 加项包不看
+          // 类型以 **detail** 为准（列表里那份不一定包含被绑的包）；两类之外的包直接跳过
+          const kind = tabOfType(d.package_type);
+          if (!kind) return;
           const items = (d.product_items || [])
             .slice()
             .sort((x, y) => (Number(x.sequence) || 0) - (Number(y.sequence) || 0))
@@ -1164,21 +1445,19 @@
               price: it.price,
               salePrice: it.sale_price,
             }));
-          gives.push({
+          const rec = {
             code: a.package_code,
             name: d.package_name || a.package_name || '',
             group: a.group, // 组号（1 基）；约束要去宿主套餐的 selectionSizeList[group-1] 取
+            price: d.price, // 成交价 —— 加项金额按这个累加（红领巾 2026-11-28 定）
+            salePrice: d.sale_price, // 原价 —— 加项包里两个价都显示
             items: items,
-          });
-        });
-        if (!gives.length) return; // 只绑加项包 → 整行不出现
-
-        giveTotal += gives.length;
-        gives.forEach((g) => {
-          itemTotal += g.items.length;
+          };
+          if (kind === TAB_ADD) adds.push(rec);
+          else gives.push(rec);
         });
 
-        rows.push({
+        const base = {
           code: host.package_code,
           name: host.package_name || '',
           type: host.package_type || '',
@@ -1186,19 +1465,55 @@
           salePrice: host.sale_price, // 原价
           price: host.price, // 成交价
           voided: isVoid(host),
-          // 组头要的是**宿主套餐自己**的约束（不是赠送包的）—— 见文件头接口第 ③ 条
-          groups: buildGroups(gives, host.selectionSizeList),
-        });
+        };
+
+        if (gives.length) {
+          gives.forEach((g) => {
+            if (seenGive.has(g.code)) return;
+            seenGive.add(g.code);
+            giveTotal += 1;
+            itemTotal += g.items.length;
+          });
+          rows.push(Object.assign({}, base, {
+            // 组头要的是**宿主套餐自己**的约束（不是包的）—— 见文件头接口第 ③ 条
+            groups: buildGroups(gives, host.selectionSizeList),
+          }));
+        }
+
+        if (adds.length) {
+          adds.forEach((g) => {
+            if (seenAdd.has(g.code)) return;
+            seenAdd.add(g.code);
+            addTotal += 1;
+            addItemTotal += g.items.length;
+          });
+          // 同样的约束源，但每组要多算「加项金额区间」（最少档 / 最多档）
+          const groups = buildGroups(adds, host.selectionSizeList);
+          const rng = attachPriceRange(groups);
+          addRows.push(Object.assign({}, base, {
+            groups: groups,
+            addMinSum: rng.minSum,
+            addMaxSum: rng.maxSum,
+            addMinN: groups.reduce((s, g) => s + (g.minN || 0), 0),
+            addMaxN: groups.reduce((s, g) => s + (g.maxN || 0), 0),
+          }));
+        }
       });
 
       state.rows = rows;
+      state.addRows = addRows;
       state.giveTotal = giveTotal;
       state.itemTotal = itemTotal;
+      state.addTotal = addTotal;
+      state.addItemTotal = addItemTotal;
       // v1.7.0：算一次套餐名的**共同前缀** —— 行内渲染要靠它做去重
+      // v1.10.0：两页的套餐集合不同（比如只绑加项包的那几条），前缀要各算一份
       state.commonPrefix = commonPrefixOf(rows.map((r) => r.name));
+      state.addPrefix = commonPrefixOf(addRows.map((r) => r.name));
     } catch (e) {
       state.err = '读取失败：' + (e && e.message ? e.message : e);
       state.rows = [];
+      state.addRows = [];
     } finally {
       state.loading = false;
     }
@@ -1206,7 +1521,9 @@
     paint();
     console.log(
       '[扁鹊-1.9] ' + orderCode + '：绑定包 ' + state.bindTotal + ' 个 → 赠送包 ' +
-        state.giveTotal + ' 个、项目 ' + state.itemTotal + ' 个，列出套餐 ' + state.rows.length + ' 个'
+        state.giveTotal + ' 个、项目 ' + state.itemTotal + ' 个，列出套餐 ' + state.rows.length + ' 个' +
+        '；加项包 ' + state.addTotal + ' 个、项目 ' + state.addItemTotal + ' 个，列出套餐 ' +
+        state.addRows.length + ' 个'
     );
   }
 
